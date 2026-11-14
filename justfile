@@ -37,9 +37,13 @@ publish tag="latest":
     owner="$(gh repo view --json owner --jq .owner.login)"
     username="$(gh api user --jq .login)"
     image="ghcr.io/${owner}/harbringer:{{tag}}"
+    amd64_image="${image}-amd64"
+    arm64_image="${image}-arm64"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker buildx build --platform linux/amd64,linux/arm64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$image" .
+    docker buildx build --platform linux/amd64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$amd64_image" .
+    docker buildx build --platform linux/arm64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$arm64_image" .
+    docker buildx imagetools create --tag "$image" "$amd64_image" "$arm64_image"
 
 # build and publish the non-stable nightly docker image
 nightly: (publish "nightly")
