@@ -52,6 +52,7 @@ use tracing::{info, warn, Span};
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const PLEX_DEFAULT_AUDIO_LANGUAGE: &str = "en";
+const WEB_UI_PORT: u16 = 4826;
 const USER_ID: &str = "mplex-user";
 
 #[derive(Parser, Debug, Clone)]
@@ -685,9 +686,12 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             }
         }
     });
-    let app = build_app(state.clone());
+    let plex_app = build_plex_listener_app(state.clone());
+    let web_app = build_web_listener_app(state.clone());
     let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
     let address = listener.local_addr()?;
+    let web_address = SocketAddr::new(address.ip(), WEB_UI_PORT);
+    let web_listener = tokio::net::TcpListener::bind(web_address).await?;
     let gdm_task = tokio::spawn(run_gdm_responder(
         gdm_machine_identifier,
         address.port(),
@@ -701,21 +705,35 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     print!("\n");
     print_startup_banner();
     println!(
-        "harbringer running on port {}\nWeb client: http://{}:{}/\n",
+        "harbringer Plex API: http://{}:{}/\nHarbringer web UI: http://{}:{}/\n",
+        host,
         address.port(),
         host,
-        address.port()
+        web_address.port()
     );
     #[cfg(unix)]
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let server = server_tls.serve_until(listener, app, async move {
+    let (web_shutdown_tx, web_shutdown_rx) = tokio::sync::oneshot::channel();
+    let plex_server = server_tls.serve_until(listener, plex_app, async move {
         let _ = shutdown_rx.await;
     });
-    tokio::pin!(server);
+    let web_server = async move {
+        axum::serve(web_listener, web_app)
+            .with_graceful_shutdown(async move {
+                let _ = web_shutdown_rx.await;
+            })
+            .await
+    };
+    tokio::pin!(plex_server);
+    tokio::pin!(web_server);
     #[cfg(unix)]
     let outcome = tokio::select! {
-        result = &mut server => {
+        result = &mut plex_server => {
+            result?;
+            RunOutcome::Shutdown
+        }
+        result = &mut web_server => {
             result?;
             RunOutcome::Shutdown
         }
@@ -730,7 +748,11 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     };
     #[cfg(not(unix))]
     let outcome = tokio::select! {
-        result = &mut server => {
+        result = &mut plex_server => {
+            result?;
+            RunOutcome::Shutdown
+        }
+        result = &mut web_server => {
             result?;
             RunOutcome::Shutdown
         }
@@ -740,10 +762,11 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         }
     };
     let _ = shutdown_tx.send(());
-    if tokio::time::timeout(Duration::from_secs(5), &mut server)
-        .await
-        .is_err()
-    {
+    let _ = web_shutdown_tx.send(());
+    let plex_drain = tokio::time::timeout(Duration::from_secs(5), &mut plex_server);
+    let web_drain = tokio::time::timeout(Duration::from_secs(5), &mut web_server);
+    let (plex_result, web_result) = tokio::join!(plex_drain, web_drain);
+    if plex_result.is_err() || web_result.is_err() {
         warn!("timed out waiting for active connections to close during shutdown");
     }
     gdm_task.abort();
@@ -788,6 +811,7 @@ fn build_app(state: AppState) -> Router {
         .route("/web/translated-subtitle", post(web_translated_subtitle))
         .route("/web/translation-progress", post(web_translation_progress))
         .route("/web/artwork", get(web_artwork))
+        .route("/web/artwork/media/:id/:kind", get(web_media_artwork))
         .route("/web/info", get(web_info))
         .route("/web/tv-match/search", get(tv_match_search))
         .route("/web/tv-match/select", post(tv_match_select))
@@ -992,6 +1016,42 @@ fn build_app(state: AppState) -> Router {
                 }),
         )
         .with_state(state)
+}
+
+#[derive(Clone, Copy)]
+enum ListenerSurface {
+    Web,
+    Plex,
+}
+
+fn build_web_listener_app(state: AppState) -> Router {
+    build_app(state).layer(middleware::from_fn(|mut request: Request<Body>, next: Next| async move {
+        if !is_web_surface_path(request.uri().path()) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        request.extensions_mut().insert(ListenerSurface::Web);
+        next.run(request).await
+    }))
+}
+
+fn build_plex_listener_app(state: AppState) -> Router {
+    build_app(state).layer(middleware::from_fn(|mut request: Request<Body>, next: Next| async move {
+        if is_web_surface_path(request.uri().path()) && request.uri().path() != "/" {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        request.extensions_mut().insert(ListenerSurface::Plex);
+        next.run(request).await
+    }))
+}
+
+fn is_web_surface_path(path: &str) -> bool {
+    path == "/"
+        || path == "/auth"
+        || path.starts_with("/auth/")
+        || path == "/web"
+        || path.starts_with("/web/")
+        || path == "/settings"
+        || path.starts_with("/settings/")
 }
 
 async fn run_gdm_responder(
@@ -4710,7 +4770,7 @@ if (!window.__mplexSettingsDeleteBound) {
     } else {
         r#"<p class="note">Connect harbringer to your Plex account so Plex clients can discover and authenticate with this server.</p><div class="action-row"><form method="get" action="/settings/plex/start"><button type="submit">Connect to Plex.tv</button></form></div>"#.to_owned()
     };
-    Html(format!(
+    Html(add_build_info_footer(format!(
         r#"<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>harbringer settings</title><style>
@@ -4830,7 +4890,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
         html(query.folder.as_deref().unwrap_or("")),
         if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list },
         logs_content
-    ))
+    )))
     .into_response()
 }
 
@@ -7610,7 +7670,7 @@ async fn settings_browse(Query(query): Query<BrowseQuery>) -> Response {
         "</body>",
         "<script>document.addEventListener('click',event=>{const link=event.target.closest?.('a.choose, .toolbar a.action[href*=\\\"/settings?folder=\\\"]');if(!link||window.parent===window)return;event.preventDefault();const path=new URL(link.href,location.origin).searchParams.get('folder');window.parent.postMessage({type:'mplex-folder-selected',path},location.origin);});</script></body>",
     );
-    Html(page).into_response()
+    Html(add_build_info_footer(page)).into_response()
 }
 
 async fn create_library(State(state): State<AppState>, RawForm(raw): RawForm) -> Response {
@@ -8317,10 +8377,10 @@ async fn home_client(State(state): State<AppState>) -> Response {
     if recent.is_empty() {
         recent = "<p class=\"note empty-state\">No recently added media yet.</p>".to_owned();
     }
-    Html(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>harbringer</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }} .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+    Html(add_build_info_footer(format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>harbringer</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
         POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries, fix_match_dialog_markup(), media_card_action_script(), spa_navigation_script()
-    )).into_response()
+    ))).into_response()
 }
 
 fn next_tv_episode_paths(
@@ -8757,7 +8817,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 .path
                 .strip_prefix(&library_root)
                 .unwrap_or(std::path::Path::new(""));
-            folder_cards.push_str(&media_poster_card(
+            folder_cards.push_str(&media_cover_card(
                 Some(&representative.id),
                 &href,
                 &format!("Season {season:02}"),
@@ -8794,7 +8854,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 query.season.unwrap_or_default(),
                 url_encode(&episode_path.to_string_lossy())
             );
-            items.push_str(&media_poster_card(
+            items.push_str(&media_cover_card(
                 Some(&episode.id),
                 &href,
                 &title,
@@ -8877,7 +8937,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         "/?library={library_index}&path={}",
                         url_encode(&show_path.to_string_lossy())
                     );
-                    folder_cards.push_str(&media_poster_card(
+                    folder_cards.push_str(&media_cover_card(
                         Some(&representative.id),
                         &href,
                         &show.title,
@@ -8958,7 +9018,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 let season_card = season_media
                     .first()
                     .map(|representative| {
-                        media_poster_card(
+                        media_cover_card(
                             Some(&representative.id),
                             &format!(
                                 "/?library={}&path={}",
@@ -9055,7 +9115,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     url_encode(&child_relative.to_string_lossy())
                 );
                 let progress = item_metadata.map(media_card_progress).unwrap_or_default();
-                items.push_str(&media_poster_card(
+                items.push_str(&media_cover_card(
                     matched_media.as_ref().map(|media| media.id.as_str()),
                     &href,
                     &title,
@@ -9073,7 +9133,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             }
             let artwork = matched_media
                 .as_ref()
-                .map(|media| media_thumbnail_url(&media.id));
+                .map(|media| media_cover_url(&media.id));
             let artwork = if artwork.is_some() {
                 artwork
             } else if sidecar_mode
@@ -9132,7 +9192,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     }
     (
         [(header::CACHE_CONTROL, "no-store")],
-        Html(format!(
+        Html(add_build_info_footer(format!(
         r#"<!doctype html>
 <html lang="en">
 <head>
@@ -9169,11 +9229,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }}
     .media-card-artwork {{ position: relative; }}
-    .media-card-poster, .media-card-poster img {{ display: block; width: 100%; aspect-ratio: 2 / 3; }}
-    .media-card-poster img {{ object-fit: cover; border-radius: .35rem; background: #111827; }}
-    .media-card-placeholder {{ display: grid; width: 100%; height: 100%; place-items: center; border-radius: .35rem; color: #bfdbfe; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); font-size: 2rem; }}
-    .media-card-placeholder {{ font-size: .9rem; padding: .7rem; text-align: center; overflow-wrap: anywhere; }}
-    .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 0; color: inherit; text-align: center; text-decoration: none; }}
+        .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 0; color: inherit; text-align: center; text-decoration: none; }}
     .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }}
     .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }}
@@ -9721,7 +9777,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         fix_match_dialog_markup(),
         media_card_action_script(),
         spa_navigation_script()
-        )),
+        ))),
     )
         .into_response()
 }
@@ -10991,6 +11047,18 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response()
 }
 
+async fn web_media_artwork(
+    State(state): State<AppState>,
+    Path((id, kind)): Path<(String, String)>,
+) -> Response {
+    let filename = match kind.as_str() {
+        "cover" => "cover.jpg",
+        "banner" => "banner.jpg",
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    plex_artwork(&state, &id, filename).await
+}
+
 async fn web_info(State(s): State<AppState>, Query(query): Query<WebPath>) -> Response {
     let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
         return StatusCode::BAD_REQUEST.into_response();
@@ -11410,8 +11478,8 @@ fn folder_card(
     )
 }
 
-fn media_thumbnail_url(media_id: &str) -> String {
-    format!("/library/metadata/{}/thumb", url_encode(media_id))
+fn media_cover_url(media_id: &str) -> String {
+    format!("/web/artwork/media/{}/cover", url_encode(media_id))
 }
 
 fn media_card(
@@ -11467,7 +11535,7 @@ fn media_card(
             .unwrap_or_default()
     };
     let progress = metadata.map(media_card_progress).unwrap_or_default();
-    media_poster_card(
+    media_cover_card(
         Some(&media.id),
         &href,
         &title,
@@ -11523,7 +11591,7 @@ fn release_year(date: &str) -> Option<u32> {
     (1888..=2100).contains(&year).then_some(year)
 }
 
-fn media_poster_card(
+fn media_cover_card(
     media_id: Option<&str>,
     href: &str,
     title: &str,
@@ -11543,17 +11611,17 @@ fn media_poster_card(
     let details = details
         .map(|value| format!("<span class=\"media-card-details\">{}</span>", html(value)))
         .unwrap_or_default();
-    let poster = media_id
+    let cover = media_id
         .map(|id| {
             format!(
-                r#"<img src="{}" alt="Poster for {}" loading="lazy">"#,
-                html(&media_thumbnail_url(id)),
+                r#"<img src="{}" alt="Cover for {}" loading="lazy">"#,
+                html(&media_cover_url(id)),
                 html(title)
             )
         })
         .unwrap_or_else(|| {
             format!(
-                r#"<div class="media-card-placeholder" role="img" aria-label="Poster unavailable for {}">No poster available</div>"#,
+                r#"<div class="media-cover-placeholder" role="img" aria-label="Cover unavailable for {}">No cover available</div>"#,
                 html(title)
             )
         });
@@ -11600,7 +11668,7 @@ fn media_poster_card(
         String::new()
     };
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-poster" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
         path,
@@ -11608,7 +11676,7 @@ fn media_poster_card(
         watch_scope,
         watch_key,
         html(href),
-        poster,
+        cover,
         path,
         library,
         watch_scope,
@@ -11676,12 +11744,12 @@ fn fix_match_dialog_markup() -> &'static str {
 .fix-match-search-row input { flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }
 .fix-match-results { display: grid; gap: .65rem; }
 .fix-match-result { display: flex; align-items: flex-start; gap: .9rem; padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }
-.fix-match-poster { flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }
+.fix-match-cover { flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }
 .fix-match-result-content { min-width: 0; }
 .fix-match-result h3 { margin: 0; }
 .fix-match-result p { margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }
 .fix-match-status { min-height: 1.5rem; color: #cbd5e1; }
-@media (max-width: 420px) { .fix-match-poster { flex-basis: 60px; width: 60px; height: 90px; } .fix-match-result { gap: .6rem; } }
+@media (max-width: 420px) { .fix-match-cover { flex-basis: 60px; width: 60px; height: 90px; } .fix-match-result { gap: .6rem; } }
 </style><dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>"#
 }
 
@@ -11696,13 +11764,13 @@ const bindCardAction = (element, type, handler, options) => {
 };
 bindCardAction(document, "error", event => {
   const image = event.target;
-  if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-poster img")) return;
+  if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-cover img")) return;
   const placeholder = document.createElement("div");
-  const title = image.alt.replace(/^Poster for /, "");
-  placeholder.className = "media-card-placeholder";
+  const title = image.alt.replace(/^Cover for /, "");
+  placeholder.className = "media-cover-placeholder";
   placeholder.setAttribute("role", "img");
-  placeholder.setAttribute("aria-label", `Poster unavailable for ${title}`);
-  placeholder.textContent = "No poster available";
+  placeholder.setAttribute("aria-label", `Cover unavailable for ${title}`);
+  placeholder.textContent = "No cover available";
   image.replaceWith(placeholder);
 }, true);
 const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
@@ -11769,11 +11837,11 @@ const searchTvMatches = async () => {
     payload.results.forEach(result => {
       const item = document.createElement("div");
       item.className = "fix-match-result";
-      const poster = document.createElement("img");
-      poster.className = "fix-match-poster";
-      poster.alt = "";
-      poster.loading = "lazy";
-      if (result.poster_path) poster.src = `https://image.tmdb.org/t/p/w185${result.poster_path}`;
+      const cover = document.createElement("img");
+      cover.className = "fix-match-cover";
+      cover.alt = "";
+      cover.loading = "lazy";
+      if (result.poster_path) cover.src = `https://image.tmdb.org/t/p/w185${result.poster_path}`;
       const content = document.createElement("div");
       content.className = "fix-match-result-content";
       const heading = document.createElement("h3");
@@ -11786,7 +11854,7 @@ const searchTvMatches = async () => {
       select.dataset.matchId = String(result.id);
       select.textContent = "Use this match";
       content.append(heading, overview, select);
-      item.append(poster, content);
+      item.append(cover, content);
       fixMatchResults.append(item);
     });
   } catch (error) {
@@ -13723,7 +13791,23 @@ async fn root_handler(
     headers: HeaderMap,
     uri: Uri,
     Query(query): Query<WebPath>,
+    surface: Option<axum::Extension<ListenerSurface>>,
 ) -> Response {
+    if matches!(surface, Some(axum::Extension(ListenerSurface::Plex))) {
+        return plex_root(&s).await;
+    }
+    if matches!(surface, Some(axum::Extension(ListenerSurface::Web))) {
+        return if query.library.is_some()
+            || query.path.is_some()
+            || query.play.is_some()
+            || query.episode.is_some()
+            || query.view.is_some()
+        {
+            web_client(State(s), Query(query)).await
+        } else {
+            home_client(State(s)).await
+        };
+    }
     let is_plex_client = headers.contains_key("X-Plex-Product")
         || headers.contains_key("X-Plex-Client-Identifier")
         || headers.contains_key("X-Plex-Token");
@@ -13769,6 +13853,12 @@ fn web_session_valid(state: &AppState, headers: &HeaderMap) -> bool {
 }
 
 async fn web_auth_gate(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+    if matches!(
+        request.extensions().get::<ListenerSurface>(),
+        Some(ListenerSurface::Plex)
+    ) {
+        return next.run(request).await;
+    }
     let path = request.uri().path();
     let plex_client = request.headers().contains_key("X-Plex-Product")
         || request.headers().contains_key("X-Plex-Client-Identifier")
@@ -13798,7 +13888,7 @@ async fn auth_page(State(state): State<AppState>) -> Response {
     let confirm = if setup { r#"<label>Confirm password<input name="confirm_password" type="password" autocomplete="new-password" required></label>"# } else { "" };
     let body = format!(r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · harbringer</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#f9fafb;font:16px system-ui}}main{{box-sizing:border-box;width:min(92vw,410px);padding:2rem;border:1px solid #374151;border-radius:1rem;background:#111827}}h1{{margin-top:0}}p{{color:#9ca3af}}form,label{{display:grid;gap:.7rem}}form{{gap:1rem}}input,button{{box-sizing:border-box;width:100%;padding:.8rem;border-radius:.5rem;font:inherit}}input{{border:1px solid #4b5563;background:#0b1020;color:white}}button{{border:0;background:#2563eb;color:white;font-weight:700;cursor:pointer}}</style><main><h1>{title}</h1><p>{description}</p><form method="post" action="{action}"><label>Administrator password<input name="password" type="password" minlength="8" autocomplete="{autocomplete}" required></label>{confirm}<button>{button}</button></form></main></html>"#,
         autocomplete = if setup { "new-password" } else { "current-password" });
-    Html(body).into_response()
+    Html(add_build_info_footer(body)).into_response()
 }
 
 async fn auth_setup(State(state): State<AppState>, Form(form): Form<AdminLoginForm>) -> Response {
@@ -20637,6 +20727,20 @@ fn html(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&#39;")
+}
+
+fn add_build_info_footer(mut document: String) -> String {
+    let footer = format!(
+        r#"<aside class="harbringer-build-info" aria-label="Harbringer version and commit">Harbringer v{} · commit {}</aside><style>.harbringer-build-info{{position:fixed;left:.75rem;bottom:.65rem;z-index:30;padding:.35rem .55rem;border:1px solid rgba(148,163,184,.18);border-radius:.45rem;color:#9ca3af;background:rgba(11,16,32,.88);backdrop-filter:blur(8px);font:500 .68rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none;white-space:nowrap}}.media-card-cover,.media-card-cover img{{display:block;box-sizing:border-box;width:100%;aspect-ratio:2/3}}.media-card-cover img{{object-fit:cover;border-radius:.35rem;background:#111827}}.media-cover-placeholder{{display:grid;box-sizing:border-box;width:100%;height:100%;place-items:center;border-radius:.35rem;color:#bfdbfe;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827);font-size:.9rem;padding:.7rem;text-align:center;overflow-wrap:anywhere}}@media(max-width:480px){{.harbringer-build-info{{left:.4rem;bottom:.4rem;font-size:.62rem}}}}</style>"#,
+        env!("CARGO_PKG_VERSION"),
+        env!("HARBRINGER_GIT_COMMIT"),
+    );
+    if let Some(position) = document.rfind("</body>") {
+        document.insert_str(position, &footer);
+    } else if let Some(position) = document.rfind("</html>") {
+        document.insert_str(position, &footer);
+    }
+    document
 }
 
 #[cfg(test)]

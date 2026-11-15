@@ -7,7 +7,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 ## What you can do
 
 - Create movie, TV, and other libraries from folders on your server.
-- Browse posters and folders in the built-in web client.
+- Browse cover artwork and folders in the built-in web client.
 - Connect compatible Plex clients to your server.
 - Scan libraries manually or on a schedule.
 - Match movie and TV titles with TMDB metadata.
@@ -24,9 +24,9 @@ Install Rust, then run:
 cargo run
 ```
 
-Harbringer reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, it listens on port `32400`. At startup, it prints the address of the built-in web client.
+Harbringer reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, the Plex API listens on port `32400` and the Harbringer web client listens on port `4826`. At startup, it prints both addresses.
 
-Open `http://<server>:32400/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
+Open `http://<server>:4826/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
 
 ### Reset the web admin password
 
@@ -50,6 +50,7 @@ services:
     image: ghcr.io/danielb2/harbringer:latest
     ports:
       - "32400:32400"
+      - "4826:4826"
     volumes:
       - ./config:/config
       - ./media:/media:ro
@@ -59,10 +60,10 @@ services:
 Or run it directly without Compose:
 
 ```sh
-docker run --name harbringer -p 32400:32400 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
+docker run --name harbringer -p 32400:32400 -p 4826:4826 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
 ```
 
-Open `http://localhost:32400/`. In **Settings**, add `/media` as a library folder.
+Open `http://localhost:4826/`. In **Settings**, add `/media` as a library folder.
 
 The media mount is read-only by default while Harbringer is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
 

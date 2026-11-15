@@ -1,8 +1,11 @@
 FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 ARG BUILDARCH
 ARG TARGETARCH
+ARG GIT_COMMIT=unknown
+ENV HARBRINGER_GIT_COMMIT=$GIT_COMMIT
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
+COPY build.rs ./build.rs
 COPY src ./src
 RUN set -eux; \
     case "$TARGETARCH" in \
@@ -31,5 +34,5 @@ ENV IMAGE_BUILD_DATE=${IMAGE_BUILD_DATE}
 COPY --from=builder /build/harbringer /usr/local/bin/harbringer
 RUN mkdir -p /config
 VOLUME ["/config", "/media"]
-EXPOSE 32400/tcp
+EXPOSE 32400/tcp 4826/tcp
 ENTRYPOINT ["harbringer", "--config", "/config", "--bind", "0.0.0.0:32400"]

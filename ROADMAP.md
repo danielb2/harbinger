@@ -131,6 +131,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-15
 
+- Separated Harbringer’s authenticated web UI and internal routes onto port 4826 while keeping Plex routes on 32400. Updated client artwork requests to use the web API, so SQLite-backed covers and banners remain reachable after the split; renamed card artwork as covers and constrained the empty-cover fallback to its frame. Moved the version/commit badge to the lower left. Checks: `cargo build`, full `cargo test` (198 passed), and `git diff --check` passed. Live Plex client and UI confirmation remains pending.
 - Plex PIN callbacks now poll their own PIN, avoiding stale-row selection. Claim and registration keep the configured server name. The latest Plex trace showed `servers.xml` created the record and the device announcement was accepted, but Plex returned only HTTP connections; the announcement now also sends the certificate-backed local `plex.direct` HTTPS URI. `cargo test` passed 196 tests and `git diff --check` passed. A new live Plex registration check is still pending.
 
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.

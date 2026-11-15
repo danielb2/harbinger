@@ -1,5 +1,5 @@
 use super::{
-    build_app, migrate_library_model, open_database, plex_external_subtitle_id, plex_part_id,
+    build_app, build_plex_listener_app, build_web_listener_app, migrate_library_model, open_database, plex_external_subtitle_id, plex_part_id,
     plex_remux_audio_mode, sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls,
 };
 use axum::{
@@ -371,6 +371,38 @@ async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
 }
 
 #[tokio::test]
+async fn web_and_plex_listener_surfaces_are_separated() {
+    let fixture = fixture();
+    let web = build_web_listener_app(fixture.state.clone());
+    let plex = build_plex_listener_app(fixture.state.clone());
+
+    let web_plex_request = web
+        .oneshot(Request::builder().uri("/identity").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(web_plex_request.status(), StatusCode::NOT_FOUND);
+
+    let plex_web_request = plex
+        .oneshot(Request::builder().uri("/settings").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(plex_web_request.status(), StatusCode::NOT_FOUND);
+
+    let plex_root = build_plex_listener_app(fixture.state.clone())
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(plex_root.status(), StatusCode::OK);
+
+    let web_root = build_web_listener_app(fixture.state.clone())
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(web_root.status(), StatusCode::SEE_OTHER);
+    assert_eq!(web_root.headers()[header::LOCATION], "/auth");
+}
+
+#[tokio::test]
 async fn first_run_creates_admin_and_starts_an_authenticated_session() {
     let fixture = fixture();
     let app = build_app(fixture.state.clone());
@@ -697,7 +729,7 @@ async fn plex_artwork_serves_database_stored_cover() {
     let fixture = fixture();
     fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
     let artwork_path = fixture.root.join("saved-cover.jpg");
-    std::fs::write(&artwork_path, b"poster bytes").unwrap();
+    std::fs::write(&artwork_path, b"cover bytes").unwrap();
     fixture
         .db
         .lock()
@@ -721,7 +753,22 @@ async fn plex_artwork_serves_database_stored_cover() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    assert_eq!(body.as_ref(), b"poster bytes");
+    assert_eq!(body.as_ref(), b"cover bytes");
+
+    let web_app = build_web_listener_app(fixture.state.clone())
+        .layer(axum::middleware::from_fn(inject_test_cookie));
+    let response = web_app
+        .oneshot(
+            Request::builder()
+                .uri("/web/artwork/media/1-1/cover")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"cover bytes");
 }
 
 #[tokio::test]
@@ -3029,7 +3076,7 @@ async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
 }
 
 #[tokio::test]
-async fn library_media_view_starts_with_flat_poster_cards_and_progress() {
+async fn library_media_view_starts_with_flat_cover_cards_and_progress() {
     let fixture = fixture();
     let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -3040,7 +3087,8 @@ async fn library_media_view_starts_with_flat_poster_cards_and_progress() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("Poster for Demo"));
+    assert!(body.contains("Cover for Demo"));
+    assert!(body.contains("/web/artwork/media/1-1/cover"));
     assert!(body.contains("/?library=0&amp;path=&amp;play=Demo.mkv"));
     assert!(body.contains("class=\"media-card-progress-row\""));
     assert!(body.contains("class=\"media-card-percent\""));
@@ -3057,7 +3105,7 @@ async fn library_media_view_starts_with_flat_poster_cards_and_progress() {
 }
 
 #[tokio::test]
-async fn tv_season_navigation_renders_episode_poster_cards() {
+async fn tv_season_navigation_renders_episode_cover_cards() {
     let fixture = tv_fixture();
     let unindexed_episode = fixture
         .root
@@ -3095,7 +3143,7 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
     let items = body.find("class=\"library\"").unwrap();
     assert!(panel < items);
 
-    assert!(body.contains("Poster for Pilot"));
+    assert!(body.contains("Cover for Pilot"));
     assert!(body.contains("class=\"media-card-title\" title=\"Pilot\""));
     assert!(body.contains("class=\"media-card-subtitle\">S1 · E1</span>"));
     assert!(body.contains("class=\"media-card-details\">Example Show</span>"));
@@ -3106,7 +3154,7 @@ async fn tv_season_navigation_renders_episode_poster_cards() {
         "href=\"/?library=0&amp;path=Example%20Show%2FSeason%2001&amp;episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv\""
     ));
     assert!(body.contains(
-        "class=\"media-card-placeholder\" role=\"img\" aria-label=\"Poster unavailable for New\">No poster available"
+        "class=\"media-cover-placeholder\" role=\"img\" aria-label=\"Cover unavailable for New\">No cover available"
     ));
     assert!(!body.contains("tv-episode-card"));
 }
@@ -3484,7 +3532,7 @@ async fn database_metadata_renders_in_the_selected_movie_view() {
 }
 
 #[test]
-fn media_cards_use_the_selected_media_poster_and_path() {
+fn media_cards_use_the_selected_media_cover_and_path() {
     let movie = super::Media {
         id: "1-42".to_owned(),
         title: "Demo Movie".to_owned(),
@@ -3542,7 +3590,7 @@ fn media_cards_use_the_selected_media_poster_and_path() {
         true,
     );
     assert!(continue_card.contains("Remove from Continue Watching"));
-    assert!(movie_card.contains("/library/metadata/1-42/thumb"));
+    assert!(movie_card.contains("/web/artwork/media/1-42/cover"));
     assert!(movie_card
         .contains("style=\"align-self:start;background:rgba(31,41,55,.3);padding:.7rem\""));
     assert!(movie_card.contains(
@@ -3550,7 +3598,7 @@ fn media_cards_use_the_selected_media_poster_and_path() {
     ));
     assert!(movie_card.contains("grid-row:4;height:1rem"));
     assert!(movie_card.contains("path=Films&amp;play=Films%2FDemo%20Movie.mkv"));
-    assert!(movie_card.contains("Poster for Demo Movie"));
+    assert!(movie_card.contains("Cover for Demo Movie"));
     assert!(movie_card.contains(
         "class=\"media-card-title\" title=\"Demo Movie\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Demo Movie</span>"
     ));
@@ -6114,5 +6162,29 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
             expected,
             "{method} {uri} returned an unexpected failure response"
         );
+    }
+}
+
+#[tokio::test]
+async fn web_ui_pages_show_the_build_version_and_commit() {
+    let fixture = fixture();
+    let expected = format!(
+        "Harbringer v{} · commit {}",
+        env!("CARGO_PKG_VERSION"),
+        env!("HARBRINGER_GIT_COMMIT")
+    );
+
+    for path in ["/", "/?path=", "/settings", "/settings/browse", "/auth"] {
+        let response = send(&fixture.app, Method::GET, path, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page = String::from_utf8(page.to_vec()).unwrap();
+        assert!(
+            page.contains("class=\"harbringer-build-info\""),
+            "{path} is missing the build info badge"
+        );
+        assert!(page.contains(&expected), "{path} is missing {expected}");
+        assert!(page.contains("position:fixed;left:.75rem;bottom:.65rem"));
+        assert!(page.contains("box-sizing:border-box;width:100%;height:100%"));
     }
 }

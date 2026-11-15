@@ -562,8 +562,8 @@ fn tv_metadata_matching_replaces_stale_episode_fields() {
 }
 
 #[test]
-fn missing_poster_markup_uses_a_readable_fallback() {
-    let card = super::media_poster_card(
+fn missing_cover_markup_uses_a_readable_fallback() {
+    let card = super::media_cover_card(
         None,
         "/web?library=0",
         "Missing Artwork",
@@ -577,8 +577,8 @@ fn missing_poster_markup_uses_a_readable_fallback() {
         "show",
         false,
     );
-    assert!(card.contains("No poster available"));
-    assert!(card.contains("Poster unavailable for Missing Artwork"));
+    assert!(card.contains("No cover available"));
+    assert!(card.contains("Cover unavailable for Missing Artwork"));
     assert!(!card.contains("<img"));
     assert!(super::media_card_action_script().contains("image.replaceWith(placeholder)"));
 }
