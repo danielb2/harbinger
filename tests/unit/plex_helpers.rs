@@ -794,7 +794,7 @@ fn extracts_plex_server_token() {
     assert_eq!(extract_xml_token("<user />"), None);
 }
 #[test]
-fn plex_publishes_lan_http_urls_for_plex_direct_discovery() {
+fn plex_publishes_plain_lan_ip_urls_without_a_certificate() {
     assert_eq!(
         plex_publish_urls(
             &[
@@ -808,22 +808,25 @@ fn plex_publishes_lan_http_urls_for_plex_direct_discovery() {
     );
 }
 #[test]
-fn plex_publishes_explicit_plex_direct_https_urls_when_a_certificate_exists() {
+fn plex_publishes_certificate_hostnames_for_plex_direct_discovery() {
     assert_eq!(
         plex_publish_urls(
             &["10.20.61.51".parse().unwrap()],
             32400,
-            Some("77917460f0a9494f9b68fb00bb562a9c")
+            Some("cert-hash")
         ),
         [
             "http://10.20.61.51:32400",
-            "https://10-20-61-51.77917460f0a9494f9b68fb00bb562a9c.plex.direct:32400"
+            "https://10-20-61-51.cert-hash.plex.direct:32400"
         ]
     );
 }
 #[test]
 fn plex_device_announce_matches_measured_pms_request_shape() {
-    let urls = vec!["http://10.20.61.51:32400".to_owned()];
+    let urls = vec![
+        "http://10.20.61.51:32400".to_owned(),
+        "https://10-20-61-51.cert-hash.plex.direct:32400".to_owned(),
+    ];
     assert_eq!(
         plex_device_announce_url("machine-id"),
         "https://servers.plex.tv/devices/machine-id"
@@ -832,6 +835,10 @@ fn plex_device_announce_matches_measured_pms_request_shape() {
         plex_device_announce_query(&urls, true, "server-token"),
         [
             ("Connection[][uri]", "http://10.20.61.51:32400"),
+            (
+                "Connection[][uri]",
+                "https://10-20-61-51.cert-hash.plex.direct:32400"
+            ),
             ("httpsEnabled", "1"),
             ("httpsRequired", "0"),
             ("dnsRebindingProtection", "0"),

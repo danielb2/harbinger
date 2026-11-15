@@ -771,6 +771,88 @@ async fn plex_artwork_serves_database_stored_cover() {
     assert_eq!(body.as_ref(), b"cover bytes");
 }
 
+#[test]
+fn startup_retries_saved_plex_token_after_publication_failure() {
+    let fixture = fixture();
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE server_identity SET plex_account_token = 'saved-server-token', claimed = 0, plex_last_error = 'Plex.tv did not publish the local HTTPS connection' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(
+        super::plex_startup_registration(&fixture.db.lock().unwrap()),
+        Some(("saved-server-token".to_owned(), false))
+    );
+
+    super::set_plex_registration_state(&fixture.db.lock().unwrap(), true, None).unwrap();
+    let (claimed, error): (bool, Option<String>) = fixture
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT claimed, plex_last_error FROM server_identity WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(claimed);
+    assert_eq!(error, None);
+}
+
+#[test]
+fn plex_resources_recognize_a_plex_direct_url_with_a_local_ip_address() {
+    let resources = serde_json::json!([{
+        "clientIdentifier": "server-id",
+        "provides": "server",
+        "connections": [{
+            "address": "10.20.61.51",
+            "port": 32400,
+            "protocol": "https",
+            "local": true,
+            "uri": "https://10-20-61-51.cert-hash.plex.direct:32400"
+        }]
+    }]);
+
+    assert!(super::plex_resources_contain_local_https(
+        &resources,
+        "server-id"
+    ));
+}
+
+#[test]
+fn plex_local_http_connection_keeps_registration_usable_without_local_https() {
+    let resources = serde_json::json!([{
+        "clientIdentifier": "server-id",
+        "provides": "server",
+        "accessToken": "server-token",
+        "connections": [{
+            "address": "10.20.61.51",
+            "port": 32400,
+            "protocol": "http",
+            "local": true,
+            "uri": "http://10.20.61.51:32400"
+        }]
+    }]);
+
+    assert!(super::plex_resources_contain(
+        &resources,
+        "server-id"
+    ));
+    assert!(super::plex_resources_contain_local_connection(
+        &resources,
+        "server-id"
+    ));
+    assert!(!super::plex_resources_contain_local_https(
+        &resources,
+        "server-id"
+    ));
+}
+
 #[tokio::test]
 async fn settings_saves_and_validates_per_library_scan_schedule() {
     let fixture = fixture();

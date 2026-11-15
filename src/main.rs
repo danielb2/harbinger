@@ -648,17 +648,15 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     let publication_state = state.clone();
     let startup_server_name = server_name.clone();
     let publication_task = tokio::spawn(async move {
-        let server_token = publication_state.db.lock().ok().and_then(|connection| {
-            connection
-                .query_row(
-                    "SELECT plex_account_token FROM server_identity WHERE id = 1 AND claimed = 1",
-                    [],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .ok()
-                .flatten()
-        });
-        if let Some(server_token) = server_token {
+        let saved_registration = publication_state
+            .db
+            .lock()
+            .ok()
+            .and_then(|connection| plex_startup_registration(&connection));
+        if let Some((server_token, was_claimed)) = saved_registration {
+            if !was_claimed {
+                info!("retrying Plex server registration with the saved server token");
+            }
             let client = reqwest::Client::new();
             if let Err(error) = publication_state
                 .plex_tls
@@ -672,7 +670,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             {
                 warn!(error = %error, "could not ensure Plex TLS certificate at startup");
             }
-            if let Err(error) = publish_plex_connections(
+            match publish_plex_connections(
                 &client,
                 &publication_state,
                 &startup_server_name,
@@ -680,9 +678,26 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             )
             .await
             {
-                warn!(error = %error, "could not refresh Plex connection URLs at startup");
-            } else {
-                run_plex_presence(&client, &publication_state, &server_token).await;
+                Ok(()) => {
+                    if let Ok(connection) = publication_state.db.lock() {
+                        if let Err(error) = set_plex_registration_state(&connection, true, None) {
+                            warn!(%error, "could not save successful Plex registration state");
+                        }
+                    }
+                    run_plex_presence(&client, &publication_state, &server_token).await;
+                }
+                Err(error) => {
+                    if let Ok(connection) = publication_state.db.lock() {
+                        if let Err(save_error) = set_plex_registration_state(
+                            &connection,
+                            false,
+                            Some(&error),
+                        ) {
+                            warn!(%save_error, "could not save failed Plex registration state");
+                        }
+                    }
+                    warn!(error = %error, "could not refresh Plex connection URLs at startup");
+                }
             }
         }
     });
@@ -3755,6 +3770,29 @@ async fn claim_and_publish_plex_server(
     Ok((server_token, true, tls_error))
 }
 
+fn plex_startup_registration(connection: &rusqlite::Connection) -> Option<(String, bool)> {
+    let (token, claimed) = connection
+        .query_row(
+            "SELECT plex_account_token, claimed FROM server_identity WHERE id = 1",
+            [],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, bool>(1)?)),
+        )
+        .ok()?;
+    Some((token?, claimed))
+}
+
+fn set_plex_registration_state(
+    connection: &rusqlite::Connection,
+    claimed: bool,
+    error: Option<&str>,
+) -> rusqlite::Result<()> {
+    connection.execute(
+        "UPDATE server_identity SET claimed = ?1, plex_last_error = ?2 WHERE id = 1",
+        (claimed, error),
+    )?;
+    Ok(())
+}
+
 async fn publish_plex_connections(
     client: &reqwest::Client,
     state: &AppState,
@@ -3844,14 +3882,23 @@ async fn verify_plex_resource(
             &resources,
             state.machine_identifier.as_ref(),
         );
-        if has_server && (state.plex_tls.hash().is_none() || has_local_https) {
+        let has_local_connection = plex_resources_contain_local_connection(
+            &resources,
+            state.machine_identifier.as_ref(),
+        );
+        if has_server && has_local_connection {
+            if state.plex_tls.hash().is_some() && !has_local_https {
+                warn!(
+                    resources = %plex_resource_connection_summary(
+                        &resources,
+                        state.machine_identifier.as_ref(),
+                    ),
+                    "Plex.tv has no local HTTPS connection for Harbringer; keeping its verified local HTTP connection"
+                );
+            }
             return Ok(());
         }
-        last_error = if has_server && state.plex_tls.hash().is_some() {
-            "Plex.tv did not publish Harbringer's local HTTPS plex.direct connection".to_owned()
-        } else {
-            "Plex.tv did not publish a usable Harbringer server resource".to_owned()
-        };
+        last_error = "Plex.tv did not publish a usable local Harbringer connection".to_owned();
         last_resources = plex_resource_connection_summary(
             &resources,
             state.machine_identifier.as_ref(),
@@ -4269,6 +4316,30 @@ fn plex_resources_contain_local_https(
     })
 }
 
+fn plex_resources_contain_local_connection(
+    resources: &serde_json::Value,
+    machine_identifier: &str,
+) -> bool {
+    resources.as_array().into_iter().flatten().any(|resource| {
+        resource
+            .get("clientIdentifier")
+            .and_then(serde_json::Value::as_str)
+            == Some(machine_identifier)
+            && resource
+                .get("connections")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|connections| {
+                    connections.iter().any(|connection| {
+                        connection.get("local").and_then(serde_json::Value::as_bool) == Some(true)
+                            && connection
+                                .get("uri")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|uri| uri.starts_with("http://") || uri.starts_with("https://"))
+                    })
+                })
+    })
+}
+
 fn extract_xml_token(body: &str) -> Option<String> {
     ["authentication-token", "authenticationToken", "authToken"]
         .iter()
@@ -4301,7 +4372,7 @@ fn plex_publish_urls(
     port: u16,
     plex_direct_hash: Option<&str>,
 ) -> Vec<String> {
-    let mut urls = Vec::with_capacity(addresses.len() * 2);
+    let mut urls = Vec::with_capacity(addresses.len() * if plex_direct_hash.is_some() { 2 } else { 1 });
     for address in addresses {
         urls.push(format!("http://{address}:{port}"));
         if let (Some(hash), std::net::IpAddr::V4(address)) = (plex_direct_hash, address) {
