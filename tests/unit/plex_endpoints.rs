@@ -853,6 +853,81 @@ fn plex_local_http_connection_keeps_registration_usable_without_local_https() {
     ));
 }
 
+#[test]
+fn plex_registration_contract_accepts_local_http_with_remote_plex_direct_https() {
+    let fixture = fixture();
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE server_identity SET plex_account_token = 'saved-server-token', claimed = 0, plex_last_error = 'previous publication failure' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+
+    let urls = super::plex_publish_urls(
+        &["10.20.61.51".parse().unwrap()],
+        32400,
+        Some("cert-hash"),
+    );
+    assert_eq!(
+        urls,
+        [
+            "http://10.20.61.51:32400",
+            "https://10-20-61-51.cert-hash.plex.direct:32400"
+        ]
+    );
+    let announce = super::plex_device_announce_query(&urls, true, "saved-server-token");
+    assert!(announce.contains(&(
+        "Connection[][uri]",
+        "https://10-20-61-51.cert-hash.plex.direct:32400"
+    )));
+
+    let machine_identifier = fixture.state.machine_identifier.as_ref();
+    let resources = serde_json::json!([{
+        "clientIdentifier": machine_identifier,
+        "provides": "server",
+        "accessToken": "server-access-token",
+        "connections": [
+            {
+                "address": "10.20.61.51",
+                "port": 32400,
+                "protocol": "http",
+                "local": true,
+                "uri": "http://10.20.61.51:32400"
+            },
+            {
+                "address": "10-20-61-51.cert-hash.plex.direct",
+                "port": 32400,
+                "protocol": "https",
+                "local": false,
+                "uri": "https://10-20-61-51.cert-hash.plex.direct:32400"
+            }
+        ]
+    }]);
+    assert!(super::plex_resources_contain(&resources, machine_identifier));
+    assert!(super::plex_resources_contain_local_connection(&resources, machine_identifier));
+    assert!(!super::plex_resources_contain_local_https(&resources, machine_identifier));
+
+    assert_eq!(
+        super::plex_startup_registration(&fixture.db.lock().unwrap()),
+        Some(("saved-server-token".to_owned(), false))
+    );
+    super::set_plex_registration_state(&fixture.db.lock().unwrap(), true, None).unwrap();
+    let claimed: bool = fixture
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT claimed FROM server_identity WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(claimed);
+}
+
 #[tokio::test]
 async fn settings_saves_and_validates_per_library_scan_schedule() {
     let fixture = fixture();
