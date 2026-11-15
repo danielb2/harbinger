@@ -47,6 +47,7 @@ Save this as `compose.yaml` and start Harbringer with `docker compose up -d`:
 ```yaml
 services:
   harbringer:
+    container_name: harbringer
     image: ghcr.io/danielb2/harbringer:latest
     ports:
       - "32400:32400"
