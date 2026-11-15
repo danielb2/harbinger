@@ -4,7 +4,8 @@ use super::{
 };
 use axum::{
     body::{to_bytes, Body},
-    http::{header, Method, Request, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
+    response::IntoResponse,
     Router,
 };
 use base64::Engine as _;
@@ -378,9 +379,149 @@ async fn first_run_creates_admin_and_starts_an_authenticated_session() {
     assert_eq!(setup.status(), StatusCode::OK);
     let created = send_form(&app, Method::POST, "/auth/setup", "password=correct-horse-battery&confirm_password=correct-horse-battery").await;
     assert_eq!(created.status(), StatusCode::SEE_OTHER);
+    assert!(created.headers()[header::SET_COOKIE].to_str().unwrap().contains("SameSite=Lax"));
     let cookie = created.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
     let settings = app.oneshot(Request::builder().uri("/settings").header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
     assert_eq!(settings.status(), StatusCode::OK);
+}
+
+#[test]
+fn plex_sign_in_upgrades_existing_admin_cookie_for_cross_site_forwarding() {
+    let headers = HeaderMap::from_iter([(
+        header::COOKIE,
+        HeaderValue::from_static("harbringer_session=existing-session"),
+    )]);
+    let mut response = StatusCode::SEE_OTHER.into_response();
+
+    super::refresh_web_session_cookie(&headers, &mut response);
+
+    assert_eq!(
+        response.headers()[header::SET_COOKIE],
+        "harbringer_session=existing-session; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
+    );
+}
+
+#[test]
+fn plex_auth_keeps_the_configured_name_for_pin_creation_and_display() {
+    let configured_name = "Living Room Server";
+    let auth_url = super::plex_auth_url(
+        "stable-client-id",
+        "pin-code",
+        configured_name,
+        "http://localhost:32400/settings/plex/callback?pin_id=1234",
+    );
+
+    assert!(auth_url.contains("clientID=stable-client-id"));
+    assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=Living%20Room%20Server"));
+    assert!(auth_url.contains("context%5Bdevice%5D%5BdeviceName%5D=Living%20Room%20Server"));
+    assert!(auth_url.contains("forwardUrl=http%3A%2F%2Flocalhost%3A32400%2Fsettings%2Fplex%2Fcallback%3Fpin_id%3D1234"));
+}
+
+#[test]
+fn plex_auth_uses_a_stable_auth_client_identifier_for_pin_creation_and_polling() {
+    let fixture = fixture();
+    *fixture.state.server_name.write().unwrap() = "Living Room Server".to_owned();
+
+    assert_eq!(
+        super::plex_auth_client_identifier(&fixture.state),
+        format!("{}-auth", fixture.state.machine_identifier)
+    );
+    assert_eq!(
+        super::plex_auth_product(&fixture.state),
+        "Living Room Server"
+    );
+}
+
+#[test]
+fn plex_pin_status_request_uses_the_documented_device_jwt_parameter() {
+    let url = super::plex_pin_status_url(1234, "signed-device-jwt");
+    let query = url.query_pairs().collect::<Vec<_>>();
+
+    assert!(query.iter().any(|(key, value)| key == "deviceJWT" && value == "signed-device-jwt"));
+    assert!(!query.iter().any(|(key, _)| key == "code"));
+}
+
+#[test]
+fn plex_pin_status_accepts_the_documented_auth_token_response() {
+    let pending: super::PlexPinStatusResponse =
+        serde_json::from_str(r#"{"authToken":null}"#).unwrap();
+    assert!(pending.auth_token.is_none());
+
+    let confirmed: super::PlexPinStatusResponse =
+        serde_json::from_str(r#"{"authToken":"plex-account-token"}"#).unwrap();
+    assert_eq!(confirmed.auth_token.as_deref(), Some("plex-account-token"));
+}
+
+#[test]
+fn plex_pin_error_summary_keeps_the_api_reason_without_raw_response_data() {
+    assert_eq!(
+        super::plex_pin_error_summary(r#"{"error":"Code not found or expired","status":404}"#),
+        Some("Code not found or expired".to_owned())
+    );
+    assert_eq!(super::plex_pin_error_summary("not json"), None);
+}
+
+#[test]
+fn plex_auth_status_selects_the_newest_pin_or_the_callback_specific_pin() {
+    let fixture = fixture();
+    let connection = fixture.db.lock().unwrap();
+    connection
+        .execute(
+            "INSERT INTO plex_auth (id, code, created_at) VALUES (101, 'older', 1000), (202, 'newer', 2000)",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(super::plex_auth_pin_id(&connection, None), Some(202));
+    assert_eq!(super::plex_auth_pin_id(&connection, Some(101)), Some(101));
+}
+
+#[test]
+fn plex_server_registration_uses_the_configured_server_name() {
+    let fixture = fixture();
+    let configured_name = "Living Room Plex";
+
+    let xml = super::plex_server_registration_xml(&fixture.state, configured_name).unwrap();
+
+    assert!(xml.contains("<Server name=\"Living Room Plex\""));
+}
+
+#[test]
+fn plex_resource_summary_exposes_http_only_publication_without_tokens() {
+    let resources = serde_json::json!([{
+        "clientIdentifier": "server-id",
+        "name": "Living Room Server",
+        "provides": "server",
+        "accessToken": "must-not-be-logged",
+        "connections": [
+            {
+                "address": "10.20.61.51",
+                "port": 32400,
+                "protocol": "http",
+                "local": true,
+                "uri": "http://10.20.61.51:32400"
+            },
+            {
+                "address": "14.161.43.148",
+                "port": 32400,
+                "protocol": "http",
+                "local": false,
+                "uri": "http://14.161.43.148:32400"
+            }
+        ]
+    }]);
+
+    assert!(super::plex_resources_contain(&resources, "server-id"));
+    assert!(!super::plex_resources_contain_local_https(
+        &resources,
+        "server-id"
+    ));
+
+    let summary = super::plex_resource_connection_summary(&resources, "server-id");
+
+    assert!(summary.to_string().contains("10.20.61.51"));
+    assert!(summary.to_string().contains("14.161.43.148"));
+    assert!(!summary.to_string().contains("must-not-be-logged"));
 }
 
 #[tokio::test]

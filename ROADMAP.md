@@ -129,6 +129,10 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-01
 
+### 2026-11-15
+
+- Plex PIN callbacks now poll their own PIN, avoiding stale-row selection. Claim and registration keep the configured server name. The latest Plex trace showed `servers.xml` created the record and the device announcement was accepted, but Plex returned only HTTP connections; the announcement now also sends the certificate-backed local `plex.direct` HTTPS URI. `cargo test` passed 196 tests and `git diff --check` passed. A new live Plex registration check is still pending.
+
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
 - Plex Desktop playback works on the current restored-capability source. Plex Web still returns `s4032 (Manifest)` for Millennium Actress. Shaka reports `Empty XML source`; the server's MPD requests return HTTP 200, but no init or media requests follow. The current code uses a one-based `SegmentTemplate`, maps segment 1 to the first fragment, keeps truthful `startWithSAP=0`, and sets explicit manifest length. Verify the latest response body in Plex Web.
 - Live item metadata exposed part and external subtitle stream IDs above JavaScript's exact integer limit (2^53−1). These IDs now use deterministic safe-range numbers; on the reloaded `just dev` server, the revised part URL returned HTTP 206 and an advertised external subtitle URL returned HTTP 200 as WebVTT. The official client still needs a metadata refresh and Play-button check.

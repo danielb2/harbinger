@@ -671,8 +671,13 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             {
                 warn!(error = %error, "could not ensure Plex TLS certificate at startup");
             }
-            if let Err(error) =
-                publish_plex_connections(&client, &publication_state, &server_token).await
+            if let Err(error) = publish_plex_connections(
+                &client,
+                &publication_state,
+                &startup_server_name,
+                &server_token,
+            )
+            .await
             {
                 warn!(error = %error, "could not refresh Plex connection URLs at startup");
             } else {
@@ -1991,6 +1996,15 @@ struct SettingsQuery {
 struct PlexPinResponse {
     id: i64,
     code: String,
+}
+
+#[derive(Deserialize, Default)]
+struct PlexAuthStatusQuery {
+    pin_id: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PlexPinStatusResponse {
     #[serde(rename = "authToken")]
     auth_token: Option<String>,
 }
@@ -2002,6 +2016,73 @@ struct PlexClaimTokenResponse {
 
 fn plex_auth_client_identifier(state: &AppState) -> String {
     format!("{}-auth", state.machine_identifier)
+}
+
+fn plex_auth_product(state: &AppState) -> String {
+    server_name(state)
+}
+
+fn plex_auth_url(
+    client_identifier: &str,
+    pin_code: &str,
+    server_name: &str,
+    callback: &str,
+) -> String {
+    format!(
+        "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D={}&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
+        url_encode(client_identifier),
+        url_encode(pin_code),
+        url_encode(server_name),
+        env!("CARGO_PKG_VERSION"),
+        url_encode(server_name),
+        url_encode(callback)
+    )
+}
+
+fn plex_pin_status_url(pin_id: i64, device_jwt: &str) -> reqwest::Url {
+    let mut url = reqwest::Url::parse(&format!("https://clients.plex.tv/api/v2/pins/{pin_id}"))
+        .expect("Plex PIN status URL is valid");
+    url.query_pairs_mut().append_pair("deviceJWT", device_jwt);
+    url
+}
+
+fn plex_pin_error_summary(body: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
+    let message = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("message").and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|errors| errors.first())
+                .and_then(|error| error.get("message"))
+                .and_then(serde_json::Value::as_str)
+        })?;
+    let summary = message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(160)
+        .collect::<String>();
+    (!summary.is_empty()).then_some(summary)
+}
+
+fn plex_auth_pin_id(connection: &rusqlite::Connection, requested_id: Option<i64>) -> Option<i64> {
+    if let Some(pin_id) = requested_id {
+        return connection
+            .query_row("SELECT id FROM plex_auth WHERE id = ?1", [pin_id], |row| {
+                row.get(0)
+            })
+            .ok();
+    }
+    connection
+        .query_row(
+            "SELECT id FROM plex_auth ORDER BY created_at DESC, id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok()
 }
 
 fn plex_device_key(state: &AppState) -> Result<(SigningKey, String), String> {
@@ -3216,8 +3297,14 @@ async fn web_media_for_relative(
 }
 
 async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let client = reqwest::Client::new();
-    let configured_server_name = server_name(&state);
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return settings_error("Could not initialize Plex authentication"),
+    };
+    let configured_server_name = plex_auth_product(&state);
     let auth_client_identifier = plex_auth_client_identifier(&state);
     let Ok((signing_key, kid)) = plex_device_key(&state) else {
         return settings_error("Could not initialize Plex device authentication");
@@ -3234,19 +3321,39 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         .send()
         .await
     {
-        Ok(response) => response,
-        Err(_) => return settings_error("Plex.tv could not be reached"),
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(%error, "Plex PIN request was rejected");
+                return settings_error("Plex.tv could not start sign-in");
+            }
+        },
+        Err(error) => {
+            warn!(%error, "Plex PIN request failed");
+            return settings_error("Plex.tv could not be reached");
+        }
     };
     let Ok(pin) = response.json::<PlexPinResponse>().await else {
         return settings_error("Plex.tv returned an invalid authentication response");
     };
+    info!(client_identifier = %auth_client_identifier, product = "harbringer", server_name = %configured_server_name, "Created Plex sign-in PIN");
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
+    let created_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or_default();
     if connection
         .execute(
-            "INSERT OR REPLACE INTO plex_auth (id, code, created_at) VALUES (?1, ?2, strftime('%s', 'now'))",
-            (pin.id, &pin.code),
+            "DELETE FROM plex_auth WHERE created_at < ?1",
+            [created_at.saturating_sub(30 * 60 * 1000)],
+        )
+        .is_err()
+        || connection
+        .execute(
+            "INSERT OR REPLACE INTO plex_auth (id, code, created_at) VALUES (?1, ?2, ?3)",
+            (pin.id, &pin.code, created_at),
         )
         .is_err()
     {
@@ -3260,22 +3367,39 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .unwrap_or("http");
-    let callback = format!("{proto}://{host}/settings/plex/callback");
-    let link = format!(
-        "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D={}&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
-        url_encode(&auth_client_identifier),
-        url_encode(&pin.code),
-        url_encode(&configured_server_name),
-        env!("CARGO_PKG_VERSION"),
-        url_encode(&configured_server_name),
-        url_encode(&callback)
+    let callback = format!("{proto}://{host}/settings/plex/callback?pin_id={}", pin.id);
+    let link = plex_auth_url(
+        &auth_client_identifier,
+        &pin.code,
+        &configured_server_name,
+        &callback,
     );
-    Redirect::to(&link).into_response()
+    let mut response = Redirect::to(&link).into_response();
+    refresh_web_session_cookie(&headers, &mut response);
+    response
 }
 
-async fn plex_auth_callback(State(state): State<AppState>) -> Response {
-    for _ in 0..60 {
-        let _ = plex_auth_status(State(state.clone())).await;
+async fn plex_auth_callback(
+    State(state): State<AppState>,
+    Query(query): Query<PlexAuthStatusQuery>,
+) -> Response {
+    let Some(pin_id) = query.pin_id else {
+        return Redirect::to(
+            "/settings?error=Plex%20sign-in%20callback%20did%20not%20identify%20its%20PIN.",
+        )
+        .into_response();
+    };
+    for attempt in 0..15 {
+        let status = plex_auth_status_for(state.clone(), Some(pin_id)).await;
+        if status.status() == StatusCode::NOT_FOUND {
+            if let Ok(connection) = state.db.lock() {
+                let _ = connection.execute("DELETE FROM plex_auth WHERE id = ?1", [pin_id]);
+            }
+            return Redirect::to(
+                "/settings?error=Plex%20rejected%20the%20PIN.%20Start%20sign-in%20again.",
+            )
+            .into_response();
+        }
         let pending = state
             .db
             .lock()
@@ -3283,40 +3407,55 @@ async fn plex_auth_callback(State(state): State<AppState>) -> Response {
             .and_then(|connection| {
                 connection
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM plex_auth WHERE id != 0)",
-                        [],
+                        "SELECT EXISTS(SELECT 1 FROM plex_auth WHERE id = ?1)",
+                        [pin_id],
                         |row| row.get::<_, bool>(0),
                     )
                     .ok()
             })
             .unwrap_or(false);
         if !pending {
-            break;
+            return Redirect::to("/settings").into_response();
         }
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if attempt < 14 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
-    Redirect::to("/settings").into_response()
+    Redirect::to("/settings?error=Plex%20sign-in%20was%20not%20confirmed.%20Please%20try%20again.")
+        .into_response()
 }
 
 async fn plex_auth_status(State(state): State<AppState>) -> Response {
-    let Some((pin_id, _pin_code)) = state.db.lock().ok().and_then(|connection| {
-        connection
-            .query_row("SELECT id, code FROM plex_auth WHERE id != 0", [], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .ok()
-    }) else {
+    plex_auth_status_for(state, None).await
+}
+
+async fn plex_auth_status_for(state: AppState, requested_id: Option<i64>) -> Response {
+    let Some(pin_id) = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| plex_auth_pin_id(&connection, requested_id))
+    else {
         return Json(serde_json::json!({"authorized": false})).into_response();
     };
     let Ok((signing_key, kid)) = plex_device_key(&state) else {
         return Json(serde_json::json!({"authorized": false})).into_response();
     };
     let device_jwt = plex_device_jwt(&signing_key, &kid, &plex_auth_client_identifier(&state));
-    let response = reqwest::Client::new()
-        .get(format!("https://clients.plex.tv/api/v2/pins/{pin_id}"))
-        .query(&[("deviceJWT", device_jwt.as_str())])
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(error) => {
+            warn!(%error, "could not initialize Plex PIN check");
+            return Json(serde_json::json!({"authorized": false})).into_response();
+        }
+    };
+    let response = client
+        .get(plex_pin_status_url(pin_id, &device_jwt))
         .header("Accept", "application/json")
-        .header("X-Plex-Product", "harbringer")
+        .header("X-Plex-Product", plex_auth_product(&state))
         .header(
             "X-Plex-Client-Identifier",
             plex_auth_client_identifier(&state),
@@ -3324,9 +3463,24 @@ async fn plex_auth_status(State(state): State<AppState>) -> Response {
         .send()
         .await;
     let Ok(response) = response else {
+        warn!("Plex PIN check failed before a response was received");
         return Json(serde_json::json!({"authorized": false})).into_response();
     };
-    let Ok(pin) = response.json::<PlexPinResponse>().await else {
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let error = plex_pin_error_summary(&body);
+        warn!(
+            ?status,
+            plex_error = error.as_deref().unwrap_or("unavailable"),
+            client_identifier = %plex_auth_client_identifier(&state),
+            product = "harbringer",
+            "Plex PIN check was rejected"
+        );
+        return (status, Json(serde_json::json!({"authorized": false}))).into_response();
+    }
+    let Ok(pin) = response.json::<PlexPinStatusResponse>().await else {
+        warn!("Plex PIN check returned an invalid response");
         return Json(serde_json::json!({"authorized": false})).into_response();
     };
     let Some(token) = pin.auth_token.filter(|token| !token.is_empty()) else {
@@ -3352,7 +3506,7 @@ async fn plex_auth_status(State(state): State<AppState>) -> Response {
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let _ = connection.execute("DELETE FROM plex_auth", []);
+    let _ = connection.execute("DELETE FROM plex_auth WHERE id = ?1", [pin_id]);
     drop(connection);
     if claimed {
         let presence_state = state.clone();
@@ -3454,7 +3608,11 @@ async fn claim_and_publish_plex_server(
     state: &AppState,
     account_token: &str,
 ) -> Result<(String, bool, Option<String>), String> {
-    let client = reqwest::Client::new();
+    let configured_server_name = server_name(state);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| format!("could not initialize Plex server claim: {error}"))?;
     let claim_response = client
         .get("https://plex.tv/api/claim/token.json")
         .header("Accept", "application/json")
@@ -3462,7 +3620,7 @@ async fn claim_and_publish_plex_server(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", server_name(state))
+        .header("X-Plex-Device-Name", &configured_server_name)
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Provides", "server")
         .header(
@@ -3491,7 +3649,7 @@ async fn claim_and_publish_plex_server(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", server_name(state))
+        .header("X-Plex-Device-Name", &configured_server_name)
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Provides", "server")
         .header(
@@ -3515,7 +3673,7 @@ async fn claim_and_publish_plex_server(
         .ensure_certificate(
             &client,
             &state.machine_identifier,
-            &server_name(state),
+            &configured_server_name,
             &server_token,
         )
         .await
@@ -3523,22 +3681,28 @@ async fn claim_and_publish_plex_server(
     if let Some(error) = &tls_error {
         warn!(error = %error, "Plex TLS certificate unavailable; publishing the HTTP connection fallback");
     }
-    if let Err(error) = publish_plex_connections(&client, state, &server_token).await {
+    if let Err(error) = publish_plex_connections(
+        &client,
+        state,
+        &configured_server_name,
+        &server_token,
+    )
+    .await
+    {
         return Ok((server_token, false, Some(error)));
     }
 
-    if let Err(error) = verify_plex_resource(&client, state, &server_token).await {
-        return Ok((server_token, false, Some(error)));
-    }
     Ok((server_token, true, tls_error))
 }
 
 async fn publish_plex_connections(
     client: &reqwest::Client,
     state: &AppState,
+    configured_server_name: &str,
     server_token: &str,
 ) -> Result<(), String> {
-    let registration = plex_server_registration_xml(state)?;
+    let registration = plex_server_registration_xml(state, configured_server_name)?;
+    info!(server_name = %configured_server_name, "Registering Harbringer with Plex");
     let registration_response = client
         .post("https://servers.plex.tv/servers.xml")
         .query(&[("auth_token", server_token)])
@@ -3550,7 +3714,7 @@ async fn publish_plex_connections(
         .header("X-Plex-Version", "1.43.4.10903-e5521bd8c")
         .header("X-Plex-Platform", "MacOSX")
         .header("X-Plex-Platform-Version", std::env::consts::ARCH)
-        .header("X-Plex-Device-Name", server_name(state))
+        .header("X-Plex-Device-Name", configured_server_name)
         .header("X-Plex-Device", "MacOSX")
         .header("X-Plex-Model", std::env::consts::ARCH)
         .header(
@@ -3576,6 +3740,7 @@ async fn publish_plex_connections(
     }
     info!(
         status = %registration_response.status(),
+        server_name = %configured_server_name,
         "Plex server registration response"
     );
     publish_plex_device(client, state, server_token).await?;
@@ -3588,39 +3753,96 @@ async fn verify_plex_resource(
     state: &AppState,
     server_token: &str,
 ) -> Result<(), String> {
-    let resources = client
-        .get("https://clients.plex.tv/api/v2/resources")
-        .query(&[
-            ("includeHttps", "1"),
-            ("includeRelay", "1"),
-            ("includeIPv6", "1"),
-        ])
-        .header("Accept", "application/json")
-        .header("X-Plex-Product", "harbringer")
-        .header(
-            "X-Plex-Client-Identifier",
+    const ATTEMPTS: usize = 6;
+    let mut last_error = "Plex.tv did not publish a usable Harbringer server resource".to_owned();
+    let mut last_resources = serde_json::Value::Null;
+    for attempt in 0..ATTEMPTS {
+        let resources = client
+            .get("https://clients.plex.tv/api/v2/resources")
+            .query(&[
+                ("includeHttps", "1"),
+                ("includeRelay", "1"),
+                ("includeIPv6", "1"),
+            ])
+            .header("Accept", "application/json")
+            .header("X-Plex-Product", "harbringer")
+            .header(
+                "X-Plex-Client-Identifier",
+                state.machine_identifier.as_ref(),
+            )
+            .header("X-Plex-Token", server_token)
+            .send()
+            .await
+            .map_err(|error| format!("could not verify harbringer in Plex resources: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("Plex resource verification failed: {error}"))?
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| format!("Plex returned invalid resource data: {error}"))?;
+        let has_server = plex_resources_contain(&resources, state.machine_identifier.as_ref());
+        let has_local_https = plex_resources_contain_local_https(
+            &resources,
             state.machine_identifier.as_ref(),
-        )
-        .header("X-Plex-Token", server_token)
-        .send()
-        .await
-        .map_err(|error| format!("could not verify harbringer in Plex resources: {error}"))?
-        .error_for_status()
-        .map_err(|error| format!("Plex resource verification failed: {error}"))?
-        .json::<serde_json::Value>()
-        .await
-        .map_err(|error| format!("Plex returned invalid resource data: {error}"))?;
-    if !plex_resources_contain(&resources, state.machine_identifier.as_ref()) {
-        return Err("Plex.tv did not publish a usable Harbringer server resource".to_owned());
-    }
-    if state.plex_tls.hash().is_some()
-        && !plex_resources_contain_local_https(&resources, state.machine_identifier.as_ref())
-    {
-        return Err(
-            "Plex.tv did not publish Harbringer's local HTTPS plex.direct connection".to_owned(),
         );
+        if has_server && (state.plex_tls.hash().is_none() || has_local_https) {
+            return Ok(());
+        }
+        last_error = if has_server && state.plex_tls.hash().is_some() {
+            "Plex.tv did not publish Harbringer's local HTTPS plex.direct connection".to_owned()
+        } else {
+            "Plex.tv did not publish a usable Harbringer server resource".to_owned()
+        };
+        last_resources = plex_resource_connection_summary(
+            &resources,
+            state.machine_identifier.as_ref(),
+        );
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
-    Ok(())
+    warn!(resources = %last_resources, error = %last_error, "Plex resource publication did not converge");
+    Err(last_error)
+}
+
+fn plex_resource_connection_summary(
+    resources: &serde_json::Value,
+    machine_identifier: &str,
+) -> serde_json::Value {
+    serde_json::Value::Array(
+        resources
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|resource| {
+                resource
+                    .get("clientIdentifier")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(machine_identifier)
+            })
+            .map(|resource| {
+                let connections = resource
+                    .get("connections")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|connection| {
+                        serde_json::json!({
+                            "address": connection.get("address"),
+                            "port": connection.get("port"),
+                            "protocol": connection.get("protocol"),
+                            "local": connection.get("local"),
+                            "uri": connection.get("uri")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                serde_json::json!({
+                    "name": resource.get("name"),
+                    "provides": resource.get("provides"),
+                    "connections": connections
+                })
+            })
+            .collect(),
+    )
 }
 
 async fn plex_account_id(
@@ -3861,7 +4083,10 @@ fn plex_device_announce_query<'a>(
         .collect()
 }
 
-fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
+fn plex_server_registration_xml(
+    state: &AppState,
+    configured_server_name: &str,
+) -> Result<String, String> {
     let bind = state
         .config
         .lock()
@@ -3900,7 +4125,7 @@ fn plex_server_registration_xml(state: &AppState) -> Result<String, String> {
     Ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"{}\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
         libraries.len() + 1,
-        xml_escape(&server_name(state)),
+        xml_escape(configured_server_name),
         xml_escape(&local_addresses),
         bind.port(),
         xml_escape(&state.machine_identifier),
@@ -4004,17 +4229,29 @@ fn plex_connection_urls(state: &AppState) -> Vec<String> {
     let Some(bind) = bind else {
         return Vec::new();
     };
-    plex_publish_urls(&plex_local_addresses(state), bind.port())
+    plex_publish_urls(
+        &plex_local_addresses(state),
+        bind.port(),
+        state.plex_tls.hash().as_deref(),
+    )
 }
 
-fn plex_publish_urls(addresses: &[std::net::IpAddr], port: u16) -> Vec<String> {
-    // Match Plex Media Server and Ether: publish the local HTTP endpoint and
-    // set httpsEnabled on the device record. Plex.tv then derives the trusted
-    // plex.direct HTTPS URI from the LAN address and the issued certificate.
-    addresses
-        .iter()
-        .map(|host| format!("http://{host}:{port}"))
-        .collect()
+fn plex_publish_urls(
+    addresses: &[std::net::IpAddr],
+    port: u16,
+    plex_direct_hash: Option<&str>,
+) -> Vec<String> {
+    let mut urls = Vec::with_capacity(addresses.len() * 2);
+    for address in addresses {
+        urls.push(format!("http://{address}:{port}"));
+        if let (Some(hash), std::net::IpAddr::V4(address)) = (plex_direct_hash, address) {
+            let plex_direct_host = address.to_string().replace('.', "-");
+            urls.push(format!(
+                "https://{plex_direct_host}.{hash}.plex.direct:{port}"
+            ));
+        }
+    }
+    urls
 }
 
 fn plex_local_addresses(state: &AppState) -> Vec<std::net::IpAddr> {
@@ -13595,8 +13832,27 @@ fn issue_web_session(state: &AppState) -> Response {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
     if state.db.lock().ok().is_none_or(|db| db.execute("INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)", (&token_hash, now + 60 * 60 * 24 * 14)).is_err()) { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
     let mut response = Redirect::to("/").into_response();
-    if let Ok(value) = HeaderValue::from_str(&format!("harbringer_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=1209600")) { response.headers_mut().insert(header::SET_COOKIE, value); }
+    if let Ok(value) = HeaderValue::from_str(&format!("harbringer_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600")) { response.headers_mut().insert(header::SET_COOKIE, value); }
     response
+}
+
+fn refresh_web_session_cookie(headers: &HeaderMap, response: &mut Response) {
+    let Some(token) = headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|cookie| {
+            cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("harbringer_session="))
+        })
+    else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "harbringer_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -13606,7 +13862,7 @@ async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Respo
         if let Ok(db) = state.db.lock() { let _ = db.execute("DELETE FROM web_sessions WHERE token_hash = ?1", [&token_hash]); }
     }
     let mut response = Redirect::to("/auth").into_response();
-    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("harbringer_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"));
+    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("harbringer_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
     response
 }
 

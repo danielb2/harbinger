@@ -801,9 +801,24 @@ fn plex_publishes_lan_http_urls_for_plex_direct_discovery() {
                 "10.20.61.51".parse().unwrap(),
                 "192.168.1.10".parse().unwrap()
             ],
-            32400
+            32400,
+            None
         ),
         ["http://10.20.61.51:32400", "http://192.168.1.10:32400"]
+    );
+}
+#[test]
+fn plex_publishes_explicit_plex_direct_https_urls_when_a_certificate_exists() {
+    assert_eq!(
+        plex_publish_urls(
+            &["10.20.61.51".parse().unwrap()],
+            32400,
+            Some("77917460f0a9494f9b68fb00bb562a9c")
+        ),
+        [
+            "http://10.20.61.51:32400",
+            "https://10-20-61-51.77917460f0a9494f9b68fb00bb562a9c.plex.direct:32400"
+        ]
     );
 }
 #[test]

@@ -5,6 +5,10 @@ Project guidance for `harbringer`: the target is a 100% drop-in replacement for 
 ## Essential rules
 - Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
+- Read `FEATURES.md` before changing a user-facing feature covered there. Treat its user goals and acceptance conditions as requirements; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a feature contract, preserve the contract and find another implementation. Record regressions as regressions.
+
+- Treat the configured Plex server name as a user-visible identity requirement. Preserve it in the Auth App device context, server registration, resource publication, Plex descriptors, and LAN discovery. Keep Harbringer's stable client/product identifier separate from that display name; never replace the configured name with the product identifier as an incidental protocol fix. Before changing this identity mapping, compare the last working commit and current Plex traces, state the expected visible name, and keep a regression check for every affected surface.
+
 - Read relevant code and current Plex request traces before changing behavior.
 - Keep the protocol surface Plex-only. Do not add Jellyfin routes or mix adapters.
 - Before implementing or changing any Plex API behavior, consult the official PMS API documentation at https://developer.plex.tv/pms and verify the operation, parameters, response formats, and status codes. Do not rely on request traces or assumptions in place of the documentation. If the documentation does not specify a detail or is unavailable, state that clearly and use current request traces and a reference PMS or compatible implementation where available; do not present an inference as documented behavior. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
