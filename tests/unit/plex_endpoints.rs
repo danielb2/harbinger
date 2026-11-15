@@ -100,11 +100,11 @@ fn fixture() -> Fixture {
     let config_dir = root.join("config");
     let media_dir = root.join("media");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::create_dir_all(media_dir.join(".mplex")).unwrap();
+    std::fs::create_dir_all(media_dir.join(".hbgr")).unwrap();
     let media_path = media_dir.join("Demo.mkv");
     std::fs::write(&media_path, b"0123456789abcdef").unwrap();
-    std::fs::write(media_dir.join(".mplex/cover.jpg"), b"cover").unwrap();
-    std::fs::write(media_dir.join(".mplex/banner.jpg"), b"banner").unwrap();
+    std::fs::write(media_dir.join(".hbgr/cover.jpg"), b"cover").unwrap();
+    std::fs::write(media_dir.join(".hbgr/banner.jpg"), b"banner").unwrap();
     std::fs::write(
         media_dir.join("Demo.en.srt"),
         b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
@@ -133,7 +133,7 @@ fn fixture() -> Fixture {
     let config = Config {
         bind: "127.0.0.1:0".to_owned(),
         libraries: vec![library],
-        metadata_storage: "sidecar".to_owned(),
+        metadata_storage: "media".to_owned(),
         tmdb_bearer_token: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
@@ -243,7 +243,7 @@ fn tv_fixture() -> Fixture {
             metadata_agent_provider_group_id: None,
             plex_preferences: None,
         }],
-        metadata_storage: "sidecar".to_owned(),
+        metadata_storage: "media".to_owned(),
         tmdb_bearer_token: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
@@ -434,7 +434,7 @@ fn plex_sign_in_upgrades_existing_admin_cookie_for_cross_site_forwarding() {
 }
 
 #[test]
-fn plex_auth_keeps_the_configured_name_for_pin_creation_and_display() {
+fn plex_auth_keeps_product_identity_separate_from_server_display_name() {
     let configured_name = "Living Room Server";
     let auth_url = super::plex_auth_url(
         "stable-client-id",
@@ -444,13 +444,13 @@ fn plex_auth_keeps_the_configured_name_for_pin_creation_and_display() {
     );
 
     assert!(auth_url.contains("clientID=stable-client-id"));
-    assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=Living%20Room%20Server"));
+    assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=harbringer"));
     assert!(auth_url.contains("context%5Bdevice%5D%5BdeviceName%5D=Living%20Room%20Server"));
     assert!(auth_url.contains("forwardUrl=http%3A%2F%2Flocalhost%3A32400%2Fsettings%2Fplex%2Fcallback%3Fpin_id%3D1234"));
 }
 
 #[test]
-fn plex_auth_uses_a_stable_auth_client_identifier_for_pin_creation_and_polling() {
+fn plex_auth_uses_a_stable_auth_client_identifier_and_product_for_pin_creation_and_polling() {
     let fixture = fixture();
     *fixture.state.server_name.write().unwrap() = "Living Room Server".to_owned();
 
@@ -458,10 +458,20 @@ fn plex_auth_uses_a_stable_auth_client_identifier_for_pin_creation_and_polling()
         super::plex_auth_client_identifier(&fixture.state),
         format!("{}-auth", fixture.state.machine_identifier)
     );
-    assert_eq!(
-        super::plex_auth_product(&fixture.state),
-        "Living Room Server"
-    );
+    assert_eq!(super::plex_auth_product(&fixture.state), "harbringer");
+}
+
+
+#[test]
+fn plex_device_jwk_declares_signing_use() {
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1; 32]);
+    let jwk = super::plex_device_jwk(&signing_key, "test-key-id");
+
+    assert_eq!(jwk["kty"], "OKP");
+    assert_eq!(jwk["crv"], "Ed25519");
+    assert_eq!(jwk["use"], "sig");
+    assert_eq!(jwk["kid"], "test-key-id");
+    assert_eq!(jwk["alg"], "EdDSA");
 }
 
 #[test]
@@ -725,24 +735,12 @@ async fn library_rename_rejects_blank_names_and_unknown_libraries() {
 }
 
 #[tokio::test]
-async fn plex_artwork_serves_database_stored_cover() {
+async fn plex_artwork_serves_config_sidecar_cover() {
     let fixture = fixture();
-    fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
-    let artwork_path = fixture.root.join("saved-cover.jpg");
-    std::fs::write(&artwork_path, b"cover bytes").unwrap();
-    fixture
-        .db
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT OR REPLACE INTO artwork (media_key, kind, local_path, downloaded_at) VALUES (?1, ?2, ?3, strftime('%s', 'now'))",
-            (
-                "1-1",
-                "cover",
-                artwork_path.to_string_lossy().as_ref(),
-            ),
-        )
-        .unwrap();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let artwork_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    std::fs::create_dir_all(&artwork_dir).unwrap();
+    std::fs::write(artwork_dir.join("cover.jpg"), b"cover bytes").unwrap();
 
     let response = send(
         &fixture.app,
@@ -770,6 +768,73 @@ async fn plex_artwork_serves_database_stored_cover() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), b"cover bytes");
 }
+
+#[tokio::test]
+async fn hbweb_serves_config_sidecar_banner() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let artwork_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    std::fs::create_dir_all(&artwork_dir).unwrap();
+    std::fs::write(artwork_dir.join("banner.jpg"), b"banner bytes").unwrap();
+
+    let web_app = build_web_listener_app(fixture.state.clone())
+        .layer(axum::middleware::from_fn(inject_test_cookie));
+    let response = web_app
+        .oneshot(
+            Request::builder()
+                .uri("/web/artwork/media/1-1/banner")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"banner bytes");
+}
+
+
+#[tokio::test]
+async fn hbweb_uses_config_sidecar_banner_as_show_background() {
+    let fixture = tv_fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media_index = super::media_snapshot(&fixture.state);
+    let media = media_index
+        .iter()
+        .find(|media| media.path.to_string_lossy().contains("Example Show"))
+        .unwrap()
+        .clone();
+    let key = super::database_media_key(1, &media.id);
+    let artwork_dir = super::config_metadata_sidecar_path(&fixture.state, &key)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&artwork_dir).unwrap();
+    std::fs::write(artwork_dir.join("banner.jpg"), b"banner bytes").unwrap();
+
+    let web_app = build_web_listener_app(fixture.state.clone())
+        .layer(axum::middleware::from_fn(inject_test_cookie));
+    let response = web_app
+        .oneshot(
+            Request::builder()
+                .uri("/?library=0&path=Example%20Show")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("background-image:linear-gradient"));
+    assert!(body.contains("kind=banner"));
+}
+
 
 #[test]
 fn startup_retries_saved_plex_token_after_publication_failure() {
@@ -996,6 +1061,10 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
 
     assert!(library_markup.contains("data-settings-delete=\"folder\""));
     assert!(library_markup.contains("data-settings-delete=\"library\""));
+    assert!(page.contains("Store metadata with media"));
+    assert!(page.contains("Store metadata in config folder"));
+    assert!(page.contains("Both options use the same .hbgr sidecar format"));
+    assert!(!page.contains("SQLite database"));
     assert!(page.contains("X-Mplex-Async"));
     assert!(page.contains("currentList.replaceWith(nextList)"));
     assert!(page.contains("window.scrollTo(0, scrollTop)"));
@@ -1360,6 +1429,15 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
     assert_eq!(second_items[0]["title"], "SectionTwo");
 }
 
+
+#[test]
+fn manual_scans_match_existing_unmatched_media() {
+    assert!(!crate::metadata_scan_assets_only(0, true));
+    assert!(crate::metadata_scan_assets_only(0, false));
+    assert!(!crate::metadata_scan_assets_only(1, false));
+}
+
+
 #[tokio::test]
 async fn scans_keep_existing_supported_media_omitted_by_scan() {
     let fixture = fixture();
@@ -1718,9 +1796,9 @@ async fn other_libraries_skip_tmdb_metadata_matching() {
 }
 
 #[tokio::test]
-async fn new_tv_episode_inherits_database_show_match_automatically() {
+async fn new_tv_episode_inherits_config_sidecar_show_match_automatically() {
     let fixture = tv_fixture();
-    fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
     {
         let mut inventory = fixture.state.media.write().unwrap();
         let mut media = inventory.as_ref().clone();
@@ -1729,7 +1807,7 @@ async fn new_tv_episode_inherits_database_show_match_automatically() {
         }
         *inventory = Arc::new(media);
     }
-    super::scan_library_inventory(&fixture.state, 0)
+    super::scan_library_inventory(&fixture.state, 0, true)
         .await
         .unwrap();
 
@@ -1744,7 +1822,7 @@ async fn new_tv_episode_inherits_database_show_match_automatically() {
         "overview": "Matched show"
     });
     let first_key = first_episode.id.clone();
-    assert!(super::write_database_metadata(
+    assert!(super::write_config_metadata(
         &fixture.state,
         &first_key,
         &show_metadata
@@ -1754,7 +1832,7 @@ async fn new_tv_episode_inherits_database_show_match_automatically() {
         .root
         .join("media/Example Show/Season 01/Example.Show.S01E03.Added.mkv");
     std::fs::write(&new_path, b"new episode").unwrap();
-    super::scan_library_inventory(&fixture.state, 0)
+    super::scan_library_inventory(&fixture.state, 0, true)
         .await
         .unwrap();
 
@@ -1763,7 +1841,7 @@ async fn new_tv_episode_inherits_database_show_match_automatically() {
         .find(|media| media.path == new_path)
         .unwrap()
         .clone();
-    let new_metadata = super::read_database_metadata(&fixture.state, &new_episode.id).unwrap();
+    let new_metadata = super::read_config_metadata(&fixture.state, &new_episode.id).unwrap();
     assert_eq!(new_metadata["id"], 4242);
     assert_eq!(new_metadata["mplex_season"], 1);
     assert_eq!(new_metadata["mplex_episode"], 3);
@@ -3270,7 +3348,7 @@ async fn tv_season_navigation_renders_episode_cover_cards() {
     std::fs::write(&unindexed_episode, b"0123456789abcdef").unwrap();
     let season_info = fixture
         .root
-        .join("media/Example Show/Season 01/.mplex/data.json");
+        .join("media/Example Show/Season 01/.hbgr/data.json");
     std::fs::create_dir_all(season_info.parent().unwrap()).unwrap();
     std::fs::write(
         &season_info,
@@ -3418,7 +3496,7 @@ async fn show_sidecar_stores_show_metadata_without_a_representative_episode_path
     .await
     .unwrap();
 
-    let sidecar = std::fs::read(show_directory.join(".mplex/data.json")).unwrap();
+    let sidecar = std::fs::read(show_directory.join(".hbgr/data.json")).unwrap();
     let sidecar: serde_json::Value = serde_json::from_slice(&sidecar).unwrap();
     assert_eq!(sidecar["title"], "Tales of the Gold Monkey");
     assert_eq!(sidecar["metadata_json"]["number_of_episodes"], 22);
@@ -3457,8 +3535,14 @@ async fn tv_show_cards_display_the_season_count() {
     assert!(body.contains("aria-label=\"Search TV shows\""));
     assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
     assert!(body.contains("/web/tv-match/search"));
-    assert!(body.contains("Lost connection to Harbringer. Check that the server is running"));
-    assert!(body.contains("window.__mplexLibraryRefreshTimer = null"));
+    assert!(body.contains("Lost connection to Harbringer."));
+    assert!(body.contains("window.__mplexShowConnected"));
+    assert!(body.contains("notice.textContent = \"Connected\""));
+    assert!(body.contains("background:#166534"));
+    assert!(body.contains("position:fixed;top:0;left:0;right:0"));
+    assert!(body.contains("window.setTimeout(() => notice.remove(), 2500)"));
+    assert!(body.contains("window.__mplexConnectionCheckTimer = window.setInterval"));
+    assert!(!body.contains("then reload the page"));
     assert!(body.contains("Review the title, then click Search to look for a match."));
     assert!(body.contains("window.__mplexCardActionsCleanup?.()"));
     assert!(body.contains("window.__mplexCardActionsCleanup ="));
@@ -3482,7 +3566,7 @@ async fn home_page_renders_the_fix_match_dialog_for_home_card_actions() {
 #[tokio::test]
 async fn tv_show_view_places_show_description_above_the_library_items() {
     let fixture = tv_fixture();
-    let show_info = fixture.root.join("media/Example Show/.mplex/data.json");
+    let show_info = fixture.root.join("media/Example Show/.hbgr/data.json");
     std::fs::create_dir_all(show_info.parent().unwrap()).unwrap();
     std::fs::write(
         &show_info,
@@ -3514,7 +3598,7 @@ async fn tv_show_view_places_show_description_above_the_library_items() {
 #[tokio::test]
 async fn tv_episode_view_uses_episode_description_in_the_shared_card_location() {
     let fixture = tv_fixture();
-    let show_info = fixture.root.join("media/Example Show/.mplex/data.json");
+    let show_info = fixture.root.join("media/Example Show/.hbgr/data.json");
     std::fs::create_dir_all(show_info.parent().unwrap()).unwrap();
     std::fs::write(
         &show_info,
@@ -3523,7 +3607,7 @@ async fn tv_episode_view_uses_episode_description_in_the_shared_card_location() 
     .unwrap();
     let season_info = fixture
         .root
-        .join("media/Example Show/Season 01/.mplex/data.json");
+        .join("media/Example Show/Season 01/.hbgr/data.json");
     std::fs::create_dir_all(season_info.parent().unwrap()).unwrap();
     std::fs::write(
         &season_info,
@@ -3573,7 +3657,7 @@ async fn movie_fix_match_accepts_movie_paths_without_calling_tmdb() {
 #[tokio::test]
 async fn refresh_metadata_requires_and_preserves_existing_match() {
     let fixture = fixture();
-    super::scan_library_inventory(&fixture.state, 0)
+    super::scan_library_inventory(&fixture.state, 0, true)
         .await
         .unwrap();
     let media = super::media_snapshot(&fixture.state)
@@ -3589,9 +3673,9 @@ async fn refresh_metadata_requires_and_preserves_existing_match() {
         .unwrap()
         .contains("Refresh%20requires%20an%20existing%20metadata%20match"));
     let media_key = super::database_media_key(1, &media.id);
-    assert!(super::read_database_metadata(&fixture.state, &media_key).is_none());
+    assert!(super::read_config_metadata(&fixture.state, &media_key).is_none());
 
-    assert!(super::write_database_metadata(
+    assert!(super::write_config_metadata(
         &fixture.state,
         &media_key,
         &serde_json::json!({"id": 4242, "title": "Selected movie"})
@@ -3599,7 +3683,7 @@ async fn refresh_metadata_requires_and_preserves_existing_match() {
     let response = send(&fixture.app, Method::POST, refresh_url, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
     assert_eq!(
-        super::read_database_metadata(&fixture.state, &media_key).unwrap()["id"],
+        super::read_config_metadata(&fixture.state, &media_key).unwrap()["id"],
         4242
     );
 }
@@ -3643,30 +3727,27 @@ async fn tv_season_without_description_has_no_empty_metadata_panel() {
 }
 
 #[tokio::test]
-async fn database_metadata_renders_in_the_selected_movie_view() {
+async fn config_sidecar_metadata_renders_in_the_selected_movie_view() {
     let fixture = fixture();
-    fixture.config.lock().unwrap().metadata_storage = "database".to_owned();
-    let media_path = fixture.root.join("media/Demo.mkv");
-    let metadata = serde_json::json!({
-        "title": "Database Film",
-        "overview": "Stored film description",
-        "release_date": "2024-03-14"
-    })
-    .to_string();
-    fixture
-        .db
-        .lock()
-        .unwrap()
-        .execute(
-            "INSERT INTO media (media_key, path, title, metadata_json) VALUES (?1, ?2, ?3, ?4)",
-            [
-                "1-1-1",
-                media_path.to_str().unwrap(),
-                "Demo",
-                metadata.as_str(),
-            ],
-        )
-        .unwrap();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let sidecar_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    std::fs::create_dir_all(&sidecar_dir).unwrap();
+    std::fs::write(
+        sidecar_dir.join("data.json"),
+        serde_json::json!({
+            "title": "Config Film",
+            "description": "Stored film description",
+            "release_date": "2024-03-14",
+            "first_air_date": "",
+            "metadata_json": {
+                "title": "Config Film",
+                "overview": "Stored film description",
+                "release_date": "2024-03-14"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
 
     let response = send(
         &fixture.app,
@@ -3683,10 +3764,118 @@ async fn database_metadata_renders_in_the_selected_movie_view() {
             .to_vec(),
     )
     .unwrap();
-    assert!(body.contains("<h2>Database Film</h2>"));
+    assert!(body.contains("<h2>Config Film</h2>"));
     assert!(body.contains("Stored film description"));
     assert!(body.contains("2024-03-14"));
 }
+
+#[test]
+fn metadata_sidecar_reads_prefer_selected_location_and_fall_back() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media = super::media_snapshot(&fixture.state)
+        .iter()
+        .find(|media| media.path.ends_with("Demo.mkv"))
+        .unwrap()
+        .clone();
+    let media_key = super::database_media_key(1, &media.id);
+    let root = fixture.root.join("media");
+    let group_path = super::metadata_group_path(&root, &media.path, "movie");
+    let media_sidecar_path = super::metadata_sidecar_info_path(&group_path);
+    std::fs::create_dir_all(media_sidecar_path.parent().unwrap()).unwrap();
+    let media_info = super::MediaInfo {
+        title: "Media location".to_owned(),
+        media_path: None,
+        description: "Media description".to_owned(),
+        release_date: String::new(),
+        first_air_date: String::new(),
+        number_of_seasons: None,
+        number_of_episodes: None,
+        season: None,
+        episode: None,
+        episode_end: None,
+        episode_title: None,
+        metadata_json: serde_json::json!({"id": 101}),
+        technical: None,
+        show_id: None,
+    };
+    std::fs::write(&media_sidecar_path, serde_json::to_vec(&media_info).unwrap()).unwrap();
+    assert!(super::write_config_metadata(
+        &fixture.state,
+        &media_key,
+        &serde_json::json!({"id": 202, "title": "Config location"})
+    ));
+    assert_eq!(
+        super::read_metadata_sidecar(&fixture.state, &media_key, &group_path).unwrap()["id"],
+        202
+    );
+
+    let config_path = super::config_metadata_sidecar_path(&fixture.state, &media_key);
+    std::fs::remove_file(config_path).unwrap();
+    assert_eq!(
+        super::read_metadata_sidecar(&fixture.state, &media_key, &group_path).unwrap()["id"],
+        101
+    );
+
+    assert!(super::write_config_metadata(
+        &fixture.state,
+        &media_key,
+        &serde_json::json!({"id": 202, "title": "Config location"})
+    ));
+    fixture.config.lock().unwrap().metadata_storage = "media".to_owned();
+    assert_eq!(
+        super::read_metadata_sidecar(&fixture.state, &media_key, &group_path).unwrap()["id"],
+        101
+    );
+}
+
+
+#[test]
+fn legacy_database_metadata_migrates_to_config_sidecars() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media = super::media_snapshot(&fixture.state)
+        .iter()
+        .find(|media| media.path.ends_with("Demo.mkv"))
+        .unwrap()
+        .clone();
+    let media_key = super::database_media_key(1, &media.id);
+    let legacy_media_key = format!("1-{media_key}");
+    let serialized = serde_json::json!({
+        "id": 4242,
+        "title": "Legacy match",
+        "overview": "Preserved description"
+    })
+    .to_string();
+    {
+        let connection = fixture.db.lock().unwrap();
+        connection
+            .execute_batch("ALTER TABLE media ADD COLUMN metadata_json TEXT")
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO media (media_key, path, title, metadata_json) VALUES (?1, ?2, ?3, ?4)",
+                [
+                    legacy_media_key.as_str(),
+                    media.path.to_str().unwrap(),
+                    "Demo",
+                    serialized.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+
+    super::migrate_legacy_database_metadata(&fixture.state);
+
+    assert_eq!(
+        super::read_config_metadata(&fixture.state, &media_key).unwrap()["id"],
+        4242
+    );
+    let root = fixture.root.join("media");
+    let group_path = super::metadata_group_path(&root, &media.path, "movie");
+    assert!(!super::metadata_sidecar_info_path(&group_path).is_file());
+}
+
 
 #[test]
 fn media_cards_use_the_selected_media_cover_and_path() {
@@ -4147,7 +4336,7 @@ async fn library_creation_keeps_settings_open_and_publishes_stable_scan_metadata
     let updated_at_before_scan = providers["MediaContainer"]["updatedAt"].as_u64().unwrap();
 
     assert_eq!(
-        crate::scan_library_inventory(&fixture.state, 1)
+        crate::scan_library_inventory(&fixture.state, 1, true)
             .await
             .unwrap(),
         1

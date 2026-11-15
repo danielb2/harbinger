@@ -122,7 +122,7 @@ fn default_bind() -> String {
     "0.0.0.0:32400".to_owned()
 }
 fn default_metadata_storage() -> String {
-    "database".to_owned()
+    "config".to_owned()
 }
 fn default_true() -> bool {
     true
@@ -635,6 +635,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
 
         plex_tls,
     };
+    migrate_legacy_database_metadata(&state);
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let remux_cleanup_state = state.clone();
@@ -1358,7 +1359,16 @@ fn library_scan_interval(library: &ConfigLibrary) -> Duration {
     Duration::from_secs(seconds)
 }
 
-async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<usize, String> {
+fn metadata_scan_assets_only(newly_found: usize, match_unmatched: bool) -> bool {
+    newly_found == 0 && !match_unmatched
+}
+
+
+async fn scan_library_inventory(
+    state: &AppState,
+    library_id: usize,
+    match_unmatched: bool,
+) -> Result<usize, String> {
     let _scan_guard = state.inventory_scan_lock.lock().await;
     let library = state
         .config
@@ -1547,8 +1557,11 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
         });
         let _ = state.plex_notifications.send(notification.to_string());
     }
-    if !newly_found.is_empty() && library.kind != "other" {
-        info!(library = %library.name, count = newly_found.len(), "automatic metadata detection started");
+    if library.kind != "other" {
+        let assets_only = metadata_scan_assets_only(newly_found.len(), match_unmatched);
+        if !assets_only {
+            info!(library = %library.name, count = newly_found.len(), "automatic metadata detection started");
+        }
         let response = scan_library_metadata(
             State(state.clone()),
             Path(library_id),
@@ -1556,10 +1569,13 @@ async fn scan_library_inventory(state: &AppState, library_id: usize) -> Result<u
                 force: Some(false),
                 path: None,
                 refresh: None,
+                assets_only: Some(assets_only),
             }),
         )
         .await;
-        info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
+        if !assets_only {
+            info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
+        }
     }
     Ok(scanned_count)
 }
@@ -1585,7 +1601,7 @@ async fn library_scan_scheduler(state: AppState) {
                 continue;
             }
             *last_scan = now;
-            if let Err(error) = scan_library_inventory(&state, index).await {
+            if let Err(error) = scan_library_inventory(&state, index, false).await {
                 warn!(library = %library.name, %error, "automatic library scan failed");
             }
         }
@@ -1614,10 +1630,13 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             .and_then(toml::Value::as_bool)
             == Some(true)
     {
-        config.metadata_storage = "sidecar".to_owned();
-    }
-    if !matches!(config.metadata_storage.as_str(), "database" | "sidecar") {
-        config.metadata_storage = default_metadata_storage();
+        config.metadata_storage = "media".to_owned();
+    } else {
+        config.metadata_storage = match config.metadata_storage.as_str() {
+            "database" | "config" => "config".to_owned(),
+            "sidecar" | "media" => "media".to_owned(),
+            _ => default_metadata_storage(),
+        };
     }
     Ok(config)
 }
@@ -1821,9 +1840,7 @@ fn open_database(
          CREATE TABLE IF NOT EXISTS media (
              media_key TEXT PRIMARY KEY,
              path TEXT NOT NULL,
-             title TEXT NOT NULL,
-             metadata_json TEXT,
-             matched_at INTEGER
+             title TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS media_identity (
              library_section INTEGER NOT NULL,
@@ -1840,14 +1857,6 @@ fn open_database(
              hidden_from_continue INTEGER NOT NULL DEFAULT 0,
              updated_at INTEGER NOT NULL,
              PRIMARY KEY (user_id, media_key)
-         );
-         CREATE TABLE IF NOT EXISTS artwork (
-             media_key TEXT NOT NULL,
-             kind TEXT NOT NULL,
-             source_url TEXT,
-             local_path TEXT,
-             downloaded_at INTEGER,
-             PRIMARY KEY (media_key, kind)
          );
          CREATE TABLE IF NOT EXISTS libraries (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1905,6 +1914,7 @@ fn open_database(
          CREATE UNIQUE INDEX IF NOT EXISTS collection_items_collection_media
              ON collection_items(collection_id, media_key);",
     )?;
+
     let _ = connection.execute(
         "ALTER TABLE server_identity ADD COLUMN plex_last_error TEXT",
         [],
@@ -2041,8 +2051,6 @@ struct LibraryScanSettingsForm {
 #[derive(Deserialize)]
 struct PreferencesForm {
     metadata_storage: Option<String>,
-    #[serde(default)]
-    metadata_in_media_folder: Option<String>,
     tmdb_bearer_token: Option<String>,
 }
 
@@ -2093,8 +2101,10 @@ fn plex_auth_client_identifier(state: &AppState) -> String {
     format!("{}-auth", state.machine_identifier)
 }
 
-fn plex_auth_product(state: &AppState) -> String {
-    server_name(state)
+const PLEX_AUTH_PRODUCT: &str = "harbringer";
+
+fn plex_auth_product(_state: &AppState) -> String {
+    PLEX_AUTH_PRODUCT.to_owned()
 }
 
 fn plex_auth_url(
@@ -2107,7 +2117,7 @@ fn plex_auth_url(
         "https://app.plex.tv/auth#?clientID={}&code={}&context%5Bdevice%5D%5Bproduct%5D={}&context%5Bdevice%5D%5Bversion%5D={}&context%5Bdevice%5D%5Bplatform%5D=macOS&context%5Bdevice%5D%5BdeviceName%5D={}&forwardUrl={}",
         url_encode(client_identifier),
         url_encode(pin_code),
-        url_encode(server_name),
+        url_encode(PLEX_AUTH_PRODUCT),
         env!("CARGO_PKG_VERSION"),
         url_encode(server_name),
         url_encode(callback)
@@ -2195,6 +2205,7 @@ fn plex_device_jwk(signing_key: &SigningKey, kid: &str) -> serde_json::Value {
     serde_json::json!({
         "kty": "OKP",
         "crv": "Ed25519",
+        "use": "sig",
         "x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()),
         "kid": kid,
         "alg": "EdDSA"
@@ -2229,6 +2240,7 @@ struct ScanQuery {
     force: Option<bool>,
     path: Option<String>,
     refresh: Option<bool>,
+    assets_only: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -2373,13 +2385,15 @@ async fn web_translation_progress(
             }
         }
     };
-    let final_path = bilingual_subtitle_path(
+    let final_path = configured_bilingual_subtitle_path(
+        &state,
         &media,
         &request.first_language,
         &request.second_language,
         "srt",
     );
-    let checkpoint_path = bilingual_subtitle_path(
+    let checkpoint_path = configured_bilingual_subtitle_path(
+        &state,
         &media,
         &request.first_language,
         &request.second_language,
@@ -2728,7 +2742,23 @@ async fn translate_subtitle_cached_with_progress(
         "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
-    let sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
+    let sidecar_path = configured_bilingual_subtitle_path(state, media, first, second, &output_extension);
+    let media_sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
+    if media_sidecar_path != sidecar_path
+        && tokio::fs::metadata(&media_sidecar_path).await.is_ok()
+        && tokio::fs::metadata(&sidecar_path).await.is_err()
+    {
+        if let Ok(contents) = tokio::fs::read(&media_sidecar_path).await {
+            if let Some(parent) = sidecar_path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::write(&sidecar_path, contents).await;
+            let old_marker = subtitle_source_marker_path(&media_sidecar_path);
+            if let Ok(marker) = tokio::fs::read(old_marker).await {
+                let _ = tokio::fs::write(subtitle_source_marker_path(&sidecar_path), marker).await;
+            }
+        }
+    }
     if tokio::fs::metadata(&sidecar_path).await.is_ok()
         && tokio::fs::metadata(subtitle_source_marker_path(&sidecar_path))
             .await
@@ -2747,7 +2777,7 @@ async fn translate_subtitle_cached_with_progress(
         "ass" => ass_to_vtt(contents),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
-    let sidecar_part_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let sidecar_part_path = configured_bilingual_subtitle_path(state, media, first, second, "vtt");
     let sidecar_part_path = PathBuf::from(format!("{}.part", sidecar_part_path.to_string_lossy()));
     let fingerprint = subtitle_translation_fingerprint(
         media,
@@ -2943,7 +2973,7 @@ async fn translated_subtitle_preview(
     source_key: Option<&str>,
 ) -> String {
     let extension = source_format.to_ascii_lowercase();
-    let final_path = bilingual_subtitle_path(media, first, second, &extension);
+    let final_path = configured_bilingual_subtitle_path(state, media, first, second, &extension);
     let Ok(fingerprint) = subtitle_translation_fingerprint(
         media,
         source_contents,
@@ -2963,7 +2993,7 @@ async fn translated_subtitle_preview(
         }
     }
 
-    let checkpoint_path = bilingual_subtitle_path(media, first, second, "vtt");
+    let checkpoint_path = configured_bilingual_subtitle_path(state, media, first, second, "vtt");
     let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
     let source_input = match extension.as_str() {
         "ass" => ass_to_vtt(source_contents),
@@ -3379,7 +3409,8 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         Ok(client) => client,
         Err(_) => return settings_error("Could not initialize Plex authentication"),
     };
-    let configured_server_name = plex_auth_product(&state);
+    let configured_server_name = server_name(&state);
+    let auth_product = plex_auth_product(&state);
     let auth_client_identifier = plex_auth_client_identifier(&state);
     let Ok((signing_key, kid)) = plex_device_key(&state) else {
         return settings_error("Could not initialize Plex device authentication");
@@ -3391,7 +3422,7 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
             "strong": true
         }))
         .header("Accept", "application/json")
-        .header("X-Plex-Product", &configured_server_name)
+        .header("X-Plex-Product", &auth_product)
         .header("X-Plex-Client-Identifier", &auth_client_identifier)
         .send()
         .await
@@ -4580,7 +4611,7 @@ async fn settings_page(
         r#"<form class="library-card" method="post" action="/settings/scan"><button type="submit">Scan all libraries</button></form>"#,
     );
     let subtitle_settings = format!(
-        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbringer generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Progress is staged beside the media file, and completed subtitles are saved beside the video so Plex clients can discover them.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
+        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbringer generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
         if bilingual_enabled { " checked" } else { "" },
         translation_language_options(&subtitle_language_primary),
         translation_language_options(&subtitle_language_secondary),
@@ -4797,10 +4828,10 @@ if (!window.__mplexSettingsDeleteBound) {
     } else {
         "<p class=\"credential-status\">No TMDB token is saved. Add one to scan libraries for metadata.</p>"
     };
-    let metadata_enabled = state
+    let config_selected = state
         .config
         .lock()
-        .is_ok_and(|config| config.metadata_storage == "sidecar");
+        .is_ok_and(|config| config.metadata_storage == "config");
     let plex_status = state
         .db
         .lock()
@@ -4871,7 +4902,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
-<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Choose one place for matched movie and TV metadata. Sidecars let another mplex server reuse matches and artwork without its database or a new TMDB lookup. SQLite still stores server identity, library configuration, and playback progress.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="database" {}><span class="option-copy"><strong>SQLite database {}</strong><span class="note">Matched metadata stays in this server’s database.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="sidecar" {}><span class="option-copy"><strong>.mplex files in media folders {}</strong><span class="note">Artwork and metadata are written to <code>.mplex/cover.jpg</code>, <code>banner.jpg</code>, and <code>data.json</code>.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label>{}<div><button type="submit">Save metadata settings</button></div></form></section>
+<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata and artwork are written only to the selected location.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label>{}<div><button type="submit">Save metadata settings</button></div></form></section>
 {}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
@@ -4952,10 +4983,10 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
         settings_stack_style,
         format!("<div class=\"section-content\">{}</div>", plex_auth),
         current_server_name,
-        if metadata_enabled { "" } else { "checked" },
-        if metadata_enabled { "" } else { "(current)" },
-        if metadata_enabled { "checked" } else { "" },
-        if metadata_enabled { "(current)" } else { "" },
+        if config_selected { "checked" } else { "" },
+        if config_selected { "(current)" } else { "" },
+        if config_selected { "" } else { "checked" },
+        if config_selected { "" } else { "(current)" },
         tmdb_token_status,
         subtitle_settings,
         html(query.folder.as_deref().unwrap_or("")),
@@ -4992,12 +5023,10 @@ async fn update_preferences(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let token = requested_token.or_else(|| config.tmdb_bearer_token.clone());
-    if form.metadata_storage.as_deref() == Some("sidecar")
-        || form.metadata_in_media_folder.is_some()
-    {
-        config.metadata_storage = "sidecar".to_owned();
-    } else if form.metadata_storage.as_deref() == Some("database") {
-        config.metadata_storage = "database".to_owned();
+    if form.metadata_storage.as_deref() == Some("media") {
+        config.metadata_storage = "media".to_owned();
+    } else if form.metadata_storage.as_deref() == Some("config") {
+        config.metadata_storage = "config".to_owned();
     }
     config.tmdb_bearer_token = token;
     if save_config(&state.config_path, &config).is_err() {
@@ -5068,7 +5097,7 @@ async fn scan_library_metadata(
         .tmdb_bearer_token
         .as_deref()
         .filter(|token| !token.is_empty());
-    let sidecar_mode = config.metadata_storage == "sidecar";
+    let sidecar_mode = config.metadata_storage == "media";
     let kind = if library.kind == "tv" { "tv" } else { "movie" };
     let mut matched = 0;
     let indexed_ids = media_snapshot(&state)
@@ -5077,6 +5106,7 @@ async fn scan_library_metadata(
         .collect::<HashMap<_, _>>();
     let forced = scan_query.force.unwrap_or(false);
     let refreshing = scan_query.refresh.unwrap_or(false);
+    let assets_only = scan_query.assets_only.unwrap_or(false);
     let target_path = match scan_query.path.as_deref() {
         Some(path) => match clean_relative_path(path) {
             Some(path) => Some(path),
@@ -5135,13 +5165,15 @@ async fn scan_library_metadata(
                 matched += 1;
                 continue;
             }
-            if !forced {
-                let media_key = database_media_key(library_id + 1, &group[0].id);
-                let selected = if sidecar_mode {
-                    read_sidecar_metadata(&group_path)
-                } else {
-                    read_database_metadata(&state, &media_key)
-                };
+            let media_key = database_media_key(library_id + 1, &group[0].id);
+            let selected = read_metadata_sidecar(&state, &media_key, &group_path);
+            let stored_match = selected
+                .as_ref()
+                .is_some_and(|metadata| metadata.get("id").is_some());
+            if assets_only && !stored_match {
+                continue;
+            }
+            if !forced || stored_match {
                 if let Some(mut metadata) = selected.filter(|metadata| metadata.get("id").is_some())
                 {
                     if kind == "tv"
@@ -5177,7 +5209,7 @@ async fn scan_library_metadata(
                                             kind,
                                         );
                                         let key = database_media_key(library_id + 1, &media.id);
-                                        if !write_database_metadata(&state, &key, &metadata) {
+                                        if !write_config_metadata(&state, &key, &metadata) {
                                             return StatusCode::INTERNAL_SERVER_ERROR
                                                 .into_response();
                                         }
@@ -5203,11 +5235,10 @@ async fn scan_library_metadata(
                             );
                         }
 
-                        clear_group_database_metadata(&state, library_id, &group);
                     } else {
                         for media in &group {
                             let key = database_media_key(library_id + 1, &media.id);
-                            let existing = read_database_metadata(&state, &key);
+                            let existing = read_config_metadata(&state, &key);
                             if existing
                                 .as_ref()
                                 .is_some_and(|metadata| metadata.get("id").is_some())
@@ -5216,7 +5247,7 @@ async fn scan_library_metadata(
                             }
                             let metadata =
                                 tv_metadata_for_media(&metadata, folder, &media.path, kind);
-                            if !write_database_metadata(&state, &key, &metadata) {
+                            if !write_config_metadata(&state, &key, &metadata) {
                                 warn!(library = %library.name, path = %media.path.display(), "existing match could not be applied to newly found media");
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
@@ -5262,11 +5293,7 @@ async fn scan_library_metadata(
                     }
                     continue;
                 }
-                let previous = if sidecar_mode {
-                    read_database_metadata(&state, &media_key)
-                } else {
-                    read_sidecar_metadata(&group_path)
-                };
+                let previous = read_metadata_sidecar(&state, &media_key, &group_path);
                 if let Some(metadata) = previous.filter(|metadata| metadata.get("id").is_some()) {
                     if sidecar_mode {
                         let representative = &group[0];
@@ -5284,7 +5311,6 @@ async fn scan_library_metadata(
                                 "Could not move matched metadata to the media-folder sidecar",
                             );
                         }
-                        clear_group_database_metadata(&state, library_id, &group);
                         if let Some(token) = token {
                             let _ = download_tmdb_artwork(
                                 &client,
@@ -5303,7 +5329,7 @@ async fn scan_library_metadata(
                             let metadata =
                                 tv_metadata_for_media(&metadata, folder, &media.path, kind);
                             let key = database_media_key(library_id + 1, &media.id);
-                            if !write_database_metadata(&state, &key, &metadata) {
+                            if !write_config_metadata(&state, &key, &metadata) {
                                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                             }
                         }
@@ -5399,23 +5425,8 @@ async fn scan_library_metadata(
             for media in &group {
                 let media_metadata = tv_metadata_for_media(result, folder, &media.path, kind);
                 if !sidecar_mode {
-                    let metadata_json =
-                        serde_json::to_string(&media_metadata).unwrap_or_else(|_| "{}".to_owned());
                     let media_key = database_media_key(library_id + 1, &media.id);
-                    let database_ok = state
-                        .db
-                        .lock()
-                        .ok()
-                        .and_then(|connection| {
-                            connection
-                                .execute(
-                                    "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-                                    (&metadata_json, &media_key),
-                                )
-                                .ok()
-                        })
-                        .is_some();
-                    if !database_ok {
+                    if !write_config_metadata(&state, &media_key, &media_metadata) {
                         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
                     }
                 }
@@ -5508,13 +5519,7 @@ async fn refresh_matched_metadata(
     sidecar_mode: bool,
 ) -> Result<(), String> {
     let media_key = database_media_key(library_id + 1, &group[0].id);
-    let sidecar_metadata = read_sidecar_metadata(group_path);
-    let database_metadata = read_database_metadata(state, &media_key);
-    let metadata = if sidecar_mode {
-        sidecar_metadata.or(database_metadata)
-    } else {
-        database_metadata.or(sidecar_metadata)
-    }
+    let metadata = read_metadata_sidecar(state, &media_key, group_path)
     .filter(|metadata| {
         metadata
             .get("id")
@@ -5555,12 +5560,11 @@ async fn refresh_matched_metadata(
         store_metadata_sidecar(folder, group_path, group_title, &group[0], &refreshed)
             .await
             .map_err(|_| "Could not save refreshed metadata sidecar".to_owned())?;
-        clear_group_database_metadata(state, library_id, group);
     } else {
         for media in group {
             let item_metadata = tv_metadata_for_media(&refreshed, folder, &media.path, kind);
             let key = database_media_key(library_id + 1, &media.id);
-            if !write_database_metadata(state, &key, &item_metadata) {
+            if !write_config_metadata(state, &key, &item_metadata) {
                 return Err("Could not save refreshed metadata".to_owned());
             }
         }
@@ -5849,7 +5853,7 @@ async fn tv_match_select(
                 .into_response();
         }
     };
-    if config.metadata_storage == "sidecar" {
+    if config.metadata_storage == "media" {
         if let Err(error) =
             store_metadata_sidecar(&root, &media_directory, &title, &media_items[0], &metadata)
                 .await
@@ -5857,7 +5861,6 @@ async fn tv_match_select(
             warn!(library = %library.name, title = %title, error = %error, "Fix-match metadata could not be saved");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        clear_group_database_metadata(&state, selection.library, &media_items);
     } else {
         for media in &media_items {
             let media_key = database_media_key(selection.library + 1, &media.id);
@@ -5866,7 +5869,7 @@ async fn tv_match_select(
             } else {
                 metadata.clone()
             };
-            if !write_database_metadata(&state, &media_key, &item_metadata) {
+            if !write_config_metadata(&state, &media_key, &item_metadata) {
                 warn!(library = %library.name, title = %title, media = %media.path.display(), "Fix-match metadata could not be saved");
                 return StatusCode::INTERNAL_SERVER_ERROR.into_response();
             }
@@ -5894,23 +5897,13 @@ async fn tv_match_select(
             &media_items,
             selection.library + 1,
             &metadata,
-            config.metadata_storage == "sidecar",
+            config.metadata_storage == "media",
             &state,
             true,
         )
         .await
         {
             warn!(library = %library.name, title = %title, error = %error, "TV season metadata update failed");
-        }
-    }
-    let artwork_directory = media_directory.join(".mplex");
-    for media in &media_items {
-        let media_key = database_media_key(selection.library + 1, &media.id);
-        for (kind, filename) in [("cover", "cover.jpg"), ("banner", "banner.jpg")] {
-            let artwork = artwork_directory.join(filename);
-            if artwork.is_file() {
-                record_artwork(&state.db, &media_key, kind, &artwork);
-            }
         }
     }
     info!(library = %library.name, title = %title, tmdb_id = selection.tmdb_id, "metadata fix-match selection saved");
@@ -5931,7 +5924,7 @@ async fn scan_media_metadata(
     if library.kind == "other" {
         return settings_error("TMDB matching is not available for Other libraries");
     }
-    let sidecar_mode = config.metadata_storage == "sidecar";
+    let sidecar_mode = config.metadata_storage == "media";
     let Some(token) = config
         .tmdb_bearer_token
         .as_deref()
@@ -5985,45 +5978,28 @@ async fn scan_media_metadata(
         return settings_error("No metadata match was found");
     };
     let media_key = database_media_key(library_id + 1, &media.id);
-    let metadata_json = serde_json::to_string(result).unwrap_or_else(|_| "{}".to_owned());
-    if !sidecar_mode {
-        let database_ok = state
-            .db
-            .lock()
-            .ok()
-            .and_then(|connection| {
-                connection
-                    .execute(
-                        "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-                        (&metadata_json, &media_key),
-                    )
-                    .ok()
-            })
-            .is_some();
-        if !database_ok {
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
+    let group_path = metadata_group_path(root, &media.path, kind);
+    if !sidecar_mode && !write_config_metadata(&state, &media_key, result) {
+        return settings_error("Could not write matched metadata to the config-folder sidecar");
     }
-    if sidecar_mode {
-        let group_path = metadata_group_path(root, &media.path, kind);
-        if store_metadata_sidecar(root, &group_path, &title, &media, result)
+    if sidecar_mode
+        && store_metadata_sidecar(root, &group_path, &title, &media, result)
             .await
             .is_err()
-        {
-            return settings_error("Could not write matched metadata to the media-folder sidecar");
-        }
-        let _ = download_tmdb_artwork(
-            &client,
-            token,
-            root,
-            &group_path,
-            &media_key,
-            result,
-            &state,
-            true,
-        )
-        .await;
+    {
+        return settings_error("Could not write matched metadata to the media-folder sidecar");
     }
+    let _ = download_tmdb_artwork(
+        &client,
+        token,
+        root,
+        &group_path,
+        &media_key,
+        result,
+        &state,
+        true,
+    )
+    .await;
     let parent = relative.parent().unwrap_or(std::path::Path::new(""));
     Redirect::to(&format!(
         "/?library={library_id}&path={}",
@@ -6054,7 +6030,7 @@ fn metadata_sidecar_info_path(group_path: &std::path::Path) -> PathBuf {
     } else {
         group_path
     };
-    directory.join(".mplex/data.json")
+    directory.join(".hbgr/data.json")
 }
 
 fn parse_sidecar_info(contents: &str) -> Option<serde_json::Value> {
@@ -6062,7 +6038,7 @@ fn parse_sidecar_info(contents: &str) -> Option<serde_json::Value> {
 }
 
 async fn read_sidecar_info(directory: &std::path::Path) -> Option<serde_json::Value> {
-    tokio::fs::read_to_string(directory.join(".mplex/data.json"))
+    tokio::fs::read_to_string(directory.join(".hbgr/data.json"))
         .await
         .ok()
         .and_then(|contents| parse_sidecar_info(&contents))
@@ -6090,47 +6066,152 @@ fn database_media_key(section_id: usize, media_id: &str) -> String {
     }
 }
 
-fn read_database_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
-    let connection = state.db.lock().ok()?;
-    let contents = connection
-        .query_row(
-            "SELECT metadata_json FROM media WHERE media_key = ?1",
-            [media_key],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .ok()??;
-    serde_json::from_str(&contents).ok()
+fn config_metadata_sidecar_path(state: &AppState, media_key: &str) -> PathBuf {
+    state
+        .subtitle_checkpoints_dir
+        .parent()
+        .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+        .join(".hbgr")
+        .join(media_key)
+        .join("data.json")
 }
 
-fn write_database_metadata(
+fn read_config_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
+    let contents = std::fs::read_to_string(config_metadata_sidecar_path(state, media_key)).ok()?;
+    parse_sidecar_metadata(&contents)
+}
+
+fn read_metadata_sidecar(
+    state: &AppState,
+    media_key: &str,
+    group_path: &std::path::Path,
+) -> Option<serde_json::Value> {
+    let config_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    if config_mode {
+        read_config_metadata(state, media_key)
+            .or_else(|| read_sidecar_metadata(group_path))
+    } else {
+        read_sidecar_metadata(group_path)
+            .or_else(|| read_config_metadata(state, media_key))
+    }
+}
+
+fn write_config_metadata(
     state: &AppState,
     media_key: &str,
     metadata: &serde_json::Value,
 ) -> bool {
-    let Ok(connection) = state.db.lock() else {
+    let path = config_metadata_sidecar_path(state, media_key);
+    let Some(directory) = path.parent() else {
         return false;
     };
-    let metadata_json = serde_json::to_string(metadata).unwrap_or_else(|_| "{}".to_owned());
-    connection
-        .execute(
-            "UPDATE media SET metadata_json = ?1, matched_at = strftime('%s', 'now') WHERE media_key = ?2",
-            (&metadata_json, media_key),
-        )
-        .is_ok()
+    if std::fs::create_dir_all(directory).is_err() {
+        return false;
+    }
+    let title = json_string(metadata, "name");
+    let title = if title.is_empty() {
+        json_string(metadata, "title")
+    } else {
+        title
+    };
+    let info = MediaInfo {
+        title,
+        media_path: None,
+        description: json_string(metadata, "overview"),
+        release_date: json_string(metadata, "release_date"),
+        first_air_date: json_string(metadata, "first_air_date"),
+        number_of_seasons: json_i64(metadata, "number_of_seasons"),
+        number_of_episodes: json_i64(metadata, "number_of_episodes"),
+        season: None,
+        episode: None,
+        episode_end: None,
+        episode_title: None,
+        metadata_json: metadata.clone(),
+        technical: None,
+        show_id: metadata.get("id").map(|id| id.to_string()),
+    };
+    serde_json::to_vec_pretty(&info)
+        .ok()
+        .is_some_and(|contents| std::fs::write(path, contents).is_ok())
 }
 
-fn clear_group_database_metadata(state: &AppState, library_id: usize, group: &[Media]) {
-    let Ok(connection) = state.db.lock() else {
+
+fn migrate_legacy_database_metadata(state: &AppState) {
+    if !state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config")
+    {
         return;
+    }
+    let current_keys_by_path = {
+        let Ok(config) = state.config.lock() else {
+            return;
+        };
+        let media_index = media_snapshot(state);
+        let mut keys = HashMap::new();
+        for (library_index, library) in config.libraries.iter().enumerate() {
+            let section = library_index + 1;
+            for media in media_index.iter().filter(|media| media_in_library(media, library)) {
+                let media_key = database_media_key(section, &media.id);
+                keys.insert(
+                    (section, media.path.to_string_lossy().into_owned()),
+                    media_key.clone(),
+                );
+                for folder in &library.folders {
+                    if let Ok(relative) = media.path.strip_prefix(folder) {
+                        keys.insert(
+                            (section, relative.to_string_lossy().into_owned()),
+                            media_key.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        keys
     };
-    for media in group {
-        let media_key = database_media_key(library_id + 1, &media.id);
-        let _ = connection.execute(
-            "UPDATE media SET metadata_json = NULL, matched_at = NULL WHERE media_key = ?1",
-            [media_key],
-        );
+    let records = {
+        let Ok(connection) = state.db.lock() else {
+            return;
+        };
+        let Ok(mut statement) = connection.prepare(
+            "SELECT media_key, path, metadata_json FROM media WHERE metadata_json IS NOT NULL",
+        ) else {
+            return;
+        };
+        let Ok(rows) = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) else {
+            return;
+        };
+        rows.filter_map(Result::ok).collect::<Vec<_>>()
+    };
+    for (legacy_key, path, serialized) in records {
+        let section = legacy_key
+            .split_once('-')
+            .and_then(|(section, _)| section.parse::<usize>().ok());
+        let media_key = section
+            .and_then(|section| current_keys_by_path.get(&(section, path)).cloned())
+            .unwrap_or(legacy_key);
+        if config_metadata_sidecar_path(state, &media_key).is_file() {
+            continue;
+        }
+        let Ok(metadata) = serde_json::from_str(&serialized) else {
+            continue;
+        };
+        if !write_config_metadata(state, &media_key, &metadata) {
+            warn!(%media_key, "legacy metadata could not be migrated to the config sidecar");
+        }
     }
 }
+
 
 fn metadata_group_title(group: &std::path::Path, root: &PathBuf) -> String {
     if group.is_file() {
@@ -6614,7 +6695,7 @@ async fn store_metadata_sidecar(
     } else {
         group_path
     };
-    let directory = media_directory.join(".mplex");
+    let directory = media_directory.join(".hbgr");
     tokio::fs::create_dir_all(&directory).await?;
     let tv_show =
         metadata.get("first_air_date").is_some() || metadata.get("number_of_seasons").is_some();
@@ -7024,12 +7105,18 @@ async fn add_plex_technical_metadata(
             )
         });
     let external_subtitles = if enabled {
-        let _ = ensure_merged_bilingual_sidecar(
-            media,
-            &language_primary,
-            &language_secondary,
-        )
-        .await;
+        if state
+            .config
+            .lock()
+            .is_ok_and(|config| config.metadata_storage == "media")
+        {
+            let _ = ensure_merged_bilingual_sidecar(
+                media,
+                &language_primary,
+                &language_secondary,
+            )
+            .await;
+        }
         external_subtitle_files(&media.path).await
     } else {
         external_subtitle_files(&media.path)
@@ -7340,12 +7427,25 @@ async fn download_tmdb_artwork(
     state: &AppState,
     replace_existing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let config_mode = state
+        .config
+        .lock()
+        .map_err(|_| "Configuration is unavailable")?
+        .metadata_storage
+        == "config";
     let media_directory = if group_path.is_file() {
         group_path.parent().unwrap_or(folder)
     } else {
         group_path
     };
-    let artwork = media_directory.join(".mplex");
+    let artwork = if config_mode {
+        config_metadata_sidecar_path(state, media_key)
+            .parent()
+            .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+            .to_path_buf()
+    } else {
+        media_directory.join(".hbgr")
+    };
     tokio::fs::create_dir_all(&artwork).await?;
     for (kind, field) in [("cover", "poster_path"), ("banner", "backdrop_path")] {
         let Some(path) = metadata.get(field).and_then(|value| value.as_str()) else {
@@ -7381,7 +7481,6 @@ async fn download_tmdb_artwork(
         }
         let bytes = response.bytes().await?;
         tokio::fs::write(&local, &bytes).await?;
-        record_artwork(&state.db, media_key, kind, &local);
         info!(
             artwork = kind,
             bytes = bytes.len(),
@@ -7397,8 +7496,6 @@ async fn download_tmdb_season_artwork(
     season_directory: &std::path::Path,
     show_metadata: &serde_json::Value,
     season: u32,
-    media_key: &str,
-    state: &AppState,
     replace_existing: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !replace_existing
@@ -7425,7 +7522,7 @@ async fn download_tmdb_season_artwork(
         return Ok(());
     }
     let metadata = response.json::<serde_json::Value>().await?;
-    let artwork = season_directory.join(".mplex");
+    let artwork = season_directory.join(".hbgr");
     tokio::fs::create_dir_all(&artwork).await?;
     let info = SeasonInfo {
         title: format!("Season {season:02}"),
@@ -7451,11 +7548,10 @@ async fn download_tmdb_season_artwork(
     }
     let local = artwork.join("cover.jpg");
     tokio::fs::write(&local, image.bytes().await?).await?;
-    record_artwork(&state.db, media_key, "season-cover", &local);
     Ok(())
 }
 
-async fn download_tmdb_season_database(
+async fn download_tmdb_season_metadata(
     client: &reqwest::Client,
     token: &str,
     folder: &PathBuf,
@@ -7471,7 +7567,7 @@ async fn download_tmdb_season_database(
     };
     if !replace_existing
         && episodes.iter().all(|media| {
-            read_database_metadata(state, &database_media_key(library_key, &media.id))
+            read_config_metadata(state, &database_media_key(library_key, &media.id))
                 .and_then(|metadata| metadata.get("mplex_season_metadata_fetched").cloned())
                 .and_then(|value| value.as_bool())
                 == Some(true)
@@ -7500,14 +7596,14 @@ async fn download_tmdb_season_database(
         .map_err(|error| format!("TMDB returned invalid details for season {season}: {error}"))?;
     for media in episodes {
         let key = database_media_key(library_key, &media.id);
-        let metadata = read_database_metadata(state, &key)
+        let metadata = read_config_metadata(state, &key)
             .unwrap_or_else(|| tv_metadata_for_media(show_metadata, folder, &media.path, "tv"));
         let metadata = tv_metadata_with_season_details(
             &metadata,
             &season_metadata,
             tv_episode_info(folder, &media.path).map(|episode| episode.episode),
         );
-        if !write_database_metadata(state, &key, &metadata) {
+        if !write_config_metadata(state, &key, &metadata) {
             return Err(format!(
                 "Could not save season {season} details for {}",
                 media.path.display()
@@ -7583,7 +7679,6 @@ async fn ensure_tv_season_metadata(
         };
         let show_directory = folder.join(show_name.as_os_str());
         let season_directory = tv_season_directory(&show_directory, season, episode_path);
-        let media_key = database_media_key(library_key, &episodes[0].id);
         let result = if sidecar_mode {
             download_tmdb_season_artwork(
                 client,
@@ -7591,14 +7686,12 @@ async fn ensure_tv_season_metadata(
                 &season_directory,
                 show_metadata,
                 season,
-                &media_key,
-                state,
                 replace_existing,
             )
             .await
             .map_err(|error| error.to_string())
         } else {
-            download_tmdb_season_database(
+            download_tmdb_season_metadata(
                 client,
                 token,
                 folder,
@@ -7616,19 +7709,6 @@ async fn ensure_tv_season_metadata(
     Ok(())
 }
 
-fn record_artwork(
-    db: &Arc<Mutex<Connection>>,
-    media_key: &str,
-    kind: &str,
-    path: &std::path::Path,
-) {
-    if let Ok(connection) = db.lock() {
-        let _ = connection.execute(
-            "INSERT OR REPLACE INTO artwork (media_key, kind, local_path, downloaded_at) VALUES (?1, ?2, ?3, strftime('%s', 'now'))",
-            (media_key, kind, path.to_string_lossy().as_ref()),
-        );
-    }
-}
 
 fn settings_error(message: &str) -> Response {
     let location = format!("/settings?error={}", url_encode(message));
@@ -8094,7 +8174,7 @@ async fn scan_all_libraries(State(state): State<AppState>) -> Response {
     let mut media_count = 0;
     let mut failed = false;
     for library_id in 0..library_count {
-        match scan_library_inventory(&state, library_id).await {
+        match scan_library_inventory(&state, library_id, true).await {
             Ok(count) => media_count += count,
             Err(error) => {
                 failed = true;
@@ -8112,7 +8192,7 @@ async fn scan_library_inventory_handler(
     State(state): State<AppState>,
     Path(library_id): Path<usize>,
 ) -> Response {
-    match scan_library_inventory(&state, library_id).await {
+    match scan_library_inventory(&state, library_id, true).await {
         Ok(count) => Redirect::to(&format!("/settings?inventory_scan={count}")).into_response(),
         Err(error) => {
             warn!(library_id, %error, "manual library scan failed");
@@ -8135,7 +8215,7 @@ async fn plex_section_refresh(
     if !library_exists {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(error) = scan_library_inventory(&state, library_id).await {
+    if let Err(error) = scan_library_inventory(&state, library_id, false).await {
         warn!(section, %error, "Plex library scan failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -8146,6 +8226,7 @@ async fn plex_section_refresh(
             force: Some(false),
             path: None,
             refresh: None,
+            assets_only: Some(false),
         }),
     )
     .await;
@@ -8238,11 +8319,7 @@ async fn home_client(State(state): State<AppState>) -> Response {
         .collect::<Vec<_>>();
     let mut libraries = String::new();
     for (index, library) in config.libraries.iter().enumerate() {
-        let artwork = if config.metadata_storage == "sidecar" {
-            library_artwork(library, index).await
-        } else {
-            None
-        };
+        let artwork = library_artwork(&state, library, index).await;
         let artwork_markup = artwork
             .map(|(cover, banner)| {
                 format!(
@@ -8526,23 +8603,43 @@ fn ordered_continue_paths(mut candidates: Vec<(String, i64)>) -> Vec<String> {
         .collect()
 }
 
-async fn library_artwork(library: &ConfigLibrary, index: usize) -> Option<(String, String)> {
+async fn library_artwork(
+    state: &AppState,
+    library: &ConfigLibrary,
+    index: usize,
+) -> Option<(String, String)> {
     let root = library.folders.first()?;
-    let media = scan_media(root).await.ok()?;
-    for item in media {
-        let parent = item.path.parent()?;
-        if tokio::fs::metadata(parent.join(".mplex/cover.jpg"))
-            .await
-            .is_err()
-        {
-            continue;
-        }
+    let config_mode = state
+        .config
+        .lock()
+        .ok()
+        .is_some_and(|config| config.metadata_storage == "config");
+    for media in media_snapshot(state)
+        .iter()
+        .filter(|media| media_in_library(media, library))
+    {
+        let group_path = metadata_group_path(root, &media.path, &library.kind);
+        let parent = if group_path.is_file() {
+            group_path.parent().unwrap_or(root)
+        } else {
+            group_path.as_path()
+        };
         let relative = parent.strip_prefix(root).ok()?;
+        let key = database_media_key(index + 1, &media.id);
+        let config_dir = config_metadata_sidecar_path(state, &key)
+            .parent()
+            .map(|path| path.to_path_buf())?;
+        let media_dir = parent.join(".hbgr");
+        let mut paths = [config_dir.join("cover.jpg"), media_dir.join("cover.jpg")];
+        if !config_mode {
+            paths.reverse();
+        }
+        let Some(cover_path) = paths.iter().find(|path| path.is_file()) else {
+            continue;
+        };
         let cover = artwork_url(relative, Some(index), "cover");
-        let banner = if tokio::fs::metadata(parent.join(".mplex/banner.jpg"))
-            .await
-            .is_ok()
-        {
+        let banner_path = cover_path.parent()?.join("banner.jpg");
+        let banner = if banner_path.is_file() {
             artwork_url(relative, Some(index), "banner")
         } else {
             cover.clone()
@@ -8601,7 +8698,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     let sidecar_mode = s
         .config
         .lock()
-        .is_ok_and(|config| config.metadata_storage == "sidecar");
+        .is_ok_and(|config| config.metadata_storage == "media");
     let library_config = query.library.and_then(|index| {
         s.config
             .lock()
@@ -8626,13 +8723,27 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             _ => return StatusCode::NOT_FOUND.into_response(),
         }
     }
-    let pane_banner = if sidecar_mode
-        && tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
-            .await
-            .is_ok()
-    {
+    let config_banner_exists = query.library.is_some_and(|library_index| {
+        media_index
+            .iter()
+            .filter(|media| library_config.as_ref().is_some_and(|library| media_in_library(media, library)))
+            .find(|media| {
+                let group_path = metadata_group_path(&library_root, &media.path, library_kind.as_deref().unwrap_or("movie"));
+                let group_directory = if group_path.is_file() { group_path.parent().unwrap_or(&group_path) } else { group_path.as_path() };
+                group_directory == directory
+                    || std::fs::canonicalize(group_directory)
+                        .is_ok_and(|canonical| canonical == directory)
+            })
+            .is_some_and(|media| {
+                let key = database_media_key(library_index + 1, &media.id);
+                config_metadata_sidecar_path(&s, &key)
+                    .parent()
+                    .is_some_and(|path| path.join("banner.jpg").is_file())
+            })
+    });
+    let pane_banner = if directory.join(".hbgr/banner.jpg").is_file() || config_banner_exists {
         format!(
-            r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')""#,
+            r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')"#,
             artwork_url(&relative, query.library, "banner")
         )
     } else {
@@ -8654,51 +8765,68 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             episode_info_panel(&s, &library_root, selected_relative).await
         } else {
             let selected_path = library_root.join(selected_relative);
-            let database_metadata = if sidecar_mode {
-                None
-            } else {
-                media_index
-                    .iter()
-                    .find(|media| media.path == selected_path)
-                    .and_then(|media| {
-                        media_library(&s, media)
-                            .map(|(library_id, _)| format!("{library_id}-{}", media.id))
-                    })
-                    .and_then(|media_key| read_database_metadata(&s, &media_key))
-            };
+            let selected_metadata = media_index
+                .iter()
+                .find(|media| media.path == selected_path)
+                .and_then(|media| {
+                    let (library_id, library) = media_library(&s, media)?;
+                    let root = library
+                        .folders
+                        .iter()
+                        .find(|folder| media.path.starts_with(folder))?;
+                    let media_key = database_media_key(library_id, &media.id);
+                    let group_path = metadata_group_path(root, &media.path, &library.kind);
+                    read_metadata_sidecar(&s, &media_key, &group_path)
+                });
             media_info_panel(
                 selected_path.parent().unwrap_or(&library_root),
-                database_metadata.as_ref(),
+                selected_metadata.as_ref(),
+                !sidecar_mode,
                 false,
                 None,
             )
             .await
         }
     } else if sidecar_mode || tv_season_view || tv_show_view {
-        let cover_url = if tv_show_view
-            && sidecar_mode
-            && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
-                .await
-                .is_ok()
-        {
-            Some(artwork_url(&relative, query.library, "cover"))
-        } else {
-            None
-        };
         let show_metadata_directory = library_root.join(&relative);
         let show_metadata = (tv_show_view || query.season.is_some())
             .then(|| matched_tv_show_metadata(&s, &media_index, &show_metadata_directory))
             .flatten();
-        let database_metadata = (tv_show_view && !sidecar_mode)
-            .then_some(show_metadata.as_ref())
-            .flatten();
+        let selected_metadata = tv_show_view.then_some(show_metadata.as_ref()).flatten();
+        let cover_url = if tv_show_view {
+            let config_cover = media_index
+                .iter()
+                .find(|media| media.path.starts_with(&show_metadata_directory))
+                .and_then(|media| {
+                    let (library_id, _) = media_library(&s, media)?;
+                    let media_key = database_media_key(library_id, &media.id);
+                    config_metadata_sidecar_path(&s, &media_key)
+                        .parent()
+                        .map(|directory| directory.join("cover.jpg"))
+                });
+            let media_cover_exists = tokio::fs::metadata(
+                show_metadata_directory.join(".hbgr/cover.jpg"),
+            )
+            .await
+            .is_ok();
+            let config_cover_exists = if let Some(path) = config_cover {
+                tokio::fs::metadata(path).await.is_ok()
+            } else {
+                false
+            };
+            (media_cover_exists || config_cover_exists)
+                .then(|| artwork_url(&relative, query.library, "cover"))
+        } else {
+            None
+        };
         let panel_directory = query
             .season
             .map(|season| tv_season_directory(&directory, season, &directory))
             .unwrap_or_else(|| directory.clone());
         let mut panel = media_info_panel(
             &panel_directory,
-            database_metadata,
+            selected_metadata,
+            !sidecar_mode,
             tv_show_view,
             cover_url.as_deref(),
         )
@@ -8751,9 +8879,15 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                                 && tv_season_number(&library_root, &media.path) == Some(season)
                         })
                         .find_map(|media| {
-                            let (library_id, _) = media_library(&s, media)?;
-                            let key = format!("{library_id}-{}", media.id);
-                            read_database_metadata(&s, &key)
+                            let (library_id, library) = media_library(&s, media)?;
+                            let root = library
+                                .folders
+                                .iter()
+                                .find(|folder| media.path.starts_with(folder))?;
+                            let key = database_media_key(library_id, &media.id);
+                            let group_path =
+                                metadata_group_path(root, &media.path, &library.kind);
+                            read_metadata_sidecar(&s, &key, &group_path)
                         })
                         .and_then(|metadata| {
                             metadata
@@ -9124,11 +9258,11 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 .await
                 .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
             let cover = sidecar_mode
-                && tokio::fs::metadata(directory.join(".mplex/cover.jpg"))
+                && tokio::fs::metadata(directory.join(".hbgr/cover.jpg"))
                     .await
                     .is_ok();
             let banner = sidecar_mode
-                && tokio::fs::metadata(directory.join(".mplex/banner.jpg"))
+                && tokio::fs::metadata(directory.join(".hbgr/banner.jpg"))
                     .await
                     .is_ok();
             folder_cards.push_str(&folder_card(
@@ -9211,7 +9345,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 && tokio::fs::metadata(
                     path.parent()
                         .unwrap_or(std::path::Path::new("."))
-                        .join(".mplex/cover.jpg"),
+                        .join(".hbgr/cover.jpg"),
                 )
                 .await
                 .is_ok()
@@ -9269,7 +9403,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>mplex</title>
+  <title>harbringer</title>
   <style>
     :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
     body {{ margin: 0; background: #111827; color: #f9fafb; }}
@@ -9815,9 +9949,14 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       try {{
         const response = await fetch(window.location.href, {{ cache: "no-store" }});
         if (!response.ok) {{
-          window.__mplexShowConnectionLost?.(`Connection to Harbringer failed (HTTP ${{response.status}}). Reload the page to reconnect.`);
+          window.__mplexShowConnected?.();
+          if (response.status === 404) {{
+            clearInterval(window.__mplexLibraryRefreshTimer);
+            window.__mplexLibraryRefreshTimer = null;
+          }}
           return;
         }}
+        window.__mplexShowConnected?.();
         const document = new DOMParser().parseFromString(await response.text(), "text/html");
         const current = window.document.querySelector(".library");
         const next = document.querySelector(".library");
@@ -9828,7 +9967,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           window.__mplexSelectedVideo = null;
         }}
       }} catch (_) {{
-        window.__mplexShowConnectionLost?.("Lost connection to Harbringer. Check that the server is running, then reload the page.");
+        window.__mplexShowConnectionLost?.("Lost connection to Harbringer.");
       }} finally {{
         refreshing = false;
       }}
@@ -10290,6 +10429,30 @@ fn bilingual_subtitle_path(media: &Media, first: &str, second: &str, extension: 
         ))
 }
 
+
+fn configured_bilingual_subtitle_path(
+    state: &AppState,
+    media: &Media,
+    first: &str,
+    second: &str,
+    extension: &str,
+) -> PathBuf {
+    let config_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    if config_mode {
+        return state.subtitle_checkpoints_dir.join(format!(
+            "{}.{}-{}.{}",
+            media.id,
+            first.to_ascii_lowercase(),
+            second.to_ascii_lowercase(),
+            extension.to_ascii_lowercase()
+        ));
+    }
+    bilingual_subtitle_path(media, first, second, extension)
+}
+
 fn merged_bilingual_subtitle_path(
     media: &Media,
     first: &str,
@@ -10538,7 +10701,13 @@ async fn subtitle_tracks(
     });
     let bilingual_enabled = languages.is_some();
     if let Some((first, second)) = languages {
-        let _ = ensure_merged_bilingual_sidecar(media, &first, &second).await;
+        if state
+            .config
+            .lock()
+            .is_ok_and(|config| config.metadata_storage == "media")
+        {
+            let _ = ensure_merged_bilingual_sidecar(media, &first, &second).await;
+        }
     }
     for path in external_subtitle_files(&media.path).await {
         if !bilingual_enabled && external_subtitle_pair(&media.path, &path).is_some() {
@@ -10659,10 +10828,16 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
 
 async fn media_info_panel(
     directory: &std::path::Path,
-    database_metadata: Option<&serde_json::Value>,
+    stored_metadata: Option<&serde_json::Value>,
+    prefer_config_metadata: bool,
     hide_episode_fields: bool,
     cover_artwork: Option<&str>,
 ) -> String {
+    if prefer_config_metadata {
+        if let Some(metadata) = stored_metadata {
+            return render_metadata_info_panel(metadata, None);
+        }
+    }
     if let Some(value) = read_sidecar_info(directory).await {
         let title = value
             .get("title")
@@ -10711,8 +10886,8 @@ async fn media_info_panel(
             details
         );
     }
-    database_metadata
-        .map(|metadata| render_database_info_panel(metadata, None))
+    stored_metadata
+        .map(|metadata| render_metadata_info_panel(metadata, None))
         .unwrap_or_default()
 }
 
@@ -10767,7 +10942,7 @@ fn render_tv_show_metadata_details(metadata: &serde_json::Value) -> String {
         .collect()
 }
 
-fn render_database_info_panel(
+fn render_metadata_info_panel(
     metadata: &serde_json::Value,
     episode: Option<&TvEpisodeInfo>,
 ) -> String {
@@ -10881,15 +11056,19 @@ fn matched_tv_show_metadata(
     media_index: &[Media],
     show_directory: &std::path::Path,
 ) -> Option<serde_json::Value> {
-    read_sidecar_metadata(show_directory).or_else(|| {
-        media_index
-            .iter()
-            .filter(|media| media.path.starts_with(show_directory))
-            .find_map(|media| {
-                let (library_id, _) = media_library(state, media)?;
-                read_database_metadata(state, &format!("{library_id}-{}", media.id))
-            })
-    })
+    media_index
+        .iter()
+        .filter(|media| media.path.starts_with(show_directory))
+        .find_map(|media| {
+            let (library_id, library) = media_library(state, media)?;
+            let root = library
+                .folders
+                .iter()
+                .find(|folder| media.path.starts_with(folder))?;
+            let media_key = database_media_key(library_id, &media.id);
+            let group_path = metadata_group_path(root, &media.path, &library.kind);
+            read_metadata_sidecar(state, &media_key, &group_path)
+        })
 }
 
 fn render_season_description_panel(
@@ -10966,18 +11145,20 @@ async fn episode_info_panel(
     let sidecar_mode = state
         .config
         .lock()
-        .is_ok_and(|config| config.metadata_storage == "sidecar");
-    let database_metadata = if sidecar_mode {
-        None
-    } else {
-        media_index
-            .iter()
-            .find(|media| media.path == path)
-            .and_then(|media| {
-                let (library_id, _) = media_library(state, media)?;
-                read_database_metadata(state, &format!("{library_id}-{}", media.id))
-            })
-    };
+        .is_ok_and(|config| config.metadata_storage == "media");
+    let selected_metadata = media_index
+        .iter()
+        .find(|media| media.path == path)
+        .and_then(|media| {
+            let (library_id, library) = media_library(state, media)?;
+            let root = library
+                .folders
+                .iter()
+                .find(|folder| media.path.starts_with(folder))?;
+            let media_key = database_media_key(library_id, &media.id);
+            let group_path = metadata_group_path(root, &media.path, &library.kind);
+            read_metadata_sidecar(state, &media_key, &group_path)
+        });
     let season_directory = show_directory
         .as_deref()
         .map(|directory| tv_season_directory(directory, episode_info.season, &path))
@@ -10989,7 +11170,7 @@ async fn episode_info_panel(
     } else {
         None
     };
-    let stored_metadata = season_metadata.as_ref().or(database_metadata.as_ref());
+    let stored_metadata = season_metadata.as_ref().or(selected_metadata.as_ref());
     let episode_metadata = stored_metadata.and_then(|metadata| {
         metadata.get("mplex_episode_metadata").cloned().or_else(|| {
             metadata
@@ -11010,7 +11191,7 @@ async fn episode_info_panel(
         .and_then(|metadata| metadata.get("overview"))
         .cloned()
         .or_else(|| {
-            database_metadata
+            selected_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.get("mplex_season_description"))
                 .cloned()
@@ -11024,7 +11205,7 @@ async fn episode_info_panel(
             object.insert("mplex_episode_metadata".to_owned(), episode_metadata);
         }
     }
-    render_database_info_panel(&panel_metadata, Some(&episode_info))
+    render_metadata_info_panel(&panel_metadata, Some(&episode_info))
 }
 
 fn render_sidecar_details(value: &serde_json::Value, hide_episode_fields: bool) -> String {
@@ -11092,16 +11273,10 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    if contains_hidden_component(&relative)
-        || !matches!(query.kind.as_deref(), Some("cover" | "banner"))
-    {
+    let Some(kind) = query.kind.as_deref().filter(|kind| matches!(*kind, "cover" | "banner")) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
-    if !s
-        .config
-        .lock()
-        .is_ok_and(|config| config.metadata_storage == "sidecar")
-    {
+    };
+    if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
     let root = selected_library_root(&s, query.library);
@@ -11109,13 +11284,49 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
         Ok(path) if path.is_dir() => path,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let path = directory
-        .join(".mplex")
-        .join(format!("{}.jpg", query.kind.unwrap()));
-    let Ok(bytes) = tokio::fs::read(path).await else {
+    let library_index = query.library.unwrap_or_default();
+    let library = s.config.lock().ok().and_then(|config| config.libraries.get(library_index).cloned());
+    let Some(library) = library else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response()
+    let media_index = media_snapshot(&s);
+    let group_media = media_index
+        .iter()
+        .filter(|media| media_in_library(media, &library))
+        .filter(|media| {
+            let group_path = metadata_group_path(&root, &media.path, &library.kind);
+            let group_directory = if group_path.is_file() {
+                group_path.parent().unwrap_or(&group_path)
+            } else {
+                group_path.as_path()
+            };
+            group_directory == directory
+        })
+        .collect::<Vec<_>>();
+    let config_mode = s
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    let mut paths = Vec::new();
+    if let Some(media) = group_media.first() {
+        let key = database_media_key(library_index + 1, &media.id);
+        paths.push(
+            config_metadata_sidecar_path(&s, &key)
+                .parent()
+                .unwrap_or(s.subtitle_checkpoints_dir.as_path())
+                .join(format!("{kind}.jpg")),
+        );
+    }
+    paths.push(directory.join(".hbgr").join(format!("{kind}.jpg")));
+    if !config_mode {
+        paths.reverse();
+    }
+    for path in paths {
+        if let Ok(bytes) = tokio::fs::read(path).await {
+            return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+        }
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
 async fn web_media_artwork(
@@ -11850,31 +12061,25 @@ const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
 const fixMatchStatus = document.querySelector("#tv-fix-match-status");
 const fixMatchResults = document.querySelector("#tv-fix-match-results");
 let matchSearchPending = false;
-const stopLibraryRefresh = () => {
-  if (window.__mplexLibraryRefreshTimer) {
-    clearInterval(window.__mplexLibraryRefreshTimer);
-    window.__mplexLibraryRefreshTimer = null;
-  }
-};
 window.__mplexShowConnectionLost = message => {
-  stopLibraryRefresh();
-  let notice = document.querySelector("#mplex-connection-lost");
+  clearTimeout(window.__mplexConnectionNoticeTimer);
+  let notice = document.querySelector("#harbringer-connection-status");
   if (!notice) {
     notice = document.createElement("div");
-    notice.id = "mplex-connection-lost";
-    notice.setAttribute("role", "alert");
-    notice.style.cssText = "position:fixed;top:1rem;left:50%;transform:translateX(-50%);z-index:9999;display:flex;align-items:center;gap:1rem;max-width:calc(100vw - 2rem);padding:.8rem 1rem;border:1px solid #ef4444;border-radius:.65rem;color:#fff;background:#7f1d1d;box-shadow:0 8px 24px #0008";
-    const text = document.createElement("span");
-    text.className = "connection-lost-message";
-    const reload = document.createElement("button");
-    reload.type = "button";
-    reload.textContent = "Reload page";
-    reload.style.cssText = "flex:0 0 auto;padding:.5rem .7rem;border:0;border-radius:.4rem;color:#111827;background:#fff;font:inherit;cursor:pointer";
-    reload.addEventListener("click", () => window.location.reload());
-    notice.append(text, reload);
+    notice.id = "harbringer-connection-status";
     document.body.append(notice);
   }
-  notice.querySelector(".connection-lost-message").textContent = message;
+  notice.setAttribute("role", "alert");
+  notice.textContent = message || "Lost connection to Harbringer.";
+  notice.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;justify-content:center;padding:.8rem 1rem;border:1px solid #ef4444;color:#fff;background:#7f1d1d;box-shadow:0 8px 24px #0008";
+};
+window.__mplexShowConnected = () => {
+  const notice = document.querySelector("#harbringer-connection-status");
+  if (!notice) return;
+  notice.setAttribute("role", "status");
+  notice.textContent = "Connected";
+  notice.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;display:flex;justify-content:center;padding:.8rem 1rem;border:1px solid #22c55e;color:#dcfce7;background:#166534;box-shadow:0 8px 24px #0008";
+  window.__mplexConnectionNoticeTimer = window.setTimeout(() => notice.remove(), 2500);
 };
 const searchTvMatches = async () => {
   if (matchSearchPending) return;
@@ -11896,8 +12101,7 @@ const searchTvMatches = async () => {
     const response = await fetch(`/web/tv-match/search?${params}`, { cache: "no-store" });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 404) {
-      window.__mplexShowConnectionLost("Harbringer could not find the match search endpoint (404). Reload the page to reconnect.");
-      throw new Error("Harbringer could not find the match search endpoint (404). Reload the page to reconnect.");
+      throw new Error("The match search endpoint is unavailable (404).");
     }
     if (!response.ok) throw new Error(payload.error || `TMDB search failed (HTTP ${response.status}).`);
     if (!payload.results.length) {
@@ -11930,9 +12134,8 @@ const searchTvMatches = async () => {
     });
   } catch (error) {
     if (error instanceof TypeError) {
-      const message = "Lost connection to Harbringer. Check that the server is running, then click Search to retry.";
-      window.__mplexShowConnectionLost(message);
-      fixMatchStatus.textContent = message;
+      window.__mplexShowConnectionLost("Lost connection to Harbringer.");
+      fixMatchStatus.textContent = "";
     } else {
       fixMatchStatus.textContent = error.message || "TMDB search failed.";
     }
@@ -11965,8 +12168,7 @@ bindCardAction(fixMatchResults, "click", async event => {
     });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 404) {
-      window.__mplexShowConnectionLost("Harbringer could not find the match save endpoint (404). Reload the page to reconnect.");
-      throw new Error("Harbringer could not find the match save endpoint (404). Reload the page to reconnect.");
+      throw new Error("The match save endpoint is unavailable (404).");
     }
     if (!response.ok) throw new Error(payload.error || "Could not save this match.");
     fixMatchDialog.close();
@@ -11974,9 +12176,8 @@ bindCardAction(fixMatchResults, "click", async event => {
   } catch (error) {
     select.disabled = false;
     if (error instanceof TypeError) {
-      const message = "Lost connection to Harbringer. Your match was not saved. Check that the server is running, then reload the page.";
-      window.__mplexShowConnectionLost(message);
-      fixMatchStatus.textContent = message;
+      window.__mplexShowConnectionLost("Lost connection to Harbringer.");
+      fixMatchStatus.textContent = "";
     } else {
       fixMatchStatus.textContent = error.message || "Could not save this match.";
     }
@@ -12033,7 +12234,6 @@ bindCardAction(document, "click", async event => {
     const fixMatchHeading = document.querySelector("#tv-fix-match-heading");
     const fixMatchDescription = document.querySelector("#tv-fix-match-show");
     if (!fixMatchDialog || !fixMatchQuery || !fixMatchSearchButton || !fixMatchStatus || !fixMatchResults || !fixMatchHeading || !fixMatchDescription) {
-      window.__mplexShowConnectionLost("The Fix Match dialog is unavailable on this page. Reload to reconnect.");
       return;
     }
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
@@ -12117,6 +12317,25 @@ bindCardAction(document, "click", async event => {
   }
 });
 window.__mplexCardActionsCleanup = () => cardActionListeners.splice(0).forEach(remove => remove());
+let checkingConnection = false;
+if (window.__mplexConnectionCheckTimer) clearInterval(window.__mplexConnectionCheckTimer);
+window.__mplexConnectionCheckTimer = window.setInterval(async () => {
+  if (checkingConnection) return;
+  checkingConnection = true;
+  try {
+    const response = await fetch("/", { cache: "no-store" });
+    if (response.status === 404) {
+      clearInterval(window.__mplexConnectionCheckTimer);
+      window.__mplexConnectionCheckTimer = null;
+    }
+    await response.body?.cancel();
+    window.__mplexShowConnected();
+  } catch (_) {
+    window.__mplexShowConnectionLost("Lost connection to Harbringer.");
+  } finally {
+    checkingConnection = false;
+  }
+}, 5000);
 </script>"##
 }
 
@@ -15878,39 +16097,10 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
         return metadata;
     };
     let media_index = media_snapshot(state);
-    let sidecar_mode = config.metadata_storage == "sidecar";
-    if !sidecar_mode {
-        if let Ok(connection) = state.db.lock() {
-            if let Ok(mut statement) = connection.prepare(
-            "SELECT media_key, metadata_json FROM media WHERE media_key LIKE ?1 AND metadata_json IS NOT NULL",
-        ) {
-            if let Ok(rows) = statement.query_map([format!("{section}-%")], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            }) {
-                for row in rows.flatten() {
-                    let (key, value) = row;
-                    if let (Some(id), Ok(item)) = (
-                        key.strip_prefix(&format!("{section}-")),
-                        serde_json::from_str(&value),
-                    ) {
-                        metadata.insert(id.to_owned(), item);
-                    }
-                }
-            }
-        }
-        }
-    }
-
     for media in media_index
         .iter()
         .filter(|media| media_in_library(media, &library))
     {
-        if !sidecar_mode {
-            continue;
-        }
-        if metadata.contains_key(&media.id) {
-            continue;
-        }
         let Some(root) = library
             .folders
             .iter()
@@ -15919,17 +16109,16 @@ fn plex_section_metadata(state: &AppState, section: usize) -> HashMap<String, se
             continue;
         };
         let group_path = metadata_group_path(root, &media.path, &library.kind);
-        let Some(mut item) = read_sidecar_metadata(&group_path) else {
+        let media_key = database_media_key(section, &media.id);
+        let item = read_metadata_sidecar(state, &media_key, &group_path);
+        let Some(mut item) = item else {
             continue;
         };
         if library.kind == "tv" {
             if let Some(episode) = tv_episode_info(root, &media.path) {
                 if let Some(object) = item.as_object_mut() {
                     object.insert("mplex_season".to_owned(), serde_json::json!(episode.season));
-                    object.insert(
-                        "mplex_episode".to_owned(),
-                        serde_json::json!(episode.episode),
-                    );
+                    object.insert("mplex_episode".to_owned(), serde_json::json!(episode.episode));
                     if let Some(end) = episode.episode_end {
                         object.insert("mplex_episode_end".to_owned(), serde_json::json!(end));
                     }
@@ -18420,7 +18609,7 @@ async fn plex_item(
             });
         if known_stale_key {
             if let Some(section) = section {
-                if scan_library_inventory(&s, section - 1).await.is_ok() {
+                if scan_library_inventory(&s, section - 1, false).await.is_ok() {
                     if let Ok(config) = s.config.lock().map(|config| config.clone()) {
                         if let Some(library) = config.libraries.get(section - 1) {
                             let mut container = plex_library_media_container(
@@ -20234,62 +20423,70 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let sidecar_mode = state
+    let config_mode = state
         .config
         .lock()
-        .is_ok_and(|config| config.metadata_storage == "sidecar");
-    if sidecar_mode {
-        let group_path = metadata_group_path(root, &media.path, &library.kind);
-        let group_directory = if group_path.is_file() {
-            group_path.parent().unwrap_or(root)
-        } else {
-            group_path.as_path()
-        };
-        let season_directory = media.path.parent().unwrap_or(root);
-        let artwork_paths = if library.kind == "tv" && filename == "cover.jpg" {
-            [
-                season_directory.join(".mplex").join(filename),
-                group_directory.join(".mplex").join(filename),
-            ]
-        } else {
-            [
-                group_directory.join(".mplex").join(filename),
-                season_directory.join(".mplex").join(filename),
-            ]
-        };
-        for artwork in artwork_paths {
-            if let Ok(bytes) = tokio::fs::read(artwork).await {
-                return (
-                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-                    bytes,
-                )
-                    .into_response();
-            }
+        .is_ok_and(|config| config.metadata_storage == "config");
+    let filename = match filename {
+        "cover.jpg" | "banner.jpg" => filename,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let group_path = metadata_group_path(root, &media.path, &library.kind);
+    let media_index = media_snapshot(state);
+    let representative = media_index
+        .iter()
+        .find(|candidate| {
+            media_library(state, candidate).is_some_and(|(id, _)| id == library_id)
+                && metadata_group_path(root, &candidate.path, &library.kind) == group_path
+        })
+        .unwrap_or(&media);
+    let media_key = database_media_key(library_id, &representative.id);
+    let config_artwork = config_metadata_sidecar_path(state, &media_key)
+        .parent()
+        .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+        .join(filename);
+    let group_directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(root)
+    } else {
+        group_path.as_path()
+    };
+    let season_directory = media.path.parent().unwrap_or(root);
+    let media_artwork = if library.kind == "tv" && filename == "cover.jpg" {
+        [season_directory.join(".hbgr").join(filename), group_directory.join(".hbgr").join(filename)]
+    } else {
+        [group_directory.join(".hbgr").join(filename), season_directory.join(".hbgr").join(filename)]
+    };
+    let artwork_paths = if config_mode {
+        std::iter::once(config_artwork).chain(media_artwork).collect::<Vec<_>>()
+    } else {
+        media_artwork.into_iter().chain(std::iter::once(config_artwork)).collect::<Vec<_>>()
+    };
+    for artwork in &artwork_paths {
+        if let Ok(bytes) = tokio::fs::read(artwork).await {
+            return ([(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))], bytes).into_response();
         }
     }
-    if !sidecar_mode {
-        let kind = match filename {
-            "cover.jpg" => "cover",
-            "banner.jpg" => "banner",
-            _ => return StatusCode::NOT_FOUND.into_response(),
-        };
-        let media_key = database_media_key(library_id, &media.id);
-        let artwork_path = state.db.lock().ok().and_then(|connection| {
-            connection
-                .query_row(
-                    "SELECT local_path FROM artwork WHERE media_key = ?1 AND kind = ?2",
-                    (&media_key, kind),
-                    |row| row.get::<_, String>(0),
-                )
-                .ok()
-        });
-        if let Some(artwork_path) = artwork_path {
-            if let Ok(bytes) = tokio::fs::read(artwork_path).await {
-                return (
-                    [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-                    bytes,
-                )
-                    .into_response();
+    if matches!(library.kind.as_str(), "movie" | "tv") {
+        if let Ok(relative_group_path) = group_path.strip_prefix(root) {
+            let _scan_guard = state.inventory_scan_lock.lock().await;
+            let response = scan_library_metadata(
+                State(state.clone()),
+                Path(library_id - 1),
+                Query(ScanQuery {
+                    force: Some(false),
+                    path: Some(relative_group_path.to_string_lossy().into_owned()),
+                    refresh: None,
+                    assets_only: Some(false),
+                }),
+            )
+            .await;
+            if !response.status().is_success() && !response.status().is_redirection() {
+                warn!(media_id = %media.id, status = %response.status(), "metadata lookup after missing artwork failed");
+            }
+            for artwork in &artwork_paths {
+                if let Ok(bytes) = tokio::fs::read(artwork).await {
+                    return ([(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))], bytes).into_response();
+                }
             }
         }
     }

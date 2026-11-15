@@ -17,7 +17,7 @@ use super::{
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_user_avatar_source,
     plex_video_json, plex_video_resolution, plex_webhook_account_from_access_tokens,
     plex_webhook_destinations_for_account, plex_webhook_destinations_from_response,
-    plex_webhook_event_for_transition, render_database_info_panel, render_season_description_panel,
+    plex_webhook_event_for_transition, render_metadata_info_panel, render_season_description_panel,
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
     tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
@@ -584,14 +584,14 @@ fn missing_cover_markup_uses_a_readable_fallback() {
 }
 
 #[test]
-fn database_metadata_renders_movie_and_episode_information() {
+fn sidecar_metadata_renders_movie_and_episode_information() {
     let movie = serde_json::json!({
         "title": "A <Film>",
         "overview": "A & good story",
         "release_date": "2024-03-14",
         "vote_average": 8.2
     });
-    let movie_panel = render_database_info_panel(&movie, None);
+    let movie_panel = render_metadata_info_panel(&movie, None);
     assert!(movie_panel.contains("A &lt;Film&gt;"));
     assert!(movie_panel.contains("A &amp; good story"));
     assert!(movie_panel.contains("2024-03-14"));
@@ -614,7 +614,7 @@ fn database_metadata_renders_movie_and_episode_information() {
         episode_end: None,
         episode_title: Some("Pilot".to_owned()),
     };
-    let episode_panel = render_database_info_panel(&episode, Some(&episode_info));
+    let episode_panel = render_metadata_info_panel(&episode, Some(&episode_info));
     assert!(episode_panel.contains("<h2>Pilot</h2>"));
     assert!(episode_panel.contains("Episode description"));
     assert!(episode_panel.contains("Episode summary"));
@@ -627,7 +627,7 @@ fn database_metadata_renders_movie_and_episode_information() {
         "mplex_season_description": "Season summary",
         "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
     });
-    let season_panel = render_database_info_panel(&season_fallback, Some(&episode_info));
+    let season_panel = render_metadata_info_panel(&season_fallback, Some(&episode_info));
     assert!(season_panel.contains("Season description"));
     assert!(season_panel.contains("Season summary"));
     assert!(!season_panel.contains("Show summary"));
@@ -638,7 +638,7 @@ fn database_metadata_renders_movie_and_episode_information() {
         "mplex_episode_title": "Pilot",
         "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
     });
-    let show_panel = render_database_info_panel(&show_fallback, Some(&episode_info));
+    let show_panel = render_metadata_info_panel(&show_fallback, Some(&episode_info));
     assert!(show_panel.contains("Show description"));
     assert!(show_panel.contains("Show summary"));
     let show_view_metadata = serde_json::json!({
@@ -647,7 +647,7 @@ fn database_metadata_renders_movie_and_episode_information() {
         "mplex_season_description": "Season summary",
         "mplex_episode_title": "Pilot"
     });
-    let show_view_panel = render_database_info_panel(&show_view_metadata, None);
+    let show_view_panel = render_metadata_info_panel(&show_view_metadata, None);
     assert!(show_view_panel.contains("<h2>Example Show</h2>"));
     assert!(show_view_panel.contains("Show summary"));
     assert!(!show_view_panel.contains("Season summary"));
