@@ -524,9 +524,40 @@ fn plex_server_registration_uses_the_configured_server_name() {
     let configured_name = "Living Room Plex";
 
     let xml = super::plex_server_registration_xml(&fixture.state, configured_name).unwrap();
+    let date = xml
+        .split(" date=\"")
+        .nth(1)
+        .and_then(|value| value.split('\"').next())
+        .expect("registration XML contains a date");
+    assert!(date.parse::<u128>().is_ok());
+    let xml = xml.replace(&format!("date=\"{date}\""), "date=\"DATE\"");
 
-    assert!(xml.contains("<Server name=\"Living Room Plex\" host=\"\""));
-    assert!(!xml.contains(" port=\""));
+    assert_eq!(
+        xml,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"2\"><Server name=\"Living Room Plex\" host=\"\" localAddresses=\"127.0.0.1\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"DATE\" relay=\"0\" /><Directory key=\"1\" type=\"movie\" title=\"Movies\" uuid=\"mplex-1\" /></MediaContainer>",
+            fixture.state.machine_identifier
+        )
+    );
+}
+
+#[test]
+fn plex_server_registration_keeps_instance_identity_distinct() {
+    let first = fixture();
+    let second = fixture();
+    first.config.lock().unwrap().bind = "10.20.61.51:32400".to_owned();
+    second.config.lock().unwrap().bind = "10.20.61.172:32400".to_owned();
+
+    let first_xml = super::plex_server_registration_xml(&first.state, "harbringer-ace").unwrap();
+    let second_xml = super::plex_server_registration_xml(&second.state, "hb-nico").unwrap();
+
+    assert!(first_xml.contains("name=\"harbringer-ace\" host=\"\" localAddresses=\"10.20.61.51\""));
+    assert!(second_xml.contains("name=\"hb-nico\" host=\"\" localAddresses=\"10.20.61.172\""));
+    assert!(first_xml.contains(&format!("machineIdentifier=\"{}\"", first.state.machine_identifier)));
+    assert!(second_xml.contains(&format!("machineIdentifier=\"{}\"", second.state.machine_identifier)));
+    assert_ne!(first.state.machine_identifier, second.state.machine_identifier);
+    assert!(!first_xml.contains(" port=\""));
+    assert!(!second_xml.contains(" port=\""));
 }
 
 
