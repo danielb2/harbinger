@@ -6609,7 +6609,13 @@ fn best_metadata_result<'a>(
     results
         .iter()
         .map(|result| (result, metadata_result_score(title, result, kind)))
-        .max_by_key(|(_, score)| *score)
+        .reduce(|best, candidate| {
+            if candidate.1 > best.1 {
+                candidate
+            } else {
+                best
+            }
+        })
         .filter(|(_, score)| *score >= 40)
 }
 

@@ -544,6 +544,18 @@ fn metadata_matching_prefers_exact_title_and_year() {
     assert!(super::best_metadata_result(&results, "Unknown Film", "movie").is_none());
 }
 
+
+#[test]
+fn tv_metadata_matching_keeps_tmdb_order_for_equal_title_scores() {
+    let results = vec![
+        serde_json::json!({"id": 11, "name": "Bones", "first_air_date": "2005-09-13"}),
+        serde_json::json!({"id": 22, "name": "Bones", "first_air_date": "2017-01-01"}),
+    ];
+    let (selected, _) = super::best_metadata_result(&results, "Bones", "tv")
+        .expect("an exact title match should be found");
+    assert_eq!(selected["id"], 11);
+}
+
 #[test]
 fn tv_metadata_matching_replaces_stale_episode_fields() {
     let root = std::path::PathBuf::from("/library");
