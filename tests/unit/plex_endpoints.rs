@@ -525,7 +525,17 @@ fn plex_server_registration_uses_the_configured_server_name() {
 
     let xml = super::plex_server_registration_xml(&fixture.state, configured_name).unwrap();
 
-    assert!(xml.contains("<Server name=\"Living Room Plex\""));
+    assert!(xml.contains("<Server name=\"Living Room Plex\" host=\"\""));
+    assert!(!xml.contains(" port=\""));
+}
+
+
+#[test]
+fn plex_server_registration_uses_reference_pms_endpoint() {
+    assert_eq!(
+        super::plex_server_registration_url(),
+        "https://plex.tv/servers.xml"
+    );
 }
 
 #[test]
@@ -564,6 +574,42 @@ fn plex_resource_summary_exposes_http_only_publication_without_tokens() {
     assert!(summary.to_string().contains("10.20.61.51"));
     assert!(summary.to_string().contains("14.161.43.148"));
     assert!(!summary.to_string().contains("must-not-be-logged"));
+}
+
+#[test]
+fn plex_account_resource_inventory_lists_servers_without_tokens_or_connections() {
+    let resources = serde_json::json!([
+        {
+            "clientIdentifier": "nico-id",
+            "name": "hb-nico",
+            "provides": "server",
+            "accessToken": "nico-secret",
+            "connections": [{"uri": "http://nico.example:32400"}]
+        },
+        {
+            "machineIdentifier": "ace-id",
+            "name": "harbringer-ace",
+            "provides": "server",
+            "accessToken": "ace-secret"
+        },
+        {
+            "clientIdentifier": "client-id",
+            "name": "Plex Client",
+            "provides": "player",
+            "accessToken": "client-secret"
+        }
+    ]);
+
+    let inventory = super::plex_account_resource_inventory(&resources).to_string();
+
+    assert!(inventory.contains("nico-id"));
+    assert!(inventory.contains("hb-nico"));
+    assert!(inventory.contains("ace-id"));
+    assert!(inventory.contains("harbringer-ace"));
+    assert!(!inventory.contains("nico-secret"));
+    assert!(!inventory.contains("ace-secret"));
+    assert!(!inventory.contains("client-secret"));
+    assert!(!inventory.contains("nico.example"));
 }
 
 #[tokio::test]
@@ -650,6 +696,18 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains("<h2 id=\"logs-heading\">Logs</h2>"));
     assert!(body.contains("id=\"settings-logs-search\" type=\"search\""));
     assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
+    assert!(body.contains("id=\"settings-logs-copy\" type=\"button\""));
+    assert!(body.contains("id=\"settings-logs-copy-status\""));
+    assert!(body.contains("visibleLogLines.slice()"));
+    assert!(body.contains("navigator.clipboard?.writeText"));
+    assert!(body.contains(".log-timestamp"));
+    assert!(body.contains(".log-level-info"));
+    assert!(body.contains(".log-level-warn"));
+    assert!(body.contains(".log-level-error"));
+    assert!(body.contains(".log-key"));
+    assert!(body.contains(".log-value"));
+    assert!(body.contains("renderLogLines(visibleLogLines)"));
+    assert!(body.contains("span.textContent = text;"));
     assert!(body.contains("id=\"settings-logs-output\""));
     assert!(body.contains("Reverse filter (show non-matching)"));
     assert!(body.contains("id=\"settings-logs-live\""));

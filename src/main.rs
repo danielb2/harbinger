@@ -3833,7 +3833,7 @@ async fn publish_plex_connections(
     let registration = plex_server_registration_xml(state, configured_server_name)?;
     info!(server_name = %configured_server_name, "Registering Harbringer with Plex");
     let registration_response = client
-        .post("https://servers.plex.tv/servers.xml")
+        .post(plex_server_registration_url())
         .query(&[("auth_token", server_token)])
         .header("User-Agent", "PlexMediaServer/1.43.4.10903-e5521bd8c")
         .header("Accept", "*/*")
@@ -3908,6 +3908,11 @@ async fn verify_plex_resource(
             .json::<serde_json::Value>()
             .await
             .map_err(|error| format!("Plex returned invalid resource data: {error}"))?;
+        info!(
+            resources = %plex_account_resource_inventory(&resources),
+            "Plex account resource inventory"
+        );
+
         let has_server = plex_resources_contain(&resources, state.machine_identifier.as_ref());
         let has_local_https = plex_resources_contain_local_https(
             &resources,
@@ -3978,6 +3983,34 @@ fn plex_resource_connection_summary(
                     "provides": resource.get("provides"),
                     "connections": connections
                 })
+            })
+            .collect(),
+    )
+}
+
+fn plex_account_resource_inventory(resources: &serde_json::Value) -> serde_json::Value {
+    serde_json::Value::Array(
+        resources
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|resource| {
+                let provides = resource
+                    .get("provides")
+                    .and_then(serde_json::Value::as_str)?;
+                if !provides
+                    .split(',')
+                    .any(|capability| capability.trim() == "server")
+                {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "clientIdentifier": resource
+                        .get("clientIdentifier")
+                        .or_else(|| resource.get("machineIdentifier")),
+                    "name": resource.get("name"),
+                    "provides": provides,
+                }))
             })
             .collect(),
     )
@@ -4198,6 +4231,11 @@ async fn publish_plex_device(
     Ok(())
 }
 
+
+fn plex_server_registration_url() -> &'static str {
+    "https://plex.tv/servers.xml"
+}
+
 fn plex_device_announce_url(machine_identifier: &str) -> String {
     format!(
         "https://servers.plex.tv/devices/{}",
@@ -4225,13 +4263,6 @@ fn plex_server_registration_xml(
     state: &AppState,
     configured_server_name: &str,
 ) -> Result<String, String> {
-    let bind = state
-        .config
-        .lock()
-        .map_err(|_| "could not read harbringer configuration".to_owned())?
-        .bind
-        .parse::<SocketAddr>()
-        .map_err(|_| "harbringer has an invalid bind address".to_owned())?;
     let local_addresses = plex_local_addresses(state);
     let local_addresses = local_addresses
         .iter()
@@ -4261,11 +4292,10 @@ fn plex_server_registration_xml(
     registration_date ^= (registration_date >> 3) & 0x38;
     registration_date ^= (registration_date >> 3) & 0x7;
     Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"{}\" localAddresses=\"{}\" port=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><MediaContainer size=\"{}\"><Server name=\"{}\" host=\"\" localAddresses=\"{}\" machineIdentifier=\"{}\" version=\"1.43.4.10903-e5521bd8c\" date=\"{}\" relay=\"0\" />{directories}</MediaContainer>",
         libraries.len() + 1,
         xml_escape(configured_server_name),
         xml_escape(&local_addresses),
-        bind.port(),
         xml_escape(&state.machine_identifier),
         registration_date,
     ))
@@ -4693,7 +4723,7 @@ async fn settings_page(
             "<p id=\"settings-logs-empty\" class=\"note\" hidden>No log entries yet.</p>"
         };
         format!(
-            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
         )
     } else {
         String::new()
@@ -4895,6 +4925,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 
 .library-add-folder[open] > summary::before {{ content: "+"; }}
 #settings-logs-live {{ color: #8fd6a7; font-size: .82rem; }} .log-follow[hidden] {{ display: none; }}
+.settings-logs .log-timestamp {{ color: #4ade80; }} .settings-logs .log-level-info {{ color: #facc15; font-weight: 700; }} .settings-logs .log-level-warn {{ color: #fb923c; font-weight: 700; }} .settings-logs .log-level-error {{ color: #f87171; font-weight: 700; }} .settings-logs .log-level-debug, .settings-logs .log-level-trace {{ color: #94a3b8; }} .settings-logs .log-key {{ color: #7dd3fc; }} .settings-logs .log-value {{ color: #c4b5fd; }}
 .log-filters {{ display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }} .log-filters > label:first-child {{ display: grid; flex: 1 1 16rem; gap: .45rem; color: #c9d4e4; font-size: .84rem; font-weight: 650; }} .log-filters > label:first-child input {{ margin-top: 0; }} .log-filters > label:nth-child(2) {{ display: flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: #c9d4e4; font-size: .84rem; }} #settings-logs-count {{ margin-left: auto; color: #98a6bb; font-size: .82rem; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
 .settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
@@ -4919,21 +4950,62 @@ const logReverse = document.querySelector('#settings-logs-reverse');
 const logCount = document.querySelector('#settings-logs-count');
 const logEmpty = document.querySelector('#settings-logs-empty');
 const logFollowButton = document.querySelector('#settings-logs-follow');
+const logCopyButton = document.querySelector('#settings-logs-copy');
+const logCopyStatus = document.querySelector('#settings-logs-copy-status');
 const logLiveStatus = document.querySelector('#settings-logs-live');
-if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowButton && logLiveStatus) {{
+if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowButton && logCopyButton && logCopyStatus && logLiveStatus) {{
   let logLines = logOutput.textContent ? logOutput.textContent.split("\n") : [];
+  let visibleLogLines = [];
   let followLogs = true;
   let lastSequence = 0;
   const isAtBottom = () => logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight <= 4;
   const scrollToLatest = () => {{ logOutput.scrollTop = logOutput.scrollHeight; }};
   const updateFollowButton = () => {{ logFollowButton.hidden = isAtBottom(); }};
+  const logTimestampPattern = /^(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d\d:\d\d)(\s+)(TRACE|DEBUG|INFO|WARN|ERROR)(\s+)(.*)$/;
+  const appendLogSpan = (parent, className, text) => {{
+    const span = document.createElement('span');
+    span.className = className;
+    span.textContent = text;
+    parent.append(span);
+  }};
+  const appendLogMessage = (parent, message) => {{
+    const keyValuePattern = /(^|\s)([A-Za-z_][A-Za-z0-9_.-]*)=("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\s]+)/g;
+    let offset = 0;
+    let match;
+    while ((match = keyValuePattern.exec(message)) !== null) {{
+      const keyStart = match.index + match[1].length;
+      parent.append(document.createTextNode(message.slice(offset, keyStart)));
+      appendLogSpan(parent, 'log-key', `${{match[2]}}=`);
+      appendLogSpan(parent, 'log-value', match[3]);
+      offset = keyValuePattern.lastIndex;
+    }}
+    parent.append(document.createTextNode(message.slice(offset)));
+  }};
+  const renderLogLines = lines => {{
+    logOutput.replaceChildren();
+    lines.forEach((line, index) => {{
+      if (index > 0) logOutput.append(document.createTextNode('\n'));
+      const parts = line.match(logTimestampPattern);
+      if (!parts) {{
+        logOutput.append(document.createTextNode(line));
+        return;
+      }}
+      const styledLine = document.createElement('span');
+      appendLogSpan(styledLine, 'log-timestamp', parts[1]);
+      styledLine.append(document.createTextNode(parts[2]));
+      appendLogSpan(styledLine, 'log-level-' + parts[3].toLowerCase(), parts[3]);
+      styledLine.append(document.createTextNode(parts[4]));
+      appendLogMessage(styledLine, parts[5]);
+      logOutput.append(styledLine);
+    }});
+  }};
   const filterLogs = () => {{
     const query = logSearch.value.trim().toLocaleLowerCase();
     const reverse = logReverse.checked && query !== "";
-    const visibleLines = query === "" ? logLines : logLines.filter(line => line.toLocaleLowerCase().includes(query) !== reverse);
-    logOutput.textContent = visibleLines.join("\n");
+    visibleLogLines = query === "" ? logLines : logLines.filter(line => line.toLocaleLowerCase().includes(query) !== reverse);
+    renderLogLines(visibleLogLines);
     logEmpty.hidden = logLines.length !== 0;
-    logCount.textContent = `${{visibleLines.length}} of ${{logLines.length}} lines`;
+    logCount.textContent = `${{visibleLogLines.length}} of ${{logLines.length}} lines`;
     if (followLogs) scrollToLatest();
     updateFollowButton();
   }};
@@ -4948,6 +5020,37 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
   }});
   logSearch.addEventListener('input', filterLogs);
   logReverse.addEventListener('change', filterLogs);
+  const copyLogText = async text => {{
+    if (navigator.clipboard?.writeText) {{
+      try {{
+        await navigator.clipboard.writeText(text);
+        return;
+      }} catch {{}}
+    }}
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.setAttribute('readonly', '');
+    textarea.style.position = 'fixed';
+    textarea.style.opacity = '0';
+    document.body.append(textarea);
+    textarea.select();
+    let copied = false;
+    try {{ copied = document.execCommand('copy'); }} finally {{ textarea.remove(); }}
+    if (!copied) throw new Error('Clipboard copy failed');
+  }};
+  logCopyButton.addEventListener('click', async () => {{
+    const lines = visibleLogLines.slice();
+    logCopyButton.disabled = true;
+    try {{
+      await copyLogText(lines.join("\n"));
+      logCopyStatus.textContent = `Copied ${{lines.length}} visible log lines.`;
+    }} catch {{
+      logCopyStatus.textContent = 'Could not copy the visible log lines.';
+    }} finally {{
+      logCopyButton.disabled = false;
+    }}
+  }});
+
   const connectLogs = () => {{
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const socket = new WebSocket(`${{protocol}}//${{location.host}}/settings/logs/socket`);
