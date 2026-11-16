@@ -2829,6 +2829,10 @@ async fn web_and_plex_clients_share_subtitle_selection() {
     assert!(!web_player.contains("Translate while playing"));
     assert!(web_player.contains("Generate bilingual subtitle"));
     assert!(web_player.contains("class=\"translation-progress\""));
+    assert!(web_player.contains("new WebSocket(subtitleSocketUrl)"));
+    assert!(!web_player.contains("setInterval(syncSubtitleSelection, 3000)"));
+    assert!(web_player.contains("const hasPlayer = Boolean(current?.querySelector(\"video[data-progress-path]\"))"));
+
 
     let plex_selection = send(
         &fixture.app,

@@ -318,6 +318,15 @@ fn log_broadcast() -> &'static tokio::sync::broadcast::Sender<(u64, String)> {
     LOG_BROADCAST.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
 }
 
+static WEB_SUBTITLE_SELECTION_BROADCAST: OnceLock<tokio::sync::broadcast::Sender<(u64, u64)>> =
+    OnceLock::new();
+
+fn web_subtitle_selection_broadcast() -> &'static tokio::sync::broadcast::Sender<(u64, u64)> {
+    WEB_SUBTITLE_SELECTION_BROADCAST
+        .get_or_init(|| tokio::sync::broadcast::channel(128).0)
+}
+
+
 #[derive(Clone)]
 struct LogBufferMakeWriter;
 
@@ -820,6 +829,10 @@ fn build_app(state: AppState) -> Router {
         .route(
             "/web/subtitle-selection",
             get(web_subtitle_selection).post(update_web_subtitle_selection),
+        )
+        .route(
+            "/web/subtitle-selection/socket",
+            get(web_subtitle_selection_socket),
         )
         .route("/web/subtitle", get(web_subtitle))
         .route("/web/translated-subtitle", post(web_translated_subtitle))
@@ -3354,6 +3367,16 @@ async fn web_watch_action(
     StatusCode::NO_CONTENT.into_response()
 }
 
+fn current_web_subtitle_stream_id(state: &AppState, media: &Media) -> u64 {
+    state
+        .plex_stream_selections
+        .lock()
+        .ok()
+        .and_then(|selections| selections.get(&plex_part_id(media)).copied())
+        .and_then(|selection| selection.subtitle_stream_id)
+        .unwrap_or_default()
+}
+
 async fn web_subtitle_selection(
     State(state): State<AppState>,
     Query(query): Query<WebSubtitleSelectionQuery>,
@@ -3368,14 +3391,79 @@ async fn web_subtitle_selection(
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let stream_id = state
-        .plex_stream_selections
-        .lock()
-        .ok()
-        .and_then(|selections| selections.get(&plex_part_id(&media)).copied())
-        .and_then(|selection| selection.subtitle_stream_id)
-        .unwrap_or_default();
-    Json(serde_json::json!({ "streamId": stream_id })).into_response()
+    Json(serde_json::json!({ "streamId": current_web_subtitle_stream_id(&state, &media) }))
+        .into_response()
+}
+
+async fn web_subtitle_selection_socket(
+    State(state): State<AppState>,
+    Query(query): Query<WebSubtitleSelectionQuery>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    let Some(relative) = clean_relative_path(&query.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_folder_root(&state, query.library, query.folder);
+    let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let part_id = plex_part_id(&media);
+    let mut updates = web_subtitle_selection_broadcast().subscribe();
+    let stream_id = current_web_subtitle_stream_id(&state, &media);
+    upgrade
+        .on_upgrade(move |mut socket| async move {
+            let snapshot = serde_json::json!({ "streamId": stream_id });
+            if socket
+                .send(Message::Text(snapshot.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut heartbeat = tokio::time::interval_at(
+                tokio::time::Instant::now() + Duration::from_secs(30),
+                Duration::from_secs(30),
+            );
+            loop {
+                tokio::select! {
+                    message = socket.recv() => match message {
+                        Some(Ok(Message::Ping(payload))) => {
+                            if socket.send(Message::Pong(payload)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
+                    },
+                    update = updates.recv() => match update {
+                        Ok((updated_part_id, stream_id)) if updated_part_id == part_id => {
+                            let event = serde_json::json!({ "streamId": stream_id });
+                            if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let stream_id = current_web_subtitle_stream_id(&state, &media);
+                            let snapshot = serde_json::json!({ "streamId": stream_id });
+                            if socket.send(Message::Text(snapshot.to_string().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = heartbeat.tick() => {
+                        if socket.send(Message::Ping(vec![b'?'].into())).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .into_response()
 }
 
 async fn update_web_subtitle_selection(
@@ -3440,6 +3528,7 @@ async fn update_web_subtitle_selection(
     } else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), update.stream_id));
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -9846,15 +9935,42 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: streamId }})
           }}).catch(() => {{}});
         }});
-        const syncSubtitleSelection = () => fetch(`/web/subtitle-selection?${{subtitleQuery.toString()}}`, {{ cache: "no-store" }})
-          .then(response => response.ok ? response.json() : null)
-          .then(selection => {{
-            if (selection && Number(selection.streamId) !== Number(subtitleSelect.dataset.selectedStreamId || 0)) {{
-              applyServerSubtitle(Number(selection.streamId));
-            }}
-          }}).catch(() => {{}});
-        syncSubtitleSelection();
-        window.setInterval(syncSubtitleSelection, 3000);
+        const subtitleSocketUrl = new URL("/web/subtitle-selection/socket", window.location.href);
+        subtitleSocketUrl.protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        subtitleSocketUrl.search = subtitleQuery.toString();
+        let subtitleSelectionSocket = null;
+        let subtitleSelectionReconnectTimer = null;
+        let subtitleSelectionSocketActive = true;
+        const connectSubtitleSelectionSocket = () => {{
+          if (!subtitleSelectionSocketActive || !subtitleSelect.isConnected) return;
+          const socket = new WebSocket(subtitleSocketUrl);
+          subtitleSelectionSocket = socket;
+          socket.addEventListener("message", event => {{
+            try {{
+              const selection = JSON.parse(event.data);
+              const streamId = Number(selection.streamId || 0);
+              if (streamId !== Number(subtitleSelect.dataset.selectedStreamId || 0)) {{
+                applyServerSubtitle(streamId);
+              }}
+            }} catch (_) {{}}
+          }});
+          socket.addEventListener("close", () => {{
+            if (!subtitleSelectionSocketActive || subtitleSelectionSocket !== socket || !subtitleSelect.isConnected) return;
+            subtitleSelectionReconnectTimer = window.setTimeout(connectSubtitleSelectionSocket, 3000);
+          }});
+        }};
+        const stopSubtitleSelectionSocket = () => {{
+          subtitleSelectionSocketActive = false;
+          if (subtitleSelectionReconnectTimer) clearTimeout(subtitleSelectionReconnectTimer);
+          subtitleSelectionSocket?.close();
+          subtitleSelectionObserver.disconnect();
+        }};
+        const subtitleSelectionObserver = new MutationObserver(() => {{
+          if (!subtitleSelect.isConnected) stopSubtitleSelectionSocket();
+        }});
+        subtitleSelectionObserver.observe(document.body, {{ childList: true, subtree: true }});
+        connectSubtitleSelectionSocket();
+        window.addEventListener("pagehide", stopSubtitleSelectionSocket, {{ once: true }});
         const addBrowserEmbeddedTracks = () => {{
           const servedTracks = new Set([...video.querySelectorAll("track")].map(element => element.track).filter(Boolean));
           [...video.textTracks].forEach((track, index) => {{
@@ -10187,7 +10303,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         const next = document.querySelector(".library");
         const hasPlaybackState = [...window.document.querySelectorAll("video")]
           .some(video => !video.paused && !video.ended || video.currentTime > 0);
-        if (!hasPlaybackState && current && next && current.innerHTML !== next.innerHTML) {{
+        const hasPlayer = Boolean(current?.querySelector("video[data-progress-path]"));
+        if (!hasPlaybackState && !hasPlayer && current && next && current.innerHTML !== next.innerHTML) {{
           current.replaceWith(next);
           window.__mplexSelectedVideo = null;
         }}
@@ -20595,8 +20712,9 @@ async fn plex_set_streams(
         if selection.audio_stream_id.is_some() {
             current.audio_stream_id = selection.audio_stream_id;
         }
-        if selection.subtitle_stream_id.is_some() {
-            current.subtitle_stream_id = selection.subtitle_stream_id;
+        if let Some(stream_id) = selection.subtitle_stream_id {
+            current.subtitle_stream_id = Some(stream_id);
+            let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), stream_id));
         }
     }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
