@@ -2585,7 +2585,12 @@ async fn web_translated_subtitle(
                 error = %error,
                 "bilingual subtitle generation stopped with an error"
             );
-            (StatusCode::BAD_GATEWAY, error).into_response()
+            let status = if error.starts_with("Google Translate rate limit (HTTP 429)") {
+                StatusCode::TOO_MANY_REQUESTS
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            (status, error).into_response()
         }
     }
 }
@@ -9674,6 +9679,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .subtitle-translation label {{ display: grid; gap: .2rem; color: #cbd5e1; font-size: .75rem; }}
     .subtitle-translation select, .subtitle-translation button {{ padding: .4rem .55rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
     .translation-status {{ flex-basis: 100%; min-height: 1.2rem; color: #9ca3af; font-size: .8rem; }}
+    .translation-status[role="alert"] {{ color: #fca5a5; font-weight: 600; }}
     .translation-source-label {{ flex-basis: 100%; color: #9ca3af; font-size: .75rem; }}
     .translation-progress {{ flex-basis: 100%; width: 100%; height: .65rem; accent-color: #22c55e; }}
     .translation-progress-label {{ flex-basis: 100%; color: #9ca3af; font-size: .75rem; }}
@@ -9915,11 +9921,18 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         }};
         const translate = async prepared => {{
           const status = translationControls.querySelector(".translation-status");
+          const showTranslationError = message => {{
+            status.setAttribute("role", "alert");
+            status.setAttribute("aria-live", "assertive");
+            status.textContent = message;
+          }};
+          status.setAttribute("role", "status");
+          status.setAttribute("aria-live", "polite");
           const generationProgress = translationControls.querySelector(".translation-progress");
           const generationProgressLabel = translationControls.querySelector(".translation-progress-label");
           const selectedOption = subtitleSelect?.selectedOptions[0];
           if (selectedOption?.dataset.bilingual === "true") {{
-            status.textContent = "This subtitle is already bilingual.";
+            showTranslationError("This subtitle is already bilingual.");
             return;
           }}
           const sourceId = Number(selectedOption?.dataset.streamId || 0);
@@ -9931,12 +9944,12 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           if (browserTrackIndex !== undefined) {{
             const embeddedTrack = video.textTracks[Number(browserTrackIndex)];
             if (!embeddedTrack?.cues || embeddedTrack.cues.length === 0) {{
-              status.textContent = "This browser has not loaded subtitle cues yet. Start playback or choose a listed server subtitle track, then try again.";
+              showTranslationError("This browser has not loaded subtitle cues yet. Start playback or choose a listed server subtitle track, then try again.");
               return;
             }}
             sourceLanguage = embeddedTrack.language || "und";
             browserCues = [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }}));
-          }} else if (!sourceId) {{ status.textContent = "Select a text subtitle track first."; return; }}
+          }} else if (!sourceId) {{ showTranslationError("Select a text subtitle track first."); return; }}
           if (activeStreamingSourceKey && (prepared || activeStreamingSourceKey !== sourceKey)) {{
             await fetch("/web/translation-stop", {{ method: "POST", headers: {{ "content-type": "application/json" }},
               body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null }}) }}).catch(() => {{}});
@@ -9981,7 +9994,12 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             }}
             const response = await fetch("/web/translated-subtitle", {{ method: "POST", headers: {{ "content-type": "application/json" }},
               body: JSON.stringify(latestTranslationRequest) }});
-            if (!response.ok) throw new Error(await response.text());
+            if (!response.ok) {{
+              const message = await response.text();
+              const error = new Error(message || `Request failed with HTTP ${{response.status}}`);
+              error.status = response.status;
+              throw error;
+            }}
             const initialContents = await response.text();
             if (translatedOption) translatedOption.remove();
             if (translatedTrack) translatedTrack.remove();
@@ -10019,7 +10037,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             status.textContent = prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
             if (prepared) {{ generationProgress.value = 100; generationProgressLabel.textContent = "Complete · saved as .srt"; }}
           }} catch (error) {{
-            status.textContent = `Translation unavailable: ${{error.message || "request failed"}}`;
+            if (error.status === 429) showTranslationError(error.message);
+            else showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}`);
             if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume.";
           }} finally {{
             if (generationProgressTimer) clearInterval(generationProgressTimer);
