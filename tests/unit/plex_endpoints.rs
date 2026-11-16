@@ -948,6 +948,28 @@ async fn hbweb_uses_config_sidecar_banner_as_show_background() {
     .unwrap();
     assert!(body.contains("background-image:linear-gradient"));
     assert!(body.contains("kind=banner"));
+
+    let episode_app = build_web_listener_app(fixture.state.clone())
+        .layer(axum::middleware::from_fn(inject_test_cookie));
+    let episode_response = episode_app
+        .oneshot(
+            Request::builder()
+                .uri("/?library=0&path=Example%20Show%2FSeason%2001&episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(episode_response.status(), StatusCode::OK);
+    let episode_body = String::from_utf8(
+        to_bytes(episode_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(episode_body.contains("kind=banner"));
+    assert!(episode_body.contains("path=Example%20Show"));
 }
 
 
@@ -3636,7 +3658,9 @@ async fn tv_season_navigation_renders_episode_cover_cards() {
     )
     .unwrap();
 
-    assert!(body.contains("class=\"media-card media-card-tv\""));
+    assert!(body.contains("class=\"media-card media-card-tv media-card-episode\""));
+    assert!(body.contains("/web/episode-artwork/tv-0"));
+    assert!(body.contains("aspect-ratio: 16 / 9"));
     assert!(body.contains("A season description"));
     let panel = body.find("class=\"metadata-panel\"").unwrap();
     let items = body.find("class=\"library\"").unwrap();
@@ -3656,6 +3680,157 @@ async fn tv_season_navigation_renders_episode_cover_cards() {
         "class=\"media-cover-placeholder\" role=\"img\" aria-label=\"Cover unavailable for New\">No cover available"
     ));
     assert!(!body.contains("tv-episode-card"));
+}
+
+#[tokio::test]
+async fn hbweb_episode_uses_tmdb_details_still_and_show_banner() {
+    let fixture = tv_fixture();
+    let show_root = fixture.root.join("media/Example Show");
+    let episode_path = show_root.join("Season 01/Example.Show.S01E01.Pilot.mkv");
+    assert_eq!(
+        super::tv_episode_show_directory(&show_root, &episode_path),
+        Some(show_root.clone())
+    );
+    let season_dir = fixture.root.join("media/Example Show/Season 01");
+    let episode_dir = season_dir.join(".hbgr/episodes");
+    std::fs::create_dir_all(&episode_dir).unwrap();
+    std::fs::write(
+        episode_dir.join("s01e01.json"),
+        r#"{"name":"TMDB Episode Title","overview":"TMDB episode summary"}"#,
+    )
+    .unwrap();
+    std::fs::write(episode_dir.join("s01e01.jpg"), b"episode still").unwrap();
+    let show_artwork = fixture.root.join("media/Example Show/.hbgr");
+    std::fs::create_dir_all(&show_artwork).unwrap();
+    std::fs::write(show_artwork.join("banner.jpg"), b"show banner").unwrap();
+
+    let season_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001",
+        Body::empty(),
+    )
+    .await;
+    let season_body = String::from_utf8(
+        to_bytes(season_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(season_body.contains("/web/episode-artwork/tv-0"));
+    assert!(season_body.contains("aspect-ratio: 16 / 9"));
+    assert!(season_body.contains("TMDB Episode Title"));
+
+    let episode_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001&episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(episode_response.status(), StatusCode::OK);
+    let episode_body = String::from_utf8(
+        to_bytes(episode_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(episode_body.contains("TMDB Episode Title"));
+    assert!(episode_body.contains("TMDB episode summary"));
+    assert!(episode_body.contains("kind=banner"));
+    assert!(episode_body.contains("<main style=\"background-size:cover"));
+    assert!(episode_body.contains("path=Example%20Show"));
+
+    let banner_response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Example%20Show&kind=banner",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(banner_response.status(), StatusCode::OK);
+    let banner = to_bytes(banner_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(banner.as_ref(), b"show banner");
+
+    let still_response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/episode-artwork/tv-0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(still_response.status(), StatusCode::OK);
+    let still = to_bytes(still_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(still.as_ref(), b"episode still");
+}
+
+#[tokio::test]
+async fn hbweb_episode_metadata_and_still_use_config_storage() {
+    let fixture = tv_fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media = super::media_snapshot(&fixture.state)
+        .iter()
+        .find(|media| media.id == "tv-0")
+        .unwrap()
+        .clone();
+    let key = super::database_media_key(1, &media.id);
+    let details = serde_json::json!({
+        "name": "Config Episode Title",
+        "overview": "Config episode summary",
+        "still_path": "/still.jpg"
+    });
+    let metadata = super::tv_metadata_with_episode_details(
+        &serde_json::json!({"name": "Example Show"}),
+        &details,
+    );
+    assert!(super::write_config_metadata(
+        &fixture.state,
+        &key,
+        &metadata
+    ));
+    let artwork_dir = super::config_metadata_sidecar_path(&fixture.state, &key)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    std::fs::create_dir_all(&artwork_dir).unwrap();
+    std::fs::write(artwork_dir.join("episode.jpg"), b"config episode still").unwrap();
+
+    let episode_response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show%2FSeason%2001&episode=Example%20Show%2FSeason%2001%2FExample.Show.S01E01.Pilot.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(episode_response.status(), StatusCode::OK);
+    let episode_body = String::from_utf8(
+        to_bytes(episode_response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(episode_body.contains("Config Episode Title"));
+    assert!(episode_body.contains("Config episode summary"));
+
+    let still_response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/episode-artwork/tv-0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(still_response.status(), StatusCode::OK);
+    let still = to_bytes(still_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(still.as_ref(), b"config episode still");
 }
 
 #[tokio::test]

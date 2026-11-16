@@ -628,7 +628,7 @@ fn sidecar_metadata_renders_movie_and_episode_information() {
     };
     let episode_panel = render_metadata_info_panel(&episode, Some(&episode_info));
     assert!(episode_panel.contains("<h2>Pilot</h2>"));
-    assert!(episode_panel.contains("Episode description"));
+    assert!(episode_panel.contains("<p class=\"metadata-description\">Episode summary</p>"));
     assert!(episode_panel.contains("Episode summary"));
     assert!(episode_panel.contains("season</strong><span>1"));
     assert!(!episode_panel.contains("Series summary"));
@@ -640,7 +640,7 @@ fn sidecar_metadata_renders_movie_and_episode_information() {
         "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
     });
     let season_panel = render_metadata_info_panel(&season_fallback, Some(&episode_info));
-    assert!(season_panel.contains("Season description"));
+    assert!(season_panel.contains("<p class=\"metadata-description\">Season summary</p>"));
     assert!(season_panel.contains("Season summary"));
     assert!(!season_panel.contains("Show summary"));
 
@@ -651,7 +651,7 @@ fn sidecar_metadata_renders_movie_and_episode_information() {
         "mplex_episode_metadata": {"name": "Pilot", "overview": ""}
     });
     let show_panel = render_metadata_info_panel(&show_fallback, Some(&episode_info));
-    assert!(show_panel.contains("Show description"));
+    assert!(show_panel.contains("<p class=\"metadata-description\">Show summary</p>"));
     assert!(show_panel.contains("Show summary"));
     let show_view_metadata = serde_json::json!({
         "name": "Example Show",
@@ -668,7 +668,7 @@ fn sidecar_metadata_renders_movie_and_episode_information() {
     let show_metadata = serde_json::json!({"overview": "Show summary"});
     let empty_season = serde_json::json!({"name": "Season One", "overview": ""});
     let season_panel = render_season_description_panel(&empty_season, 1, Some(&show_metadata));
-    assert!(season_panel.contains("Show description"));
+    assert!(season_panel.contains("<p class=\"metadata-description\">Show summary</p>"));
     assert!(season_panel.contains("Show summary"));
 }
 
