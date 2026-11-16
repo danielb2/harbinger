@@ -816,6 +816,8 @@ fn build_app(state: AppState) -> Router {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/web/stream", any(web_stream))
+        .route("/web/index.html", get(web_index_redirect))
+        .route("/web/", get(web_index_redirect))
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/translation-stop", post(stop_web_translation))
         .route("/web/watch-action", post(web_watch_action))
@@ -1052,7 +1054,11 @@ fn build_web_listener_app(state: AppState) -> Router {
 
 fn build_plex_listener_app(state: AppState) -> Router {
     build_app(state).layer(middleware::from_fn(|mut request: Request<Body>, next: Next| async move {
-        if is_web_surface_path(request.uri().path()) && request.uri().path() != "/" {
+        if is_web_surface_path(request.uri().path())
+            && request.uri().path() != "/"
+            && request.uri().path() != "/web/index.html"
+            && request.uri().path() != "/web/"
+        {
             return StatusCode::NOT_FOUND.into_response();
         }
         request.extensions_mut().insert(ListenerSurface::Plex);
@@ -2272,11 +2278,15 @@ struct BrowseQuery {
 #[derive(Deserialize)]
 struct ProgressQuery {
     path: String,
+    library: Option<usize>,
+    folder: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct ProgressUpdate {
     path: String,
+    library: Option<usize>,
+    folder: Option<usize>,
     position_ms: i64,
     duration_ms: Option<i64>,
     watched: bool,
@@ -2286,12 +2296,14 @@ struct ProgressUpdate {
 struct WebTranslationStopRequest {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct WebSubtitleSelectionUpdate {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
     stream_id: u64,
 }
 
@@ -2299,12 +2311,14 @@ struct WebSubtitleSelectionUpdate {
 struct WebSubtitleSelectionQuery {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
 }
 
 #[derive(Deserialize)]
 struct WebTranslatedSubtitleRequest {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
     #[serde(default)]
     stream_id: u64,
     #[serde(default)]
@@ -2323,6 +2337,7 @@ struct WebTranslatedSubtitleRequest {
 struct WebTranslationProgressRequest {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
     #[serde(default)]
     stream_id: u64,
     first_language: String,
@@ -2367,7 +2382,7 @@ async fn web_translation_progress(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, request.library);
+    let root = selected_library_folder_root(&state, request.library, request.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2467,7 +2482,7 @@ async fn web_translated_subtitle(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, request.library);
+    let root = selected_library_folder_root(&state, request.library, request.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -3131,6 +3146,7 @@ where
 struct WebWatchActionUpdate {
     path: String,
     library: Option<usize>,
+    folder: Option<usize>,
     action: String,
     scope: Option<String>,
 }
@@ -3142,6 +3158,10 @@ async fn web_progress(
     let Some(path) = clean_relative_path(&query.path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let root = selected_library_folder_root(&state, query.library, query.folder);
+    if web_path(&state, &root, &path).await.is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -3175,7 +3195,7 @@ async fn stop_web_translation(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, request.library);
+    let root = selected_library_folder_root(&state, request.library, request.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -3190,6 +3210,10 @@ async fn update_web_progress(
     let Some(path) = clean_relative_path(&update.path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let root = selected_library_folder_root(&state, update.library, update.folder);
+    if web_path(&state, &root, &path).await.is_err() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -3219,7 +3243,7 @@ async fn web_watch_action(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, update.library);
+    let root = selected_library_folder_root(&state, update.library, update.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         warn!(path = %relative.display(), library = ?update.library, action = %update.action, "Web watch action could not find media");
         return StatusCode::NOT_FOUND.into_response();
@@ -3301,7 +3325,7 @@ async fn web_subtitle_selection(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, query.library);
+    let root = selected_library_folder_root(&state, query.library, query.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -3325,7 +3349,7 @@ async fn update_web_subtitle_selection(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&state, update.library);
+    let root = selected_library_folder_root(&state, update.library, update.folder);
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -8390,6 +8414,7 @@ async fn delete_library(
 struct WebPath {
     path: Option<String>,
     library: Option<usize>,
+    folder: Option<usize>,
     kind: Option<String>,
     stream: Option<usize>,
     play: Option<String>,
@@ -8398,13 +8423,18 @@ struct WebPath {
     season: Option<u32>,
 }
 
-fn selected_library_root(state: &AppState, library: Option<usize>) -> PathBuf {
+
+fn selected_library_folder_root(
+    state: &AppState,
+    library: Option<usize>,
+    folder: Option<usize>,
+) -> PathBuf {
     let Ok(config) = state.config.lock() else {
         return state.root.as_ref().clone();
     };
     library
         .and_then(|index| config.libraries.get(index))
-        .and_then(|library| library.folders.first())
+        .and_then(|library| library.folders.get(folder.unwrap_or_default()))
         .cloned()
         .unwrap_or_else(|| state.root.as_ref().clone())
 }
@@ -8789,7 +8819,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let library_root = selected_library_root(&s, query.library);
+    let library_root = selected_library_folder_root(&s, query.library, query.folder);
     let library_kind = query.library.and_then(|index| {
         s.config.lock().ok().and_then(|config| {
             config
@@ -9089,6 +9119,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         .map(|index| plex_section_metadata(&s, index + 1))
         .unwrap_or_default();
     let mut virtual_seasons = BTreeMap::<u32, Vec<&Media>>::new();
+    let folder_query = query
+        .folder
+        .map(|folder| format!("&folder={folder}"))
+        .unwrap_or_default();
     if virtual_tv_view {
         for media in media_index.iter() {
             if !media
@@ -9117,9 +9151,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 continue;
             };
             let href = format!(
-                "/?library={}&path={}&season={season}",
+                "/?library={}&path={}{}&season={season}",
                 query.library.unwrap_or_default(),
-                url_encode(&show_path)
+                url_encode(&show_path),
+                folder_query
             );
             let representative_path = representative
                 .path
@@ -9156,9 +9191,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 tv_episode_card_labels(&library_root, &episode.path, item_metadata);
             let title = episode_title.unwrap_or_else(|| episode.title.clone());
             let href = format!(
-                "/?library={}&path={}&season={}&episode={}",
+                "/?library={}&path={}{}&season={}&episode={}",
                 query.library.unwrap_or_default(),
                 url_encode(&relative.to_string_lossy()),
+                folder_query,
                 query.season.unwrap_or_default(),
                 url_encode(&episode_path.to_string_lossy())
             );
@@ -9214,9 +9250,17 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     }) else {
                         continue;
                     };
+                    let Some((folder_index, source_root)) = library
+                        .folders
+                        .iter()
+                        .enumerate()
+                        .find(|(_, root)| representative.path.starts_with(*root))
+                    else {
+                        continue;
+                    };
                     let show_path = representative
                         .path
-                        .strip_prefix(&library_root)
+                        .strip_prefix(source_root)
                         .ok()
                         .and_then(|path| path.components().next())
                         .map(|component| PathBuf::from(component.as_os_str()));
@@ -9228,7 +9272,13 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     let season_count = show
                         .episodes
                         .iter()
-                        .filter_map(|episode| tv_season_number(&library_root, &episode.path))
+                        .filter_map(|episode| {
+                            library
+                                .folders
+                                .iter()
+                                .find(|root| episode.path.starts_with(*root))
+                                .and_then(|root| tv_season_number(root, &episode.path))
+                        })
                         .collect::<BTreeSet<_>>()
                         .len();
                     let season_label = format!(
@@ -9237,12 +9287,15 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     );
 
                     let Some(representative_path) =
-                        representative.path.strip_prefix(&library_root).ok()
+                        representative.path.strip_prefix(source_root).ok()
                     else {
                         continue;
                     };
+                    let folder_query = (folder_index > 0)
+                        .then(|| format!("&folder={folder_index}"))
+                        .unwrap_or_default();
                     let href = format!(
-                        "/?library={library_index}&path={}",
+                        "/?library={library_index}{folder_query}&path={}",
                         url_encode(&show_path.to_string_lossy())
                     );
                     folder_cards.push_str(&media_cover_card(
@@ -9262,7 +9315,14 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 }
             } else {
                 for media_item in media {
-                    let Some(media_path) = media_item.path.strip_prefix(&library_root).ok() else {
+                    let Some(source_root) = library
+                        .folders
+                        .iter()
+                        .find(|root| media_item.path.starts_with(*root))
+                    else {
+                        continue;
+                    };
+                    let Some(media_path) = media_item.path.strip_prefix(source_root).ok() else {
                         continue;
                     };
                     let folder = media_path.parent().unwrap_or(std::path::Path::new(""));
@@ -9271,7 +9331,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         media_item,
                         library,
                         item_metadata,
-                        &library_root,
+                        source_root,
                         folder,
                         media_path,
                         library_index,
@@ -9460,7 +9520,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 None
             };
             let subtitles = if let Some(media) = matched_media.as_ref() {
-                subtitle_tracks(&s, media, &child_relative, query.library).await
+                subtitle_tracks(&s, media, &child_relative, query.library, query.folder).await
             } else {
                 Vec::new()
             };
@@ -9478,6 +9538,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 &child_relative.to_string_lossy(),
                 mime,
                 query.library,
+                query.folder,
                 &subtitles,
                 artwork,
                 selected_subtitle,
@@ -9705,6 +9766,8 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         }}, {{ once: true }});
       }}
       const path = video.dataset.progressPath;
+      const library = video.dataset.library;
+      const folder = video.dataset.folder;
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
       let activeStreamingSourceKey = null;
       let activeStreamingSourceName = null;
@@ -9729,8 +9792,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       }};
       if (subtitleSelect) {{
         applyServerSubtitle(Number(subtitleSelect.dataset.selectedStreamId || 0));
-        const library = subtitleSelect.dataset.library;
-        const subtitleQuery = `${{library ? `library=${{encodeURIComponent(library)}}&` : ""}}path=${{encodeURIComponent(path)}}`;
+        const subtitleQuery = new URLSearchParams({{ path }});
+        if (library) subtitleQuery.set("library", library);
+        if (folder) subtitleQuery.set("folder", folder);
         subtitleSelect.addEventListener("change", event => {{
           const select = event.currentTarget;
           const option = select.selectedOptions[0];
@@ -9739,10 +9803,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           select.dataset.selectedStreamId = String(streamId);
           fetch("/web/subtitle-selection", {{
             method: "POST", headers: {{ "content-type": "application/json" }},
-            body: JSON.stringify({{ path, library: library ? Number(library) : null, stream_id: streamId }})
+            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: streamId }})
           }}).catch(() => {{}});
         }});
-        const syncSubtitleSelection = () => fetch(`/web/subtitle-selection?${{subtitleQuery}}`, {{ cache: "no-store" }})
+        const syncSubtitleSelection = () => fetch(`/web/subtitle-selection?${{subtitleQuery.toString()}}`, {{ cache: "no-store" }})
           .then(response => response.ok ? response.json() : null)
           .then(selection => {{
             if (selection && Number(selection.streamId) !== Number(subtitleSelect.dataset.selectedStreamId || 0)) {{
@@ -9838,7 +9902,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           }} else if (!sourceId) {{ status.textContent = "Select a text subtitle track first."; return; }}
           if (activeStreamingSourceKey && (prepared || activeStreamingSourceKey !== sourceKey)) {{
             await fetch("/web/translation-stop", {{ method: "POST", headers: {{ "content-type": "application/json" }},
-              body: JSON.stringify({{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null }}) }}).catch(() => {{}});
+              body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null }}) }}).catch(() => {{}});
             activeStreamingSourceKey = null;
             activeStreamingSourceName = null;
           }}
@@ -9852,7 +9916,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           status.textContent = prepared ? `Generating from ${{selectedSourceName}}…` : `Translating from ${{selectedSourceName}}…`;
           translationControls.querySelectorAll("button").forEach(button => button.disabled = true);
           try {{
-            latestTranslationRequest = {{ path, library: subtitleSelect.dataset.library ? Number(subtitleSelect.dataset.library) : null,
+            latestTranslationRequest = {{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null,
                 stream_id: sourceId, first_language: translationControls.querySelector(".translation-first").value,
                 second_language: translationControls.querySelector(".translation-second").value,
                 source_language: sourceLanguage, source_cues: browserCues, source_key: sourceKey, prepared }};
@@ -9860,7 +9924,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
               generationProgress.hidden = false;
               generationProgress.value = 0;
               generationProgressLabel.textContent = "Starting bilingual subtitle generation…";
-              const progressRequest = {{ path, library: latestTranslationRequest.library, stream_id: sourceId,
+              const progressRequest = {{ path, library: latestTranslationRequest.library, folder: latestTranslationRequest.folder, stream_id: sourceId,
                 first_language: latestTranslationRequest.first_language, second_language: latestTranslationRequest.second_language,
                 source_key: sourceKey, total_cues: browserCues.length || null }};
               const refreshProgress = async () => {{
@@ -9952,7 +10016,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       }};
       startButton?.addEventListener("click", () => playAt(0));
       resumeButton?.addEventListener("click", () => playAt(Number(resumeButton.dataset.position || 0)));
-      fetch(`/web/progress?path=${{encodeURIComponent(path)}}`, {{ cache: "no-store" }})
+      const progressQuery = new URLSearchParams({{ path }});
+      if (library) progressQuery.set("library", library);
+      if (folder) progressQuery.set("folder", folder);
+      fetch(`/web/progress?${{progressQuery.toString()}}`, {{ cache: "no-store" }})
         .then(response => response.ok ? response.json() : null)
         .then(progress => {{
           if (!progress || progress.watched || !Number.isFinite(progress.positionMs) || progress.positionMs <= 2) return;
@@ -9971,7 +10038,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         lastProgressSave = Date.now();
         fetch("/web/progress", {{
           method: "POST", headers: {{ "content-type": "application/json" }},
-          body: JSON.stringify({{ path, position_ms: Math.round(video.currentTime * 1000), duration_ms: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : null, watched }})
+          body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, position_ms: Math.round(video.currentTime * 1000), duration_ms: Number.isFinite(video.duration) ? Math.round(video.duration * 1000) : null, watched }})
         }}).catch(() => {{}});
         if (resumeButton && video.currentTime > 2) {{
           resumeButton.hidden = false;
@@ -9994,7 +10061,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       }};
       video.addEventListener("timeupdate", () => {{ if (!video.paused) save(false); }});
       video.addEventListener("pause", () => save(false));
-      const translationStopRequest = JSON.stringify({{ path, library: subtitleSelect?.dataset.library ? Number(subtitleSelect.dataset.library) : null }});
+      const translationStopRequest = JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null }});
       const cancelStreamingTranslation = () => fetch("/web/translation-stop", {{
         method: "POST", headers: {{ "content-type": "application/json" }}, body: translationStopRequest
       }}).catch(() => {{}});
@@ -10792,8 +10859,14 @@ async fn subtitle_tracks(
     media: &Media,
     relative: &std::path::Path,
     library: Option<usize>,
+    folder: Option<usize>,
 ) -> Vec<SubtitleTrack> {
     let mut tracks = Vec::new();
+    let library_query = format!(
+        "{}{}",
+        library.map(|index| format!("library={index}&")).unwrap_or_default(),
+        folder.map(|index| format!("folder={index}&")).unwrap_or_default()
+    );
     let languages = state.config.lock().ok().and_then(|config| {
         config.bilingual_subtitles_enabled.then(|| {
             (
@@ -10820,9 +10893,7 @@ async fn subtitle_tracks(
             label: format!("External: {}", external_subtitle_label(&media.path, &path)),
             url: format!(
                 "/web/subtitle?{}path={}",
-                library
-                    .map(|index| format!("library={index}&"))
-                    .unwrap_or_default(),
+                library_query,
                 url_encode(
                     &relative
                         .parent()
@@ -10867,9 +10938,7 @@ async fn subtitle_tracks(
                     label: format!("Embedded: {label}"),
                     url: format!(
                         "/web/subtitle?{}path={}&stream={stream_id}",
-                        library
-                            .map(|index| format!("library={index}&"))
-                            .unwrap_or_default(),
+                        library_query,
                         url_encode(&relative.to_string_lossy())
                     ),
                     stream_id,
@@ -10889,7 +10958,7 @@ async fn web_subtitle(State(s): State<AppState>, Query(query): Query<WebPath>) -
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&s, query.library);
+    let root = selected_library_folder_root(&s, query.library, query.folder);
     let path = match web_path(&s, &root, &relative).await {
         Ok(path) => path,
         Err(status) => return status.into_response(),
@@ -11382,7 +11451,7 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&s, query.library);
+    let root = selected_library_folder_root(&s, query.library, query.folder);
     let directory = match web_path(&s, &root, &relative).await {
         Ok(path) if path.is_dir() => path,
         _ => return StatusCode::NOT_FOUND.into_response(),
@@ -11451,7 +11520,7 @@ async fn web_info(State(s): State<AppState>, Query(query): Query<WebPath>) -> Re
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let root = selected_library_root(&s, query.library);
+    let root = selected_library_folder_root(&s, query.library, query.folder);
     let path = match web_path(&s, &root, &relative).await {
         Ok(path) => path,
         Err(status) => return status.into_response(),
@@ -11581,6 +11650,7 @@ fn web_client_item(
     relative: &str,
     mime: &str,
     library: Option<usize>,
+    folder: Option<usize>,
     subtitles: &[SubtitleTrack],
     artwork: Option<String>,
     selected_subtitle_stream_id: Option<u64>,
@@ -11589,9 +11659,15 @@ fn web_client_item(
     language_secondary: &str,
 ) -> String {
     let stream_path = url_encode(relative);
-    let library_query = library
-        .map(|index| format!("library={index}&"))
-        .unwrap_or_default();
+    let library_query = format!(
+        "{}{}",
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        folder
+            .map(|index| format!("folder={index}&"))
+            .unwrap_or_default()
+    );
     let tracks = subtitles
         .iter()
         .map(|track| {
@@ -11659,7 +11735,7 @@ fn web_client_item(
         .unwrap_or_default();
     format!(
         r#"<article>
-  <video controls preload="auto" data-progress-path="{}"{} src="/web/stream?{}path={}" type="{}">
+  <video controls preload="auto" data-library="{}" data-folder="{}" data-progress-path="{}"{} src="/web/stream?{}path={}" type="{}">
     {}
     Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
   </video>
@@ -11670,15 +11746,15 @@ fn web_client_item(
     <a href="/web/stream?{}path={}">Open stream</a>
   </div>
 </article>"#,
+        library.map(|index| index.to_string()).unwrap_or_default(),
+        folder.map(|index| index.to_string()).unwrap_or_default(),
         html(relative),
         poster,
         library_query,
         stream_path,
         mime,
         tracks,
-        library
-            .map(|index| format!("library={index}&"))
-            .unwrap_or_default(),
+        library_query,
         url_encode(relative),
         html(name),
         html(&info_url),
@@ -11687,9 +11763,7 @@ fn web_client_item(
         html(relative),
         library.map(|index| index.to_string()).unwrap_or_default(),
         html(name),
-        library
-            .map(|index| format!("library={index}&"))
-            .unwrap_or_default(),
+        library_query,
         url_encode(relative)
     )
 }
@@ -11877,8 +11951,16 @@ fn media_card(
     library: usize,
     show_remove_from_continue: bool,
 ) -> String {
+    let folder_index = library_config
+        .folders
+        .iter()
+        .position(|folder| folder == root)
+        .unwrap_or_default();
+    let folder_query = (folder_index > 0)
+        .then(|| format!("&folder={folder_index}"))
+        .unwrap_or_default();
     let href = format!(
-        "/?library={library}&path={}&play={}",
+        "/?library={library}{folder_query}&path={}&play={}",
         url_encode(&folder.to_string_lossy()),
         url_encode(&media_path.to_string_lossy())
     );
@@ -12011,6 +12093,11 @@ fn media_cover_card(
             )
         });
     let path = html(&media_path.to_string_lossy());
+    let folder_index = href
+        .split('&')
+        .find_map(|part| part.strip_prefix("folder="))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
     let watch_key = if watch_scope == "show" {
         media_path
             .components()
@@ -12053,11 +12140,12 @@ fn media_cover_card(
         String::new()
     };
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
         path,
         library,
+        folder_index,
         watch_scope,
         watch_key,
         html(href),
@@ -12378,7 +12466,7 @@ bindCardAction(document, "click", async event => {
     const response = await fetch("/web/watch-action", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ action, path, library: Number(library), scope: watchScope })
+      body: JSON.stringify({ action, path, library: Number(library), folder: Number(card?.dataset.folder || 0), scope: watchScope })
     });
     if (!response.ok) {
       button.disabled = false;
@@ -12641,7 +12729,7 @@ async fn web_stream(
     if contains_hidden_component(&relative) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let library_root = selected_library_root(&s, query.library);
+    let library_root = selected_library_folder_root(&s, query.library, query.folder);
     let path = match web_path(&s, &library_root, &relative).await {
         Ok(path) => path,
         Err(status) => return status.into_response(),
@@ -14177,6 +14265,28 @@ fn plex_cors_path(path: &str) -> bool {
         && path != "/web"
         && !path.starts_with("/web/")
         && !path.starts_with("/settings")
+}
+
+async fn web_index_redirect(
+    headers: HeaderMap,
+    surface: Option<axum::Extension<ListenerSurface>>,
+) -> Response {
+    if matches!(surface, Some(axum::Extension(ListenerSurface::Web))) {
+        return Redirect::to("/").into_response();
+    }
+    let Some(host) = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<axum::http::uri::Authority>().ok())
+        .map(|authority| authority.host().to_owned())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let host = match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host,
+    };
+    Redirect::temporary(&format!("http://{host}:{WEB_UI_PORT}/")).into_response()
 }
 
 async fn root_handler(

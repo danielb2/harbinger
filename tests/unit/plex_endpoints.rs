@@ -394,6 +394,32 @@ async fn web_and_plex_listener_surfaces_are_separated() {
         .unwrap();
     assert_eq!(plex_root.status(), StatusCode::OK);
 
+    let legacy_web = build_plex_listener_app(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/web/index.html")
+                .header(header::HOST, "localhost:32400")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_web.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(legacy_web.headers()[header::LOCATION], "http://localhost:4826/");
+
+    let legacy_web_root = build_plex_listener_app(fixture.state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/web/")
+                .header(header::HOST, "localhost:32400")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_web_root.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(legacy_web_root.headers()[header::LOCATION], "http://localhost:4826/");
+
     let web_root = build_web_listener_app(fixture.state.clone())
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
         .await
@@ -2928,6 +2954,7 @@ async fn bilingual_subtitles_can_be_disabled_globally() {
         &media,
         std::path::Path::new("Demo.mkv"),
         Some(0),
+        None,
     )
     .await;
     assert!(!web_tracks.iter().any(|track| track.bilingual));
@@ -3426,6 +3453,150 @@ async fn library_media_view_starts_with_flat_cover_cards_and_progress() {
     assert!(body.contains(">0%</span>"));
     assert!(!body.contains("<video class=\"folder-preview-video\""));
     assert!(!body.contains("<span class=\"folder-preview-icon\""));
+}
+
+#[tokio::test]
+async fn web_library_combines_multiple_folders_and_streams_from_the_selected_folder() {
+    let fixture = fixture();
+    let second_root = fixture.root.join("second-media");
+    std::fs::create_dir_all(&second_root).unwrap();
+    let second_path = second_root.join("Second.mkv");
+    std::fs::write(&second_path, b"second-folder-media").unwrap();
+    fixture.config.lock().unwrap().libraries[0]
+        .folders
+        .push(second_root);
+
+    let mut media = fixture.state.media.read().unwrap().as_ref().clone();
+    media.push(Media {
+        id: "1-2".to_owned(),
+        title: "Second Folder Movie".to_owned(),
+        path: second_path,
+        size: 19,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    });
+    *fixture.state.media.write().unwrap() = Arc::new(media);
+
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Second Folder Movie"));
+    assert!(body.contains("&amp;folder=1&amp;path=&amp;play=Second.mkv"));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&folder=1&path=&play=Second.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("src=\"/web/stream?library=0&folder=1&path=Second.mkv\""));
+
+    let watched = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/watch-action")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"path":"Second.mkv","library":0,"folder":1,"action":"watched"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watched.status(), StatusCode::NO_CONTENT);
+    let progress = send(
+        &fixture.app,
+        Method::GET,
+        "/web/progress?path=Second.mkv&library=0&folder=1",
+        Body::empty(),
+    )
+    .await;
+    let progress: serde_json::Value =
+        serde_json::from_slice(&to_bytes(progress.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(progress["watched"], true);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/stream?library=0&folder=1&path=Second.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        "second-folder-media"
+    );
+}
+
+#[tokio::test]
+async fn web_tv_library_lists_and_navigates_shows_from_all_folders() {
+    let fixture = tv_fixture();
+    let second_root = fixture.root.join("second-media");
+    let second_path = second_root.join("Another Show/Season 01/Another.Show.S01E01.Pilot.mkv");
+    std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    std::fs::write(&second_path, b"second-folder-episode").unwrap();
+    fixture.config.lock().unwrap().libraries[0]
+        .folders
+        .push(second_root);
+
+    let mut media = fixture.state.media.read().unwrap().as_ref().clone();
+    let mut episode = media[0].clone();
+    episode.id = "tv-second".to_owned();
+    episode.title = "Another Pilot".to_owned();
+    episode.path = second_path;
+    episode.size = 21;
+    media.push(episode);
+    *fixture.state.media.write().unwrap() = Arc::new(media);
+
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Another Show"));
+    assert!(body.contains("folder=1&amp;path=Another%20Show"));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&folder=1&path=Another%20Show",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Season 01"));
+    assert!(body.contains("path=Another%20Show&amp;folder=1&amp;season=1"));
 }
 
 #[tokio::test]
