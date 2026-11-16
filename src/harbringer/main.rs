@@ -1,5 +1,4 @@
 use crate::plex::{plex_remux, plex_tls};
-#[path = "../subtitles.rs"]
 mod subtitles;
 
 use axum::{
@@ -2455,6 +2454,15 @@ async fn web_translated_subtitle(
     State(state): State<AppState>,
     Json(request): Json<WebTranslatedSubtitleRequest>,
 ) -> Response {
+    info!(
+        path = %request.path,
+        prepared = request.prepared,
+        source_stream_id = request.stream_id,
+        first_language = %request.first_language,
+        second_language = %request.second_language,
+        "bilingual subtitle translation request received"
+    );
+
     if !state
         .config
         .lock()
@@ -2486,7 +2494,10 @@ async fn web_translated_subtitle(
     let (contents, source_language, format) = if request.source_cues.is_empty() {
         match read_subtitle_source(&state, &media, request.stream_id).await {
             Ok(source) => source,
-            Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+            Err(error) => {
+                warn!(media = %media.title, source_stream_id = request.stream_id, error = %error, "bilingual subtitle generation could not start");
+                return (StatusCode::BAD_REQUEST, error).into_response();
+            }
         }
     } else {
         match browser_cues_to_srt(&request.source_cues) {
@@ -2507,6 +2518,16 @@ async fn web_translated_subtitle(
     } else {
         (contents, format)
     };
+    let generation_started = std::time::Instant::now();
+    info!(
+        media = %media.title,
+        prepared = request.prepared,
+        source_stream_id = request.stream_id,
+        first_language = %request.first_language,
+        second_language = %request.second_language,
+        client_source_cues = request.source_cues.len(),
+        "bilingual subtitle generation started"
+    );
     let translated = if request.prepared {
         let job_key = format!(
             "prepared:{}:{}:{}",
@@ -2514,6 +2535,8 @@ async fn web_translated_subtitle(
         );
         let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true)
         else {
+            warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
+
             return (StatusCode::CONFLICT, "This bilingual subtitle is already being prepared")
                 .into_response();
         };
@@ -2546,10 +2569,24 @@ async fn web_translated_subtitle(
     };
     match translated {
         Ok(vtt) => {
-            info!(media = %media.title, prepared = request.prepared, "bilingual subtitle translation cached");
+            info!(
+                media = %media.title,
+                prepared = request.prepared,
+                elapsed_ms = generation_started.elapsed().as_millis(),
+                "bilingual subtitle generation stopped successfully"
+            );
             ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
         }
-        Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
+        Err(error) => {
+            tracing::error!(
+                media = %media.title,
+                prepared = request.prepared,
+                elapsed_ms = generation_started.elapsed().as_millis(),
+                error = %error,
+                "bilingual subtitle generation stopped with an error"
+            );
+            (StatusCode::BAD_GATEWAY, error).into_response()
+        }
     }
 }
 
@@ -4662,7 +4699,7 @@ async fn settings_page(
         r#"<form class="library-card" method="post" action="/settings/scan"><button type="submit">Scan all libraries</button></form>"#,
     );
     let subtitle_settings = format!(
-        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbringer generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Translation uses Google Translate while playing or ahead of time. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
+        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbringer generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Generate bilingual subtitles with Google Translate. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
         if bilingual_enabled { " checked" } else { "" },
         translation_language_options(&subtitle_language_primary),
         translation_language_options(&subtitle_language_secondary),
@@ -9893,7 +9930,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           let sourceLanguage = "und";
           if (browserTrackIndex !== undefined) {{
             const embeddedTrack = video.textTracks[Number(browserTrackIndex)];
-            if (!embeddedTrack?.cues) {{ status.textContent = "Embedded subtitle cues are unavailable in this browser."; return; }}
+            if (!embeddedTrack?.cues || embeddedTrack.cues.length === 0) {{
+              status.textContent = "This browser has not loaded subtitle cues yet. Start playback or choose a listed server subtitle track, then try again.";
+              return;
+            }}
             sourceLanguage = embeddedTrack.language || "und";
             browserCues = [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }}));
           }} else if (!sourceId) {{ status.textContent = "Select a text subtitle track first."; return; }}
@@ -9989,7 +10029,6 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             translationControls.querySelectorAll("button").forEach(button => button.disabled = false);
           }}
         }};
-        translationControls.querySelector(".translate-live").addEventListener("click", () => translate(false));
         translationControls.querySelector(".translate-prepare").addEventListener("click", () => translate(true));
       }}
       if (!path) return;
@@ -10207,7 +10246,8 @@ async fn embedded_subtitle_source(
 ) -> Result<(String, String), String> {
     if !supports_embedded_subtitle_extraction(media) {
         return Err(
-            "Embedded subtitle extraction currently supports Matroska text tracks".to_owned(),
+            "Embedded subtitle extraction supports Matroska text tracks and MP4 mov_text tracks"
+                .to_owned(),
         );
     }
     let cached = state
@@ -10238,10 +10278,7 @@ async fn embedded_subtitle_source(
         .or_else(|| technical_text(track, "CodecID"))
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !["utf-8", "utf8", "ass", "ssa", "subrip", "webvtt"]
-        .iter()
-        .any(|supported| codec.contains(supported))
-    {
+    if !is_translatable_text_codec(&codec) {
         return Err(
             "This embedded subtitle is image based and cannot be translated as text".to_owned(),
         );
@@ -10259,15 +10296,20 @@ async fn embedded_subtitle_source(
         .unwrap_or_default()
         .to_owned();
     let path = media.path.clone();
+    let mp4_text = is_mov_text_codec(&track_codec);
     let srt = tokio::task::spawn_blocking(move || {
-        extract_matroska_subtitle(
-            &path,
-            container_track_id,
-            stream_order,
-            track_name.as_deref(),
-            track_language.as_deref(),
-            &track_codec,
-        )
+        if mp4_text {
+            extract_mp4_mov_text_subtitle(&path, container_track_id)
+        } else {
+            extract_matroska_subtitle(
+                &path,
+                container_track_id,
+                stream_order,
+                track_name.as_deref(),
+                track_language.as_deref(),
+                &track_codec,
+            )
+        }
     })
     .await
     .map_err(|_| "Embedded subtitle extraction failed".to_owned())??;
@@ -10470,6 +10512,134 @@ fn extract_matroska_subtitle(
         ));
     }
     Ok(output)
+}
+
+fn extract_mp4_mov_text_subtitle(
+    video: &std::path::Path,
+    container_track_id: Option<u64>,
+) -> Result<String, String> {
+    let file = std::fs::File::open(video).map_err(|_| "Media file could not be opened".to_owned())?;
+    let size = file
+        .metadata()
+        .map_err(|_| "Media file size could not be read".to_owned())?
+        .len();
+    let mut reader = mp4::Mp4Reader::read_header(file, size)
+        .map_err(|_| "Embedded MP4 subtitles could not be read".to_owned())?;
+    let mut tracks = reader
+        .tracks()
+        .iter()
+        .filter(|(_, track)| {
+            track.track_type().ok() == Some(mp4::TrackType::Subtitle)
+                && track
+                    .box_type()
+                    .is_ok_and(|box_type| box_type.value == *b"tx3g")
+        })
+        .map(|(track_id, _)| *track_id)
+        .collect::<Vec<_>>();
+    tracks.sort_unstable();
+    let track_id = container_track_id
+        .and_then(|id| u32::try_from(id).ok())
+        .filter(|id| tracks.contains(id))
+        .or_else(|| (tracks.len() == 1).then(|| tracks[0]))
+        .ok_or_else(|| "Could not match this subtitle to a mov_text track in the MP4".to_owned())?;
+    let timescale = reader
+        .tracks()
+        .get(&track_id)
+        .map(|track| track.timescale())
+        .filter(|timescale| *timescale > 0)
+        .ok_or_else(|| "The MP4 subtitle track has an invalid time scale".to_owned())?;
+    let sample_count = reader
+        .sample_count(track_id)
+        .map_err(|_| "The MP4 subtitle sample table could not be read".to_owned())?;
+    if sample_count > 20_000 {
+        return Err("Subtitle track contains too many cues".to_owned());
+    }
+    let mut cues = Vec::new();
+    for sample_id in 1..=sample_count {
+        let Some(sample) = reader
+            .read_sample(track_id, sample_id)
+            .map_err(|_| "The MP4 subtitle sample could not be read".to_owned())?
+        else {
+            continue;
+        };
+        let Some(text) = mov_text_sample_text(&sample.bytes)? else {
+            continue;
+        };
+        let start_ms = sample.start_time.saturating_mul(1_000) / u64::from(timescale);
+        let duration_ms = u64::from(sample.duration).saturating_mul(1_000) / u64::from(timescale);
+        cues.push((start_ms, start_ms.saturating_add(duration_ms.max(1)), text));
+    }
+    if cues.is_empty() {
+        return Err("The selected embedded subtitle track has no readable text cues".to_owned());
+    }
+    let mut output = String::new();
+    for (index, (start, end, text)) in cues.iter().enumerate() {
+        output.push_str(&format!(
+            "{}\n{} --> {}\n{}\n\n",
+            index + 1,
+            srt_time(*start),
+            srt_time(*end),
+            text
+        ));
+    }
+    Ok(output)
+}
+
+fn mov_text_sample_text(sample: &[u8]) -> Result<Option<String>, String> {
+    let length = sample
+        .get(..2)
+        .map(|header| u16::from_be_bytes([header[0], header[1]]) as usize)
+        .ok_or_else(|| "The MP4 subtitle sample is truncated".to_owned())?;
+    let text = sample
+        .get(2..2 + length)
+        .ok_or_else(|| "The MP4 subtitle sample has an invalid text length".to_owned())?;
+    if text.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(String::from_utf8_lossy(text).into_owned()))
+}
+
+fn is_mov_text_codec(format: &str) -> bool {
+    let format = format.to_ascii_lowercase();
+    ["mov_text", "tx3g", "timed text"]
+        .iter()
+        .any(|codec| format.contains(codec))
+}
+
+fn is_translatable_text_codec(format: &str) -> bool {
+    let format = format.to_ascii_lowercase();
+    is_mov_text_codec(&format)
+        || ["utf-8", "utf8", "ass", "ssa", "subrip", "webvtt"]
+            .iter()
+            .any(|codec| format.contains(codec))
+}
+
+#[cfg(test)]
+mod mov_text_tests {
+    use super::{is_translatable_text_codec, mov_text_sample_text};
+
+    #[test]
+    fn reads_mov_text_sample_and_ignores_trailing_style_data() {
+        assert_eq!(
+            mov_text_sample_text(&[0, 5, b'H', b'e', b'l', b'l', b'o', 0, 1, 0, 0]),
+            Ok(Some("Hello".to_owned()))
+        );
+    }
+
+    #[test]
+    fn handles_empty_and_malformed_mov_text_samples() {
+        assert_eq!(mov_text_sample_text(&[0, 0]), Ok(None));
+        assert!(mov_text_sample_text(&[0, 4, b'x']).is_err());
+        assert!(mov_text_sample_text(&[0]).is_err());
+    }
+
+    #[test]
+    fn recognizes_mov_text_as_a_translatable_subtitle_format() {
+        assert!(is_translatable_text_codec("mov_text"));
+        assert!(is_translatable_text_codec("Timed Text"));
+        assert!(is_translatable_text_codec("tx3g"));
+        assert!(!is_translatable_text_codec("HDMV PGS"));
+    }
 }
 
 fn srt_time(milliseconds: u64) -> String {
@@ -10836,18 +11006,13 @@ fn is_translatable_embedded_track(track: &serde_json::Value) -> bool {
     technical_text(track, "@type") == Some("Text")
         && technical_text(track, "Format")
             .or_else(|| technical_text(track, "CodecID"))
-            .is_some_and(|format| {
-                let format = format.to_ascii_lowercase();
-                ["utf-8", "utf8", "ass", "ssa", "subrip", "webvtt"]
-                    .iter()
-                    .any(|supported| format.contains(supported))
-            })
+            .is_some_and(is_translatable_text_codec)
 }
 
 fn supports_embedded_subtitle_extraction(media: &Media) -> bool {
     matches!(
         media.container.to_ascii_lowercase().as_str(),
-        "mkv" | "matroska" | "webm"
+        "mkv" | "matroska" | "webm" | "mp4" | "m4v" | "mov"
     )
 }
 
@@ -11713,7 +11878,7 @@ fn web_client_item(
     };
     let translation_controls = if bilingual_enabled {
         format!(
-            r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-live">Translate while playing</button><button type="button" class="translate-prepare">Generate bilingual subtitle</button><span class="translation-source-label" role="status" aria-live="polite"></span><progress class="translation-progress" max="100" value="0" hidden aria-label="Bilingual subtitle generation progress"></progress><span class="translation-progress-label" role="status" aria-live="polite"></span><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
+            r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-prepare">Generate bilingual subtitle</button><span class="translation-source-label" role="status" aria-live="polite"></span><progress class="translation-progress" max="100" value="0" hidden aria-label="Bilingual subtitle generation progress"></progress><span class="translation-progress-label" role="status" aria-live="polite"></span><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
             translation_language_options(language_primary),
             translation_language_options(language_secondary)
         )

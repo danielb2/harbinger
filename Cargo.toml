@@ -38,6 +38,7 @@ vuio-media-info = "0.1.4"
 bytes = "1"
 broadcast-common = "11.0.0"
 matroska-demuxer = "0.8.1"
+mp4 = "0.14"
 transmux = { version = "=0.30.0", default-features = false, features = ["std"] }
 tempfile = "3"
 oxideav-ac3 = "=0.0.12"

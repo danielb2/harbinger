@@ -2826,7 +2826,7 @@ async fn web_and_plex_clients_share_subtitle_selection() {
         "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
         fixture.subtitle_id
     )));
-    assert!(web_player.contains("Translate while playing"));
+    assert!(!web_player.contains("Translate while playing"));
     assert!(web_player.contains("Generate bilingual subtitle"));
     assert!(web_player.contains("class=\"translation-progress\""));
 

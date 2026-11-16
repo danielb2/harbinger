@@ -82,8 +82,6 @@ http://<server>:32400
 
 Replace `<server>` with the hostname or IP address of the machine running Harbringer. You can link a Plex.tv account from Settings if the app needs account discovery.
 
-Plex client support is still in progress. Plex Desktop playback works for supported H.264 Matroska media. Playback in Plex Web and other clients is not fully validated.
-
 ## Metadata and files
 
 TMDB matching is available for movie and TV libraries. Other libraries are not matched. To keep metadata with your media when moving it, select sidecar metadata storage; Harbringer stores it in `.harbringer` folders beside media files. Back up the `config` directory to keep server settings, identity, and database-backed state.
@@ -92,6 +90,6 @@ Removing a folder from a library only detaches it. It does not delete the media 
 
 ## Current limitations
 
-Harbringer is under active development and is not yet a complete replacement for Plex Media Server. API coverage and client behavior are incomplete. Playback support is limited: HLS and video codecs other than H.264 are not supported by the current transcoding path, and Plex Web playback remains under validation. Embedded subtitle extraction currently supports text tracks in Matroska files; image-based subtitles cannot be translated. Google Translate can rate-limit requests; completed bilingual cues are staged beside the video so a later attempt can resume.
+Harbringer is under active development. Plex Desktop and [Plezy](https://github.com/edde746/plezy) work well. Plex Web and Plex for Android have issues.
 
-See [`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work.
+[`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work
