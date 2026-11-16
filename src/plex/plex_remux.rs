@@ -23,6 +23,7 @@ use transmux::{
     TrackId, TrackSpec,
 };
 
+#[path = "plex_remux/mkv_hls.rs"]
 mod mkv_hls;
 
 const VIDEO_TRACK_ID: u32 = 1;
