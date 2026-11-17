@@ -153,10 +153,14 @@ async fn translate_bilingual_resumable_at(
         }
     }
     for (cue_index, cue) in cues.iter().enumerate().skip(staged_cues.len()) {
-        if cancellation.as_ref().is_some_and(|token| {
-            token.load(std::sync::atomic::Ordering::Acquire)
-        }) {
-            info!(cue_number = cue_index + 1, "playback stopped; no further subtitle requests will be sent");
+        if cancellation
+            .as_ref()
+            .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
+        {
+            info!(
+                cue_number = cue_index + 1,
+                "playback stopped; no further subtitle requests will be sent"
+            );
             return Err("Bilingual translation stopped with playback".to_owned());
         }
         let first = if source_language == first_language {
@@ -268,9 +272,10 @@ pub async fn staged_vtt_matches_source(output_path: &Path, source_contents: &str
             let source_lines = source.text.lines().map(str::trim).collect::<Vec<_>>();
             !source_lines.is_empty()
                 && staged_lines.windows(source_lines.len()).any(|window| {
-                    window.iter().zip(&source_lines).all(|(saved, source)| {
-                        *saved == *source || *saved == escape_vtt(source)
-                    })
+                    window
+                        .iter()
+                        .zip(&source_lines)
+                        .all(|(saved, source)| *saved == *source || *saved == escape_vtt(source))
                 })
         })
 }
@@ -377,11 +382,29 @@ async fn translate_bilingual_at(
 ) -> Result<String, String> {
     let cues = parse_subtitles(contents)?;
     let texts = cues.iter().map(|cue| cue.text.clone()).collect::<Vec<_>>();
-    let first = translate_batch(client, endpoint, &texts, source_language, first_language, 1, None).await?;
+    let first = translate_batch(
+        client,
+        endpoint,
+        &texts,
+        source_language,
+        first_language,
+        1,
+        None,
+    )
+    .await?;
     let second = if first_language == second_language {
         first.clone()
     } else {
-        translate_batch(client, endpoint, &texts, source_language, second_language, 1, None).await?
+        translate_batch(
+            client,
+            endpoint,
+            &texts,
+            source_language,
+            second_language,
+            1,
+            None,
+        )
+        .await?
     };
     bilingual_vtt(&cues, &first, &second)
 }
@@ -402,7 +425,14 @@ async fn translate_batch(
     for (batch_index, batch) in texts.chunks(8).enumerate() {
         let batch_first_cue = first_cue_number + batch_index * 8;
         let batch_last_cue = batch_first_cue + batch.len() - 1;
-        info!(source_language = source, target_language = target, first_cue = batch_first_cue, last_cue = batch_last_cue, request_count = batch.len(), "sending Google Translate batch");
+        info!(
+            source_language = source,
+            target_language = target,
+            first_cue = batch_first_cue,
+            last_cue = batch_last_cue,
+            request_count = batch.len(),
+            "sending Google Translate batch"
+        );
         let mut jobs = JoinSet::new();
         for (index, text) in batch.iter().enumerate() {
             let client = client.clone();
@@ -508,7 +538,13 @@ async fn translate_batch(
             batch_output[index] = translated;
         }
         output.extend(batch_output);
-        info!(source_language = source, target_language = target, first_cue = batch_first_cue, last_cue = batch_last_cue, "Google Translate batch completed");
+        info!(
+            source_language = source,
+            target_language = target,
+            first_cue = batch_first_cue,
+            last_cue = batch_last_cue,
+            "Google Translate batch completed"
+        );
     }
     Ok(output)
 }
@@ -674,16 +710,13 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(staged_vtt_matches_source(
-            &checkpoint,
-            "00:00:01,000 --> 00:00:02,000\nHello\n"
-        )
-        .await);
-        assert!(!staged_vtt_matches_source(
-            &checkpoint,
-            "00:00:01,000 --> 00:00:02,000\nGoodbye\n"
-        )
-        .await);
+        assert!(
+            staged_vtt_matches_source(&checkpoint, "00:00:01,000 --> 00:00:02,000\nHello\n").await
+        );
+        assert!(
+            !staged_vtt_matches_source(&checkpoint, "00:00:01,000 --> 00:00:02,000\nGoodbye\n")
+                .await
+        );
     }
 
     async fn blocked_translation_stub(
@@ -727,15 +760,21 @@ mod tests {
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(2), request_started.notified())
-            .await
-            .expect("translation request was not sent");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            request_started.notified(),
+        )
+        .await
+        .expect("translation request was not sent");
         cancellation.store(true, std::sync::atomic::Ordering::Release);
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), job)
             .await
             .expect("in-flight translation request was not cancelled")
             .unwrap();
-        assert_eq!(result.unwrap_err(), "Bilingual translation stopped with playback");
+        assert_eq!(
+            result.unwrap_err(),
+            "Bilingual translation stopped with playback"
+        );
     }
 
     #[tokio::test]

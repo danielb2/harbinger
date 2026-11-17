@@ -1,5 +1,5 @@
 use super::{
-    apply_plex_technical_metadata, ass_to_vtt, contains_hidden_component,
+    apply_plex_technical_metadata, ass_to_vtt, contains_hidden_component, copy_sidecar_tree,
     external_subtitle_content, external_subtitle_label, external_subtitle_language_token,
     external_subtitle_pair, extract_xml_token, html, next_tv_episode_paths, ordered_continue_paths,
     parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
@@ -17,8 +17,7 @@ use super::{
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_user_avatar_source,
     plex_video_json, plex_video_resolution, plex_webhook_account_from_access_tokens,
     plex_webhook_destinations_for_account, plex_webhook_destinations_from_response,
-    copy_sidecar_tree, plex_webhook_event_for_transition, render_metadata_info_panel,
-    render_season_description_panel,
+    plex_webhook_event_for_transition, render_metadata_info_panel, render_season_description_panel,
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
     tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
@@ -67,9 +66,18 @@ fn plex_playback_ids_resolve_rating_keys_and_metadata_paths() {
 #[test]
 fn plex_external_stream_urls_accept_client_appended_extensions() {
     assert_eq!(plex_stream_id_and_format("123"), Some((123, None)));
-    assert_eq!(plex_stream_id_and_format("123.srt"), Some((123, Some("srt"))));
-    assert_eq!(plex_stream_id_and_format("123.srt.srt"), Some((123, Some("srt"))));
-    assert_eq!(plex_stream_id_and_format("123.ass.srt"), Some((123, Some("srt"))));
+    assert_eq!(
+        plex_stream_id_and_format("123.srt"),
+        Some((123, Some("srt")))
+    );
+    assert_eq!(
+        plex_stream_id_and_format("123.srt.srt"),
+        Some((123, Some("srt")))
+    );
+    assert_eq!(
+        plex_stream_id_and_format("123.ass.srt"),
+        Some((123, Some("srt")))
+    );
     assert_eq!(plex_stream_id_and_format("123.srt.exe"), None);
 }
 #[test]
@@ -545,7 +553,6 @@ fn metadata_matching_prefers_exact_title_and_year() {
     assert!(super::best_metadata_result(&results, "Unknown Film", "movie").is_none());
 }
 
-
 #[test]
 fn tv_metadata_matching_keeps_tmdb_order_for_equal_title_scores() {
     let results = vec![
@@ -823,11 +830,7 @@ fn plex_publishes_plain_lan_ip_urls_without_a_certificate() {
 #[test]
 fn plex_publishes_certificate_hostnames_for_plex_direct_discovery() {
     assert_eq!(
-        plex_publish_urls(
-            &["10.20.61.51".parse().unwrap()],
-            32400,
-            Some("cert-hash")
-        ),
+        plex_publish_urls(&["10.20.61.51".parse().unwrap()], 32400, Some("cert-hash")),
         [
             "http://10.20.61.51:32400",
             "https://10-20-61-51.cert-hash.plex.direct:32400"
@@ -1086,9 +1089,9 @@ fn plex_related_genre_matching_uses_tmdb_ids_and_names() {
 
 #[test]
 fn plex_search_matches_titles_and_respects_type_filters() {
-    assert_eq!(plex_search_rank("har", "Harbringer"), Some(1));
-    assert_eq!(plex_search_rank("br", "Harbringer"), Some(2));
-    assert_eq!(plex_search_rank("harbringer", "The Harbinger"), Some(3));
+    assert_eq!(plex_search_rank("har", "Harbinger"), Some(1));
+    assert_eq!(plex_search_rank("bin", "Harbinger"), Some(2));
+    assert_eq!(plex_search_rank("harbnger", "The Harbinger"), Some(3));
     assert_eq!(plex_search_rank("star trek", "Star Trek"), Some(0));
     assert_eq!(
         super::plex_episode_search_rank("Example Show", "Pilot", "Pilot.mkv", Some(0)),
@@ -1098,8 +1101,8 @@ fn plex_search_matches_titles_and_respects_type_filters() {
         super::plex_episode_search_rank("Pilot", "Pilot", "Pilot.mkv", None),
         Some(0)
     );
-    assert_eq!(plex_search_rank("", "Harbringer"), None);
-    assert_eq!(plex_search_rank("missing", "Harbringer"), None);
+    assert_eq!(plex_search_rank("", "Harbinger"), None);
+    assert_eq!(plex_search_rank("missing", "Harbinger"), None);
 
     let movie_query = std::collections::BTreeMap::from([("type".to_owned(), "1".to_owned())]);
     assert!(plex_search_type_matches(&movie_query, "movie"));
@@ -1421,4 +1424,14 @@ fn sidecar_copy_keeps_existing_destination_files_and_copies_missing_artwork() {
         "episode artwork"
     );
     assert!(!copy_sidecar_tree(&source, &destination).unwrap());
+}
+
+#[test]
+fn startup_banner_spells_harbinger() {
+    let expected = r#"|              |    o
+|---.,---.,---.|---..,---.,---.,---.,---.
+|   |,---||    |   |||   ||   ||---'|
+`   '`---^`    `---'``   '`---|`---'`
+                          `---'`"#;
+    assert_eq!(super::startup_banner().trim(), expected);
 }

@@ -165,7 +165,7 @@ fn fixture() -> Fixture {
         subtitle_checkpoints_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
-        server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
+        server_name: Arc::new(super::RwLock::new("harbinger".to_owned())),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(media_dir),
         media: Arc::new(super::RwLock::new(Arc::new(vec![media]))),
@@ -266,7 +266,7 @@ fn tv_fixture() -> Fixture {
         subtitle_checkpoints_dir: Arc::new(config_dir.join("translated_subtitles")),
         config_path: Arc::new(config_path),
         db: shared_db.clone(),
-        server_name: Arc::new(super::RwLock::new("harbringer".to_owned())),
+        server_name: Arc::new(super::RwLock::new("harbinger".to_owned())),
         machine_identifier: Arc::from(machine_identifier),
         root: Arc::new(media_dir),
         media: Arc::new(super::RwLock::new(Arc::new(media))),
@@ -316,7 +316,7 @@ async fn inject_test_cookie(
 ) -> axum::response::Response {
     request.headers_mut().insert(
         header::COOKIE,
-        "harbringer_session=unit-test-session".parse().unwrap(),
+        "harbinger_session=unit-test-session".parse().unwrap(),
     );
     next.run(request).await
 }
@@ -345,7 +345,7 @@ async fn send_form(
             Request::builder()
                 .method(method)
                 .uri(uri)
-                .header(header::COOKIE, "harbringer_session=unit-test-session")
+                .header(header::COOKIE, "harbinger_session=unit-test-session")
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from(body.to_owned()))
                 .unwrap(),
@@ -533,7 +533,7 @@ async fn first_run_creates_admin_and_starts_an_authenticated_session() {
 fn plex_sign_in_upgrades_existing_admin_cookie_for_cross_site_forwarding() {
     let headers = HeaderMap::from_iter([(
         header::COOKIE,
-        HeaderValue::from_static("harbringer_session=existing-session"),
+        HeaderValue::from_static("harbinger_session=existing-session"),
     )]);
     let mut response = StatusCode::SEE_OTHER.into_response();
 
@@ -541,7 +541,7 @@ fn plex_sign_in_upgrades_existing_admin_cookie_for_cross_site_forwarding() {
 
     assert_eq!(
         response.headers()[header::SET_COOKIE],
-        "harbringer_session=existing-session; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
+        "harbinger_session=existing-session; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
     );
 }
 
@@ -556,7 +556,7 @@ fn plex_auth_keeps_product_identity_separate_from_server_display_name() {
     );
 
     assert!(auth_url.contains("clientID=stable-client-id"));
-    assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=harbringer"));
+    assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=harbinger"));
     assert!(auth_url.contains("context%5Bdevice%5D%5BdeviceName%5D=Living%20Room%20Server"));
     assert!(auth_url.contains(
         "forwardUrl=http%3A%2F%2Flocalhost%3A32400%2Fsettings%2Fplex%2Fcallback%3Fpin_id%3D1234"
@@ -572,7 +572,7 @@ fn plex_auth_uses_a_stable_auth_client_identifier_and_product_for_pin_creation_a
         super::plex_auth_client_identifier(&fixture.state),
         format!("{}-auth", fixture.state.machine_identifier)
     );
-    assert_eq!(super::plex_auth_product(&fixture.state), "harbringer");
+    assert_eq!(super::plex_auth_product(&fixture.state), "harbinger");
 }
 
 #[test]
@@ -663,10 +663,10 @@ fn plex_server_registration_keeps_instance_identity_distinct() {
     first.config.lock().unwrap().bind = "10.20.61.51:32400".to_owned();
     second.config.lock().unwrap().bind = "10.20.61.172:32400".to_owned();
 
-    let first_xml = super::plex_server_registration_xml(&first.state, "harbringer-ace").unwrap();
+    let first_xml = super::plex_server_registration_xml(&first.state, "harbinger-ace").unwrap();
     let second_xml = super::plex_server_registration_xml(&second.state, "hb-nico").unwrap();
 
-    assert!(first_xml.contains("name=\"harbringer-ace\" host=\"\" localAddresses=\"10.20.61.51\""));
+    assert!(first_xml.contains("name=\"harbinger-ace\" host=\"\" localAddresses=\"10.20.61.51\""));
     assert!(second_xml.contains("name=\"hb-nico\" host=\"\" localAddresses=\"10.20.61.172\""));
     assert!(first_xml.contains(&format!(
         "machineIdentifier=\"{}\"",
@@ -742,7 +742,7 @@ fn plex_account_resource_inventory_lists_servers_without_tokens_or_connections()
         },
         {
             "machineIdentifier": "ace-id",
-            "name": "harbringer-ace",
+            "name": "harbinger-ace",
             "provides": "server",
             "accessToken": "ace-secret"
         },
@@ -759,7 +759,7 @@ fn plex_account_resource_inventory_lists_servers_without_tokens_or_connections()
     assert!(inventory.contains("nico-id"));
     assert!(inventory.contains("hb-nico"));
     assert!(inventory.contains("ace-id"));
-    assert!(inventory.contains("harbringer-ace"));
+    assert!(inventory.contains("harbinger-ace"));
     assert!(!inventory.contains("nico-secret"));
     assert!(!inventory.contains("ace-secret"));
     assert!(!inventory.contains("client-secret"));
@@ -4214,7 +4214,7 @@ async fn tv_show_cards_display_the_season_count() {
     assert!(body.contains("aria-label=\"Search TV shows\""));
     assert!(body.contains("aria-label=\"Close Fix Match dialog\" title=\"Close\""));
     assert!(body.contains("/web/tv-match/search"));
-    assert!(body.contains("Lost connection to Harbringer."));
+    assert!(body.contains("Lost connection to Harbinger."));
     assert!(body.contains("window.__mplexShowConnected"));
     assert!(body.contains("notice.textContent = \"Connected\""));
     assert!(body.contains("background:#166534"));
@@ -7425,9 +7425,9 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
 async fn web_ui_pages_show_the_build_version_and_commit() {
     let fixture = fixture();
     let expected = format!(
-        "Harbringer v{} · commit {}",
+        "Harbinger v{} · commit {}",
         env!("CARGO_PKG_VERSION"),
-        env!("HARBRINGER_GIT_COMMIT")
+        env!("HARBINGER_GIT_COMMIT")
     );
 
     for path in ["/", "/?path=", "/settings", "/settings/browse", "/auth"] {
@@ -7436,7 +7436,7 @@ async fn web_ui_pages_show_the_build_version_and_commit() {
         let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let page = String::from_utf8(page.to_vec()).unwrap();
         assert!(
-            page.contains("class=\"harbringer-build-info\""),
+            page.contains("class=\"harbinger-build-info\""),
             "{path} is missing the build info badge"
         );
         assert!(page.contains(&expected), "{path} is missing {expected}");
@@ -7755,7 +7755,11 @@ async fn web_player_receives_markers_and_independent_skip_modes() {
     .unwrap();
     assert!(page.contains("data-skip-intro-mode=\"automatic\""));
     assert!(page.contains("data-skip-credits-mode=\"off\""));
-    assert_eq!(page.matches("data-skip-markers=\"[{&quot;id&quot;:").count(), 2);
+    assert_eq!(
+        page.matches("data-skip-markers=\"[{&quot;id&quot;:")
+            .count(),
+        2
+    );
     assert!(page.contains("&quot;startTimeOffset&quot;:5000"));
     assert!(page.contains("&quot;type&quot;:&quot;credits&quot;"));
     assert!(page.contains("class=\"skip-intro-button\" data-skip-kind=\"intro\""));

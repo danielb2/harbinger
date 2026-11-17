@@ -335,7 +335,7 @@ pub(crate) async fn decode_audio_window(
     kind: MarkerKind,
     duration_ms: Option<i64>,
 ) -> Result<EpisodeAudio, String> {
-    let ffmpeg = std::env::var("HARBRINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+    let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
     let window_ms = SEARCH_WINDOW.as_millis() as i64;
     let window_start_ms = match kind {
         MarkerKind::Intro => 0,
@@ -471,14 +471,18 @@ fn longest_shared_run(
             (
                 0usize,
                 lag,
-                first_frames.len().min(second_frames.len().saturating_sub(lag)),
+                first_frames
+                    .len()
+                    .min(second_frames.len().saturating_sub(lag)),
             )
         } else {
             let lag = (-lag) as usize;
             (
                 lag,
                 0usize,
-                second_frames.len().min(first_frames.len().saturating_sub(lag)),
+                second_frames
+                    .len()
+                    .min(first_frames.len().saturating_sub(lag)),
             )
         };
         if overlap < MIN_RUN_FRAMES {
@@ -719,7 +723,12 @@ mod tests {
                 let mut frame = synthetic_frame(index);
                 if index % 2 == 0 {
                     frame.bands[0] += 0.01;
-                    let norm = frame.bands.iter().map(|value| value * value).sum::<f32>().sqrt();
+                    let norm = frame
+                        .bands
+                        .iter()
+                        .map(|value| value * value)
+                        .sum::<f32>()
+                        .sqrt();
                     for value in &mut frame.bands {
                         *value /= norm;
                     }
@@ -737,8 +746,12 @@ mod tests {
             DEFAULT_THRESHOLD,
         );
 
-        let first_range = detected[0].as_ref().expect("first shared window was not detected");
-        let second_range = detected[1].as_ref().expect("second shared window was not detected");
+        let first_range = detected[0]
+            .as_ref()
+            .expect("first shared window was not detected");
+        let second_range = detected[1]
+            .as_ref()
+            .expect("second shared window was not detected");
         assert!(first_range.start_ms <= 5_000 && first_range.start_ms >= 4_000);
         assert!(second_range.start_ms <= 11_000 && second_range.start_ms >= 10_000);
         assert!(first_range.end_ms - first_range.start_ms >= 20_000);

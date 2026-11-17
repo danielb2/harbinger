@@ -24,7 +24,7 @@ image:
         exit 1
     fi
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker buildx build --load --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbringer:latest .
+    docker buildx build --load --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbinger:latest .
 
 # build and publish docker image
 publish tag="latest":
@@ -36,7 +36,7 @@ publish tag="latest":
     fi
     owner="$(gh repo view --json owner --jq .owner.login)"
     username="$(gh api user --jq .login)"
-    image="ghcr.io/${owner}/harbringer:{{tag}}"
+    image="ghcr.io/${owner}/harbinger:{{tag}}"
     amd64_image="${image}-amd64"
     arm64_image="${image}-arm64"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
@@ -50,4 +50,4 @@ nightly: (publish "nightly")
 
 # restart local server
 restart:
-    kill -HUP (pgrep -x harbringer)
+    kill -HUP (pgrep -x harbinger)

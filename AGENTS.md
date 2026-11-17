@@ -1,13 +1,13 @@
-# harbringer
+# harbinger
 
-Project guidance for `harbringer`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
+Project guidance for `harbinger`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
 
 ## Essential rules
 - Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
 - Read `FEATURES.md` before changing a user-facing feature covered there. Treat its user goals and acceptance conditions as requirements; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a feature contract, preserve the contract and find another implementation. Record regressions as regressions.
 
-- Treat the configured Plex server name as a user-visible identity requirement. Preserve it in the Auth App device context, server registration, resource publication, Plex descriptors, and LAN discovery. Keep Harbringer's stable client/product identifier separate from that display name; never replace the configured name with the product identifier as an incidental protocol fix. Before changing this identity mapping, compare the last working commit and current Plex traces, state the expected visible name, and keep a regression check for every affected surface.
+- Treat the configured Plex server name as a user-visible identity requirement. Preserve it in the Auth App device context, server registration, resource publication, Plex descriptors, and LAN discovery. Keep Harbinger's stable client/product identifier separate from that display name; never replace the configured name with the product identifier as an incidental protocol fix. Before changing this identity mapping, compare the last working commit and current Plex traces, state the expected visible name, and keep a regression check for every affected surface.
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Match log sources to the client the user is currently using. If a needed trace requires the user to reproduce an action or switch clients, state the exact action and why before asking; never assume a stale client log represents the current behavior.
@@ -16,7 +16,7 @@ Project guidance for `harbringer`: the target is a 100% drop-in replacement for 
 - Before implementing or changing any Plex API behavior, consult the official PMS API documentation at https://developer.plex.tv/pms and verify the operation, parameters, response formats, and status codes. Do not rely on request traces or assumptions in place of the documentation. If the documentation does not specify a detail or is unavailable, state that clearly and use current request traces and a reference PMS or compatible implementation where available; do not present an inference as documented behavior. Validate client-visible behavior, including the full item menus, against Plex clients; do not infer parity from route tests alone.
 - For Plex webhooks, also consult the official support article at https://support.plex.tv/articles/115002267687-webhooks/ and inspect current Plex client traces before implementation. Webhook destination management is account-level; verify the account API behavior against traces and a compatible implementation when the PMS API reference does not document it. Do not replace existing Plex webhook destinations with an unrelated local URL list.
 - Playback is a core requirement: support direct play, direct stream/remux, and transcoding when a Plex client requires it.
-- Prefer portable in-process Rust libraries for media work where practical. FFmpeg-backed libraries and bundled `ffmpeg`/`ffprobe` binaries are acceptable for now; Docker and other supported distributions must provide the versions Harbringer uses.
+- Prefer portable in-process Rust libraries for media work where practical. FFmpeg-backed libraries and bundled `ffmpeg`/`ffprobe` binaries are acceptable for now; Docker and other supported distributions must provide the versions Harbinger uses.
 - Keep platform support in mind when selecting media libraries and features. Do not make one operating system's hardware decoder mandatory.
 - Preserve original-file serving and seeking when a client can play the source directly. Transcoding must be selected from client capabilities and media metadata, not used as a blanket path.
 - Keep shared file handling and media logic reusable. Avoid duplicated protocol responses, route behavior, or UI implementations.

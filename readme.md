@@ -1,8 +1,8 @@
 ![logo](./logo.avif)
 
-Harbringer is a self-hosted media server for organizing and streaming your personal video library. It scans folders on your computer or NAS, organizes movies and TV shows into libraries, and adds available metadata and artwork. You can browse and play supported media in its built-in web client or connect compatible Plex clients.
+Harbinger is a self-hosted media server for organizing and streaming your personal video library. It scans folders on your computer or NAS, organizes movies and TV shows into libraries, and adds available metadata and artwork. You can browse and play supported media in its built-in web client or connect compatible Plex clients.
 
-Harbringer is an alternative, independent implementation of Plex Media Server. It is not affiliated with Plex, Inc. Harbringer is under active development: its supported media formats, playback options, and client compatibility are still limited. See [Current limitations](#current-limitations) for details.
+Harbinger is an alternative, independent implementation of Plex Media Server. It is not affiliated with Plex, Inc. Harbinger is under active development: its supported media formats, playback options, and client compatibility are still limited. See [Current limitations](#current-limitations) for details.
 
 ## What you can do
 
@@ -17,7 +17,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 - Use Plex Desktop for playback of supported H.264 Matroska media, including optional AAC audio.
 - Configure optional bilingual subtitles for language learning or others.
 
-## Run Harbringer
+## Run Harbinger
 
 Install Rust, then run:
 
@@ -25,31 +25,31 @@ Install Rust, then run:
 cargo run
 ```
 
-Harbringer reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, the Plex API listens on port `32400` and the Harbringer web client listens on port `4826`. At startup, it prints both addresses.
+Harbinger reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, the Plex API listens on port `32400` and the Harbinger web client listens on port `4826`. At startup, it prints both addresses.
 
 Open `http://<server>:4826/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
 
 ### Reset the web admin password
 
-Stop Harbringer, then remove the admin account and its login sessions from the SQLite state database:
+Stop Harbinger, then remove the admin account and its login sessions from the SQLite state database:
 
 ```sh
 sqlite3 config/state.sqlite 'DELETE FROM web_sessions; DELETE FROM web_admin;'
 ```
 
-Start Harbringer and open its web client to create a new admin password. If you use a custom config directory, run the command against `state.sqlite` beside that directory's `config.toml`. For Docker, run it against the `state.sqlite` file in the host directory mounted at `/config`.
+Start Harbinger and open its web client to create a new admin password. If you use a custom config directory, run the command against `state.sqlite` beside that directory's `config.toml`. For Docker, run it against the `state.sqlite` file in the host directory mounted at `/config`.
 
 ### Docker Compose
 
 The published image supports `linux/amd64` and `linux/arm64`. It runs on Linux hosts and in Docker Desktop's Linux-container mode on macOS and Windows.
 
-Save this as `compose.yaml` and start Harbringer with `docker compose up -d`:
+Save this as `compose.yaml` and start Harbinger with `docker compose up -d`:
 
 ```yaml
 services:
-  harbringer:
-    container_name: harbringer
-    image: ghcr.io/danielb2/harbringer:latest
+  harbinger:
+    container_name: harbinger
+    image: ghcr.io/danielb2/harbinger:latest
     ports:
       - "32400:32400"
       - "4826:4826"
@@ -62,16 +62,16 @@ services:
 Or run it directly without Compose:
 
 ```sh
-docker run --name harbringer -p 32400:32400 -p 4826:4826 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbringer:latest
+docker run --name harbinger -p 32400:32400 -p 4826:4826 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbinger:latest
 ```
 
 Open `http://localhost:4826/`. In **Settings**, add `/media` as a library folder.
 
-The media mount is read-only by default while Harbringer is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
+The media mount is read-only by default while Harbinger is in alpha. For disposable test media, remove `:ro` (`./media:/media`) to let server actions delete files.
 
 Bilingual subtitle generation writes progress and the finished sidecar beside the video. The read-only `:ro` media mount prevents that; use a writable media mount to generate bilingual sidecars. Playback-driven translation stops when playback stops and resumes from staged progress on a later play. Full-episode preparation can be started from that episode in the built-in web player.
 
-Harbringer currently indexes visible `.mp4`, `.m4v`, `.mkv`, and `.webm` files. The **Files** view also shows other visible files in your library folders.
+Harbinger currently indexes visible `.mp4`, `.m4v`, `.mkv`, and `.webm` files. The **Files** view also shows other visible files in your library folders.
 
 ## Connect a Plex app
 
@@ -81,16 +81,16 @@ In the Plex app, connect to your server at:
 http://<server>:32400
 ```
 
-Replace `<server>` with the hostname or IP address of the machine running Harbringer. You can link a Plex.tv account from Settings if the app needs account discovery.
+Replace `<server>` with the hostname or IP address of the machine running Harbinger. You can link a Plex.tv account from Settings if the app needs account discovery.
 
 ## Metadata and files
 
-TMDB matching is available for movie and TV libraries. Other libraries are not matched. To keep metadata with your media when moving it, select sidecar metadata storage; Harbringer stores it in `.harbringer` folders beside media files. Back up the `config` directory to keep server settings, identity, and database-backed state.
+TMDB matching is available for movie and TV libraries. Other libraries are not matched. To keep metadata with your media when moving it, select sidecar metadata storage; Harbinger stores it in `.harbinger` folders beside media files. Back up the `config` directory to keep server settings, identity, and database-backed state.
 
 Removing a folder from a library only detaches it. It does not delete the media files. Removing media from a folder is detected by a later scan.
 
 ## Current limitations
 
-Harbringer is under active development. Plex Desktop and [Plezy](https://github.com/edde746/plezy) work well. Plex Web and Plex for Android have issues.
+Harbinger is under active development. Plex Desktop and [Plezy](https://github.com/edde746/plezy) work well. Plex Web and Plex for Android have issues.
 
 [`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work

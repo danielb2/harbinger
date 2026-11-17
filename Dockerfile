@@ -2,7 +2,7 @@ FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
 ARG BUILDARCH
 ARG TARGETARCH
 ARG GIT_COMMIT=unknown
-ENV HARBRINGER_GIT_COMMIT=$GIT_COMMIT
+ENV HARBINGER_GIT_COMMIT=$GIT_COMMIT
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./build.rs
@@ -22,7 +22,7 @@ RUN set -eux; \
     else \
         cargo build --release --target "$rust_target"; \
     fi; \
-    cp "target/$rust_target/release/harbringer" /build/harbringer
+    cp "target/$rust_target/release/harbinger" /build/harbinger
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -31,8 +31,8 @@ RUN apt-get update \
 WORKDIR /app
 ARG IMAGE_BUILD_DATE=unknown
 ENV IMAGE_BUILD_DATE=${IMAGE_BUILD_DATE}
-COPY --from=builder /build/harbringer /usr/local/bin/harbringer
+COPY --from=builder /build/harbinger /usr/local/bin/harbinger
 RUN mkdir -p /config
 VOLUME ["/config", "/media"]
 EXPOSE 32400/tcp 4826/tcp
-ENTRYPOINT ["harbringer", "--config", "/config", "--bind", "0.0.0.0:32400"]
+ENTRYPOINT ["harbinger", "--config", "/config", "--bind", "0.0.0.0:32400"]

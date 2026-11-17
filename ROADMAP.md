@@ -13,7 +13,7 @@ An item is complete only after its behavior is implemented and checked against a
 - [x] Serve the media part with HTTP range support; an existing media part returned `206 Partial Content` and 1,024 bytes during development verification.
 - [x] Return a direct-play decision from `/video/:/transcode/universal/decision` for an item path.
 - [ ] Complete and verify DASH playback when Plex Web requests `protocol=dash`. A prototype remuxes H.264 Matroska video with optional AAC audio to fMP4 and serves MPD/init/fragment URLs; other video codecs and containers are rejected, other audio is omitted, and real Plex client playback remains unverified.
-- [x] Confirm that the official client receives and displays the Play control after refreshing Harbringer's item metadata.
+- [x] Confirm that the official client receives and displays the Play control after refreshing Harbinger's item metadata.
 
 The decision endpoint and ranged file route are necessary pieces, not proof that the Play button issue is resolved. Do not move this gate to complete based only on server-side curl checks.
 
@@ -22,7 +22,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 ### 1. PMS API coverage inventory
 
 - [x] Check in a path-and-method inventory of all 260 operations in the official PMS OpenAPI 1.2.3 specification.
-- [x] Exercise all 260 documented operations through the production router and assert the current expected HTTP status, including operations not implemented by Harbringer.
+- [x] Exercise all 260 documented operations through the production router and assert the current expected HTTP status, including operations not implemented by Harbinger.
 - [x] Keep focused playback success and failure tests for queue creation/retrieval, decision, part delivery, stream selection, subtitles, timeline, and scrobble.
 - [ ] Replace expected 404/405 outcomes one operation at a time with Plex-compatible behavior and response assertions; update the inventory status only with the implementation and regression test.
 - [ ] For every documented operation, record its request parameters, authentication requirements, response schema, current implementation, and client validation status.
@@ -82,11 +82,16 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ## Product scope and follow-on architecture
 
-- [x] Keep the server protocol surface Plex-only; the built-in web client and Settings pages are Harbringer's own control surface, not another media-server adapter.
+- [x] Keep the server protocol surface Plex-only; the built-in web client and Settings pages are Harbinger's own control surface, not another media-server adapter.
 - [ ] Define a seekable media-source interface for local files and future Weaver/Scryer sources.
 - [ ] Add an embeddable Rust library API after the server compatibility gates are met.
 
 ## Gap log
+
+### 2026-11-17
+
+- Moved Plex 32400 route handlers and helpers into `src/plex/api.rs` and Harbinger web handlers and helpers into `src/harbinger/api.rs`; `src/harbinger/main.rs` now holds shared state and helpers. Existing test imports are preserved through narrow re-exports, so no test logic or expectation was changed by the move.
+- Corrected the product spelling to `harbinger` across module paths, package and binary names, build/CI env vars, cookie and CSS identifiers, the startup banner art, docs, and tests. The configured Plex server name remains authoritative and was not replaced by the product identifier; the persisted name stays as configured. Search fixtures were adjusted to keep prefix, non-leading substring, and fuzzy-match coverage without the old typo. Checks: `cargo check --all-targets`, `cargo fmt --check`, full `cargo test` (245 passed), and `git diff --check`.
 
 ### 2026-11-13
 
@@ -131,8 +136,8 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 ### 2026-11-15
 
-- Separated Harbringer’s authenticated web UI and internal routes onto port 4826 while keeping Plex routes on 32400. Updated client artwork requests to use the web API, so SQLite-backed covers and banners remain reachable after the split; renamed card artwork as covers and constrained the empty-cover fallback to its frame. Moved the version/commit badge to the lower left. Checks: `cargo build`, full `cargo test` (198 passed), and `git diff --check` passed. Live Plex client and UI confirmation remains pending.
-- Plex registration regressed because startup retried only when `claimed=1` (introduced in `0134552`), while the stricter publication check from `74458d4` left the saved server token unclaimed when Plex omitted a local HTTPS resource. Startup now retries the saved token, announces the certificate-backed `plex.direct` hostname, and accepts a verified local HTTP resource for claiming when Plex does not publish local HTTPS. This avoids advertising HTTPS at a bare LAN IP, which the live resource trace showed Plex marked local even though it did not match Harbringer's certificate. The 11:35 live run logged a `201` registration, accepted device announce, local HTTP resource, connected presence stream, and `200` connectivity check; direct `/identity` and `/media/providers` checks returned `200`. Full `cargo test` passed all 201 tests, `cargo build` passed, and `git diff --check` passed. Plex Web client-side confirmation remains pending; `Plex.log` is stale because it records Plex Desktop, while current server traces are in `output.log`.
+- Separated Harbinger’s authenticated web UI and internal routes onto port 4826 while keeping Plex routes on 32400. Updated client artwork requests to use the web API, so SQLite-backed covers and banners remain reachable after the split; renamed card artwork as covers and constrained the empty-cover fallback to its frame. Moved the version/commit badge to the lower left. Checks: `cargo build`, full `cargo test` (198 passed), and `git diff --check` passed. Live Plex client and UI confirmation remains pending.
+- Plex registration regressed because startup retried only when `claimed=1` (introduced in `0134552`), while the stricter publication check from `74458d4` left the saved server token unclaimed when Plex omitted a local HTTPS resource. Startup now retries the saved token, announces the certificate-backed `plex.direct` hostname, and accepts a verified local HTTP resource for claiming when Plex does not publish local HTTPS. This avoids advertising HTTPS at a bare LAN IP, which the live resource trace showed Plex marked local even though it did not match Harbinger's certificate. The 11:35 live run logged a `201` registration, accepted device announce, local HTTP resource, connected presence stream, and `200` connectivity check; direct `/identity` and `/media/providers` checks returned `200`. Full `cargo test` passed all 201 tests, `cargo build` passed, and `git diff --check` passed. Plex Web client-side confirmation remains pending; `Plex.log` is stale because it records Plex Desktop, while current server traces are in `output.log`.
 
 - Plezy search now returns local-library results after `/library/search` was changed to its expected `SearchResult[].Metadata` shape. Latest follow-up adds episodes to parent-show searches and emits `grandparentThumb`/`grandparentArt`; verify those additions in Plezy after its latest connection refresh.
 - Plex Desktop playback works on the current restored-capability source. Plex Web still returns `s4032 (Manifest)` for Millennium Actress. Shaka reports `Empty XML source`; the server's MPD requests return HTTP 200, but no init or media requests follow. The current code uses a one-based `SegmentTemplate`, maps segment 1 to the first fragment, keeps truthful `startWithSAP=0`, and sets explicit manifest length. Verify the latest response body in Plex Web.
@@ -142,18 +147,18 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 - Home card spacing remained incorrect after the earlier alignment change. The shared renderer now applies 70%-transparent backgrounds, equal padding on all edges, and the same fixed four-row info area to every card. Movie titles stay on one line, and the year follows the title directly. User visual validation confirms equal top/bottom spacing and fixed sizing for movie and TV cards.
 - Implemented `GET /library/all` with movie, show, season, and episode type selection, title filtering, sorting, and container pagination. The inventory now expects HTTP 200.
 - Episode responses include `guid`, `parentGuid`, `grandparentGuid`, and watch state. Unscrobbling clears `lastViewedAt`; a regression test covers the zeroed state. Provider discovery advertises timeline/scrobble/unscrobble keys, but Plex Desktop still omits the watch action after reload. `output.log` confirms Plex Desktop requests `/media/providers` after reload, so stale provider discovery is not the cause.
-- Rex's `docs/findings.md` maps Plex Web menu entries to provider features: `manage`, `playlist`, `actions`, `timeline`, and `subscribe`, plus server flags such as `allowMediaDeletion`, `allowSync`, and `backgroundProcessing`. Harbringer now advertises content/search/metadata/promoted/collection/playlist/playqueue/timeline/continuewatching/actions/universalsearch. Sharing, deletion, sync, and background processing remain disabled. The Rex findings are Web-specific, not proof of Plex Desktop behavior. Harbringer already advertises the `download` protocol; part downloads return attachment headers for `download=1`, but managed sync/download is unsupported. Watchlist, Share, and More Ways to Watch remain unexplained by the reference map.
+- Rex's `docs/findings.md` maps Plex Web menu entries to provider features: `manage`, `playlist`, `actions`, `timeline`, and `subscribe`, plus server flags such as `allowMediaDeletion`, `allowSync`, and `backgroundProcessing`. Harbinger now advertises content/search/metadata/promoted/collection/playlist/playqueue/timeline/continuewatching/actions/universalsearch. Sharing, deletion, sync, and background processing remain disabled. The Rex findings are Web-specific, not proof of Plex Desktop behavior. Harbinger already advertises the `download` protocol; part downloads return attachment headers for `download=1`, but managed sync/download is unsupported. Watchlist, Share, and More Ways to Watch remain unexplained by the reference map.
 - Full Plex Desktop context-menu parity remains open; do not advertise menu actions without implementing their routes and behavior.
 
 ### 2026-10-31
 
 - Completed the Ether-like Plex account handoff after PIN sign-in: claim-token exchange, server-token persistence, local connection publication, and claimed-state reporting are now implemented; GDM discovery, public registration, and real Plezy validation remain outstanding.
 - Plex claim/publication failures now persist their reason and display it in Settings for diagnosis.
-- Plex publication now verifies harbringer is returned by Plex’s account resource list; Settings uses a compact checkmark for the successful state.
-- Plex PIN polling now uses the server identity and capability header instead of registering the old `harbringer` app identity.
-- Plex sign-in now uses the hosted Auth App consent flow with a separate harbringer authentication identity; Settings exposes connect and disconnect as buttons.
+- Plex publication now verifies harbinger is returned by Plex’s account resource list; Settings uses a compact checkmark for the successful state.
+- Plex PIN polling now uses the server identity and capability header instead of registering the old `harbinger` app identity.
+- Plex sign-in now uses the hosted Auth App consent flow with a separate harbinger authentication identity; Settings exposes connect and disconnect as buttons.
 - Plex’s hosted consent URL now includes the full device context expected by the Auth App.
-- Plex connection now redirects directly to the hosted Auth App and completes through a harbringer callback instead of showing an intermediate code screen.
+- Plex connection now redirects directly to the hosted Auth App and completes through a harbinger callback instead of showing an intermediate code screen.
 - Plex PIN creation and polling now match Ether’s strong-PIN Auth App flow.
 - Plex server registration now sends the server product/version/platform metadata shown in Plex Authorized Devices.
 - Plex registration now includes the server device field used by Ether in Authorized Devices metadata.

@@ -1,4 +1,4 @@
-#[path = "harbringer/main.rs"]
+#[path = "harbinger/main.rs"]
 mod app;
 
 pub(super) use app::run;

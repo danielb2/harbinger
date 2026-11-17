@@ -101,17 +101,19 @@ fn plex_registration_distinguishes_instances_sharing_the_same_listener_port() {
     ace.config.lock().unwrap().bind = "10.20.61.51:32400".to_owned();
     nico.config.lock().unwrap().bind = "10.20.61.172:32400".to_owned();
 
-    let ace_xml = super::super::plex_server_registration_xml(&ace.state, "harbringer-ace").unwrap();
+    let ace_xml = super::super::plex_server_registration_xml(&ace.state, "harbinger-ace").unwrap();
     let nico_xml = super::super::plex_server_registration_xml(&nico.state, "hb-nico").unwrap();
 
-    assert!(ace_xml.contains(
-        "name=\"harbringer-ace\" host=\"\" localAddresses=\"10.20.61.51\""
-    ));
-    assert!(nico_xml.contains(
-        "name=\"hb-nico\" host=\"\" localAddresses=\"10.20.61.172\""
-    ));
-    assert!(ace_xml.contains(&format!("machineIdentifier=\"{}\"", ace.state.machine_identifier)));
-    assert!(nico_xml.contains(&format!("machineIdentifier=\"{}\"", nico.state.machine_identifier)));
+    assert!(ace_xml.contains("name=\"harbinger-ace\" host=\"\" localAddresses=\"10.20.61.51\""));
+    assert!(nico_xml.contains("name=\"hb-nico\" host=\"\" localAddresses=\"10.20.61.172\""));
+    assert!(ace_xml.contains(&format!(
+        "machineIdentifier=\"{}\"",
+        ace.state.machine_identifier
+    )));
+    assert!(nico_xml.contains(&format!(
+        "machineIdentifier=\"{}\"",
+        nico.state.machine_identifier
+    )));
     assert_ne!(ace.state.machine_identifier, nico.state.machine_identifier);
     assert!(!ace_xml.contains(" port=\""));
     assert!(!nico_xml.contains(" port=\""));

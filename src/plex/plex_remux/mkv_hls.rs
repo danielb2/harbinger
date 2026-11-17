@@ -1,9 +1,4 @@
-use std::{
-    collections::BTreeMap,
-    fs,
-    io::Write,
-    path::Path,
-};
+use std::{collections::BTreeMap, fs, io::Write, path::Path};
 
 pub(super) struct VideoTrack<'a> {
     pub codec_id: &'a str,
@@ -27,7 +22,6 @@ pub(super) struct Block<'a> {
     pub data: &'a [u8],
     pub keyframe: bool,
 }
-
 
 pub(super) struct SegmentBuilder {
     segment_starts: Vec<i64>,
@@ -79,7 +73,10 @@ impl SegmentBuilder {
         if index < self.next_segment {
             return Ok(());
         }
-        self.latest_video_segment = Some(self.latest_video_segment.map_or(index, |old| old.max(index)));
+        self.latest_video_segment = Some(
+            self.latest_video_segment
+                .map_or(index, |old| old.max(index)),
+        );
         self.pending.entry(index).or_default().push(PendingBlock {
             track_number: 1,
             timestamp_ms: ticks_to_millis(pts, super::VIDEO_TIMESCALE)?,
@@ -110,7 +107,10 @@ impl SegmentBuilder {
         if index < self.next_segment {
             return Ok(());
         }
-        self.latest_audio_segment = Some(self.latest_audio_segment.map_or(index, |old| old.max(index)));
+        self.latest_audio_segment = Some(
+            self.latest_audio_segment
+                .map_or(index, |old| old.max(index)),
+        );
         self.pending.entry(index).or_default().push(PendingBlock {
             track_number: 2,
             timestamp_ms: ticks_to_millis(pts, sample_rate)?,
@@ -168,8 +168,8 @@ impl SegmentBuilder {
             .segment_starts
             .get(index)
             .ok_or_else(|| "Matroska HLS segment has no timestamp".to_owned())?;
-        let timestamp_ms = u64::try_from(ticks_to_millis(start, super::VIDEO_TIMESCALE)?)
-            .map_err(media_error)?;
+        let timestamp_ms =
+            u64::try_from(ticks_to_millis(start, super::VIDEO_TIMESCALE)?).map_err(media_error)?;
         let mut pending = self.pending.remove(&index).unwrap_or_default();
         if !pending.iter().any(|block| block.track_number == 1) {
             return Err("Matroska HLS segment has no video frames".to_owned());
@@ -233,8 +233,8 @@ pub(super) fn initialization_segment(
 
     let mut info = Vec::new();
     uint_element(0x2ad7b1, 1_000_000, &mut info)?;
-    string_element(0x4d80, "harbringer", &mut info)?;
-    string_element(0x5741, "harbringer", &mut info)?;
+    string_element(0x4d80, "harbinger", &mut info)?;
+    string_element(0x5741, "harbinger", &mut info)?;
     element(0x1549a966, &info, &mut output)?;
 
     let mut tracks = Vec::new();
@@ -280,10 +280,7 @@ pub(super) fn initialization_segment(
     Ok(output)
 }
 
-pub(super) fn cluster_segment(
-    timestamp_ms: u64,
-    blocks: &[Block<'_>],
-) -> Result<Vec<u8>, String> {
+pub(super) fn cluster_segment(timestamp_ms: u64, blocks: &[Block<'_>]) -> Result<Vec<u8>, String> {
     if blocks.is_empty() {
         return Err("Matroska HLS cluster has no blocks".to_owned());
     }
@@ -310,7 +307,10 @@ pub(super) fn cluster_segment(
 
 fn uint_element(element_id: u32, value: u64, output: &mut Vec<u8>) -> Result<(), String> {
     let bytes = value.to_be_bytes();
-    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len() - 1);
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
     element(element_id, &bytes[first..], output)
 }
 
@@ -330,7 +330,10 @@ fn element(element_id: u32, payload: &[u8], output: &mut Vec<u8>) -> Result<(), 
 
 fn id(value: u32, output: &mut Vec<u8>) -> Result<(), String> {
     let bytes = value.to_be_bytes();
-    let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len() - 1);
+    let first = bytes
+        .iter()
+        .position(|byte| *byte != 0)
+        .unwrap_or(bytes.len() - 1);
     output.write_all(&bytes[first..]).map_err(media_error)
 }
 
@@ -353,7 +356,6 @@ fn size_vint(value: u64, output: &mut Vec<u8>) -> Result<(), String> {
 fn media_error(error: impl std::fmt::Display) -> String {
     error.to_string()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -391,7 +393,6 @@ mod tests {
         let avc = MatroskaFile::open(avc_file.reopen().unwrap()).unwrap();
         assert_eq!(avc.tracks()[0].codec_id(), "V_MPEG4/ISO/AVC");
         assert_eq!(avc.tracks()[0].codec_private(), Some(&avc_private[..]));
-
 
         let mut stream = initialization_segment(
             VideoTrack {
@@ -511,7 +512,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-
     #[test]
     fn segment_builder_waits_for_audio_and_bounds_pending_segments() {
         let directory = tempfile::tempdir().unwrap();
@@ -562,4 +562,3 @@ mod tests {
         assert!(directory.path().join("segment-1.mkv").is_file());
     }
 }
-
