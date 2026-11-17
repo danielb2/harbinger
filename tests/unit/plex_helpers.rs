@@ -17,7 +17,8 @@ use super::{
     plex_tv_season_json, plex_tv_show_groups, plex_tv_show_json, plex_user_avatar_source,
     plex_video_json, plex_video_resolution, plex_webhook_account_from_access_tokens,
     plex_webhook_destinations_for_account, plex_webhook_destinations_from_response,
-    plex_webhook_event_for_transition, render_metadata_info_panel, render_season_description_panel,
+    copy_sidecar_tree, plex_webhook_event_for_transition, render_metadata_info_panel,
+    render_season_description_panel,
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
     tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
@@ -1397,4 +1398,27 @@ fn plex_play_queue_source_and_response_follow_pms_shape() {
         .get("directPlayDecisionCode")
         .is_none());
     assert!(queue["MediaContainer"].get("generalDecisionCode").is_none());
+}
+
+#[test]
+fn sidecar_copy_keeps_existing_destination_files_and_copies_missing_artwork() {
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("source");
+    let destination = temp.path().join("destination");
+    std::fs::create_dir_all(source.join("episodes")).unwrap();
+    std::fs::create_dir_all(&destination).unwrap();
+    std::fs::write(source.join("data.json"), "metadata").unwrap();
+    std::fs::write(source.join("episodes/still.jpg"), "episode artwork").unwrap();
+    std::fs::write(destination.join("data.json"), "newer metadata").unwrap();
+
+    assert!(copy_sidecar_tree(&source, &destination).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(destination.join("data.json")).unwrap(),
+        "newer metadata"
+    );
+    assert_eq!(
+        std::fs::read_to_string(destination.join("episodes/still.jpg")).unwrap(),
+        "episode artwork"
+    );
+    assert!(!copy_sidecar_tree(&source, &destination).unwrap());
 }

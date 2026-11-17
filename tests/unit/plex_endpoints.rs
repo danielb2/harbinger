@@ -4237,6 +4237,88 @@ async fn config_sidecar_metadata_renders_in_the_selected_movie_view() {
     assert!(body.contains("<h2>Config Film</h2>"));
     assert!(body.contains("Stored film description"));
     assert!(body.contains("2024-03-14"));
+    let cover = body.find("class=\"metadata-panel-cover\"").unwrap();
+    let title = body.find("<h2>Config Film</h2>").unwrap();
+    assert!(cover < title);
+}
+
+#[tokio::test]
+async fn hbweb_movie_view_places_cover_beside_description() {
+    let fixture = fixture();
+    std::fs::write(
+        fixture.root.join("media/.hbgr/data.json"),
+        serde_json::json!({
+            "title": "Demo Film",
+            "description": "A film description",
+            "metadata_json": {
+                "title": "Demo Film",
+                "overview": "A film description"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("A film description"));
+    assert!(body.contains("src=\"/web/artwork/media/1-1/cover\""));
+    let cover = body.find("class=\"metadata-panel-cover\"").unwrap();
+    let title = body.find("<h2>Demo Film</h2>").unwrap();
+    assert!(cover < title);
+}
+
+#[tokio::test]
+async fn hbweb_show_view_places_cover_beside_description() {
+    let fixture = tv_fixture();
+    let show_directory = fixture.root.join("media/Example Show");
+    let show_artwork = show_directory.join(".hbgr");
+    std::fs::create_dir_all(&show_artwork).unwrap();
+    std::fs::write(show_artwork.join("cover.jpg"), b"show cover").unwrap();
+    std::fs::write(
+        show_artwork.join("data.json"),
+        serde_json::json!({
+            "title": "Example Show",
+            "description": "A show description",
+            "metadata_json": {
+                "name": "Example Show",
+                "overview": "A show description"
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    assert!(body.contains("A show description"));
+    assert!(body.contains("class=\"metadata-panel-cover\""));
+    assert!(!body.contains("show-overview-cover"));
+    let cover = body.find("class=\"metadata-panel-cover\"").unwrap();
+    let title = body.find("<h2>Example Show</h2>").unwrap();
+    assert!(cover < title);
 }
 
 #[test]

@@ -2068,6 +2068,7 @@ struct LibraryScanSettingsForm {
 struct PreferencesForm {
     metadata_storage: Option<String>,
     tmdb_bearer_token: Option<String>,
+    copy_existing: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -5086,7 +5087,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <main><header class="page-heading"><p class="eyebrow">harbringer</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
-<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata and artwork are written only to the selected location.</p></div></div><form method="post" action="/settings/preferences" class="settings-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label>{}<div><button type="submit">Save metadata settings</button></div></form></section>
+<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata and artwork are written only to the selected location.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
 {}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
@@ -5098,6 +5099,11 @@ toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.tog
 const pathList = document.querySelector('#new-library-paths'); const updatePathButtons = () => {{ const rows = [...pathList.querySelectorAll('.path-row')]; rows.forEach((row, index) => {{ const button = row.querySelector('.remove-path'); button.disabled = rows.length === 1; button.setAttribute('aria-label', `Remove folder path ${{index + 1}}`); button.title = `Remove folder path ${{index + 1}}`; }}); }};
 document.querySelector('#add-path')?.addEventListener('click', () => {{ const index = pathList.querySelectorAll('.path-row').length; const row = document.createElement('div'); row.className = 'path-row'; row.innerHTML = `<label class="sr-only" for="new-path-${{index}}">Folder path</label><input id="new-path-${{index}}" name="path[]" type="text" placeholder="/path/to/folder" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path">−</button>`; row.querySelector('.remove-path').addEventListener('click', () => {{ row.remove(); updatePathButtons(); }}); pathList.appendChild(row); updatePathButtons(); }});
 const logOutput = document.querySelector('#settings-logs-output');
+const storageForm = document.querySelector('#metadata-storage-form'); const storageDialog = document.querySelector('#metadata-storage-dialog'); const copyExisting = document.querySelector('#copy-existing'); let storageConfirmed = false;
+storageDialog.style.cssText = 'position:fixed;inset:0;width:min(34rem,calc(100vw - 2rem));max-height:calc(100vh - 2rem);margin:auto;padding:1.5rem;color:#f1f5fb;border:1px solid #394a63;border-radius:.85rem;background:#101a2b'; storageDialog.querySelector('form').style.cssText = 'position:absolute;top:.55rem;right:.55rem;margin:0'; storageDialog.querySelector('form button').style.cssText = 'min-height:2.2rem;padding:.3rem .55rem';
+storageForm?.addEventListener('submit', event => {{ const selected = storageForm.querySelector('input[name="metadata_storage"]:checked')?.value; const current = storageForm.querySelector('input[name="metadata_storage"][value="config"]')?.parentElement?.querySelector('strong')?.textContent?.includes('(current)') ? 'config' : storageForm.querySelector('input[name="metadata_storage"][value="media"]')?.parentElement?.querySelector('strong')?.textContent?.includes('(current)') ? 'media' : null; if (!storageConfirmed && selected && current && selected !== current) {{ event.preventDefault(); storageDialog.showModal(); }} }});
+const confirmStorageChange = copy => {{ copyExisting.value = copy ? 'true' : 'false'; storageConfirmed = true; storageDialog.close(); storageForm.requestSubmit(); }};
+document.querySelector('#storage-switch-only')?.addEventListener('click', () => confirmStorageChange(false)); document.querySelector('#storage-switch-copy')?.addEventListener('click', () => confirmStorageChange(true));
 const logSearch = document.querySelector('#settings-logs-search');
 const logReverse = document.querySelector('#settings-logs-reverse');
 const logCount = document.querySelector('#settings-logs-count');
@@ -5279,22 +5285,136 @@ async fn update_preferences(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let token = requested_token.or_else(|| config.tmdb_bearer_token.clone());
-    if form.metadata_storage.as_deref() == Some("media") {
-        config.metadata_storage = "media".to_owned();
-    } else if form.metadata_storage.as_deref() == Some("config") {
-        config.metadata_storage = "config".to_owned();
+    let previous_storage = config.metadata_storage.clone();
+    let requested_storage = match form.metadata_storage.as_deref() {
+        Some("media") => Some("media"),
+        Some("config") => Some("config"),
+        _ => None,
+    };
+    if let Some(storage) = requested_storage {
+        config.metadata_storage = storage.to_owned();
     }
     config.tmdb_bearer_token = token;
+    let new_storage = config.metadata_storage.clone();
+    let token_saved = config.tmdb_bearer_token.is_some();
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let location = if config.tmdb_bearer_token.is_some() {
-        "/settings?metadata_status=TMDB%20token%20accepted"
+    drop(config);
+    let copied = if previous_storage != new_storage && form.copy_existing == Some(true) {
+        match copy_metadata_storage(&state, &previous_storage, &new_storage) {
+            Ok(count) => Some(count),
+            Err(error) => {
+                warn!(%error, "metadata storage copy failed");
+                return settings_error("Storage changed, but some existing metadata could not be copied");
+            }
+        }
     } else {
-        "/settings?metadata_status=TMDB%20token%20cleared"
+        None
     };
-    Redirect::to(location).into_response()
+    let location = match copied {
+        Some(count) => format!("/settings?metadata_status=Copied%20{count}%20metadata%20items"),
+        None if new_storage != previous_storage => {
+            "/settings?metadata_status=Storage%20location%20changed".to_owned()
+        }
+        None if token_saved => {
+            "/settings?metadata_status=TMDB%20token%20accepted".to_owned()
+        }
+        _ => "/settings?metadata_status=TMDB%20token%20cleared".to_owned(),
+    };
+    Redirect::to(&location).into_response()
 }
+
+fn copy_metadata_storage(
+    state: &AppState,
+    source: &str,
+    destination: &str,
+) -> Result<usize, std::io::Error> {
+    let config = state
+        .config
+        .lock()
+        .map_err(|_| std::io::Error::other("configuration lock is unavailable"))?
+        .clone();
+    let media_index = media_snapshot(state);
+    let mut copied = 0;
+    let mut copied_groups = HashSet::new();
+    for (library_index, library) in config.libraries.iter().enumerate() {
+        let section = library_index + 1;
+        for media in media_index
+            .iter()
+            .filter(|media| media_in_library(media, library))
+        {
+            let Some(root) = library
+                .folders
+                .iter()
+                .find(|folder| media.path.starts_with(folder.as_path()))
+            else {
+                continue;
+            };
+            let group_path = metadata_group_path(root, &media.path, &library.kind);
+            if !copied_groups.insert((section, group_path.clone())) {
+                continue;
+            }
+            let media_key = database_media_key(section, &media.id);
+            let (from, to) = if source == "config" {
+                (
+                    config_metadata_sidecar_path(state, &media_key)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf(),
+                    metadata_sidecar_info_path(&group_path)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf(),
+                )
+            } else {
+                (
+                    metadata_sidecar_info_path(&group_path)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf(),
+                    config_metadata_sidecar_path(state, &media_key)
+                        .parent()
+                        .unwrap()
+                        .to_path_buf(),
+                )
+            };
+            if source != destination && copy_sidecar_tree(&from, &to)? {
+                copied += 1;
+            }
+        }
+    }
+    Ok(copied)
+}
+
+fn copy_sidecar_tree(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<bool, std::io::Error> {
+    let entries = match std::fs::read_dir(source) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut copied = false;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copied |= copy_sidecar_tree(&entry.path(), &target)?;
+        } else if file_type.is_file() && std::fs::metadata(&target).is_err() {
+            std::fs::create_dir_all(destination)?;
+            std::fs::copy(entry.path(), target)?;
+            copied = true;
+        }
+    }
+    Ok(copied)
+}
+
 
 async fn update_server_name(
     State(state): State<AppState>,
@@ -9335,12 +9455,16 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                     let group_path = metadata_group_path(root, &media.path, &library.kind);
                     read_metadata_sidecar(&s, &media_key, &group_path)
                 });
+            let cover_artwork = media_index
+                .iter()
+                .find(|media| media.path == selected_path)
+                .map(|media| media_cover_url(&media.id));
             media_info_panel(
                 selected_path.parent().unwrap_or(&library_root),
                 selected_metadata.as_ref(),
                 !sidecar_mode,
                 false,
-                None,
+                cover_artwork.as_deref(),
             )
             .await
         }
@@ -9373,6 +9497,30 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
             };
             (media_cover_exists || config_cover_exists)
                 .then(|| artwork_url(&relative, query.library, "cover"))
+        } else if !tv_season_view {
+            media_index
+                .iter()
+                .filter(|media| {
+                    library_config
+                        .as_ref()
+                        .is_some_and(|library| media_in_library(media, library))
+                })
+                .find(|media| {
+                    let group_path = metadata_group_path(
+                        &library_root,
+                        &media.path,
+                        library_kind.as_deref().unwrap_or("movie"),
+                    );
+                    let group_directory = if group_path.is_file() {
+                        group_path.parent().unwrap_or(&library_root)
+                    } else {
+                        group_path.as_path()
+                    };
+                    group_directory == directory
+                        || std::fs::canonicalize(group_directory)
+                            .is_ok_and(|canonical| canonical == directory)
+                })
+                .map(|media| media_cover_url(&media.id))
         } else {
             None
         };
@@ -10080,12 +10228,15 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     .breadcrumb a {{ padding: .35rem .55rem; border-radius: .35rem; text-decoration: none; }}
     .breadcrumb a:hover {{ background: #24344d; }}
     .breadcrumb-separator {{ color: #6b7280; }}
-    .metadata-panel {{ grid-column: 1 / -1; padding: 1rem 1.2rem; border: 1px solid #374151; border-radius: .75rem; background: rgba(17,24,39,.62); backdrop-filter: blur(8px); }}
-    .metadata-panel h2 {{ margin: 0 0 .45rem; }} .metadata-description {{ max-width: 75ch; color: #d1d5db; line-height: 1.5; }} .metadata-details {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .6rem 1.2rem; margin-top: .8rem; }} .metadata-detail strong {{ display: block; color: #9ca3af; font-size: .75rem; text-transform: uppercase; }}
-    .show-overview-summary {{ display: flex; align-items: flex-start; gap: 1rem; }}
-    .show-overview-cover {{ width: 120px; max-height: 180px; object-fit: cover; border-radius: .5rem; box-shadow: 0 3px 12px #0008; }}
-    .show-overview-summary > div {{ min-width: 0; }}
-    @media (max-width: 600px) {{ .show-overview-summary {{ gap: .75rem; }} .show-overview-cover {{ width: 88px; }} }}
+    .metadata-panel {{ grid-column: 1 / -1; min-width: 0; padding: 1.15rem 1.3rem; border: 1px solid rgba(55,65,81,.9); border-radius: .85rem; background: linear-gradient(145deg, rgba(31,41,55,.92), rgba(17,24,39,.9)); box-shadow: 0 16px 38px rgba(0,0,0,.28); backdrop-filter: blur(10px); }}
+    .metadata-panel h2 {{ margin: 0 0 .55rem; font-size: clamp(1.15rem, 2vw, 1.45rem); letter-spacing: -.02em; }}
+    .metadata-description {{ max-width: 75ch; color: #d7dde7; line-height: 1.6; }} .metadata-details {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .7rem 1.2rem; }} .metadata-details:not(:empty) {{ margin-top: .9rem; padding-top: .85rem; border-top: 1px solid rgba(55,65,81,.65); }} .metadata-detail strong {{ display: block; margin-bottom: .15rem; color: #9ca3af; font-size: .72rem; letter-spacing: .04em; text-transform: uppercase; }}
+    .metadata-panel-layout {{ grid-column: 1 / -1; display: grid; grid-template-columns: minmax(120px, 170px) minmax(0, 1fr); align-items: start; gap: 1.2rem; }}
+    .metadata-panel-layout > .metadata-panel {{ grid-column: 2; }}
+    .metadata-panel-layout.metadata-panel-layout-no-cover {{ grid-template-columns: minmax(0, 1fr); }}
+    .metadata-panel-layout.metadata-panel-layout-no-cover > .metadata-panel {{ grid-column: 1; }}
+    .metadata-panel-cover {{ display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border: 1px solid rgba(148,163,184,.28); border-radius: .8rem; background: linear-gradient(135deg, #1e3a8a, #312e81); box-shadow: 0 18px 36px rgba(2,6,23,.55); }}
+    @media (max-width: 640px) {{ .metadata-panel-layout {{ grid-template-columns: minmax(84px, 26vw) minmax(0, 1fr); gap: .8rem; }} .metadata-panel {{ padding: 1rem; }} }}
     .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
@@ -11609,7 +11760,10 @@ async fn media_info_panel(
 ) -> String {
     if prefer_config_metadata {
         if let Some(metadata) = stored_metadata {
-            return render_metadata_info_panel(metadata, None);
+            return metadata_panel_with_cover(
+                render_metadata_info_panel(metadata, None),
+                cover_artwork,
+            );
         }
     }
     if let Some(value) = read_sidecar_info(directory).await {
@@ -11630,39 +11784,41 @@ async fn media_info_panel(
             })
             .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
             .unwrap_or_default();
-        let overview = if hide_episode_fields {
-            let artwork = cover_artwork
-                .map(|url| {
-                    format!(
-                        r#"<img class="show-overview-cover" src="{}" alt="Cover for {}">"#,
-                        html(url),
-                        html(title)
-                    )
-                })
-                .unwrap_or_default();
-            format!(
-                r#"<div class="show-overview-summary">{}<div>{}</div></div>"#,
-                artwork, description
-            )
-        } else {
-            description
-        };
         let mut details = render_sidecar_details(&value, hide_episode_fields);
         if hide_episode_fields {
             if let Some(metadata) = value.get("metadata_json") {
                 details.push_str(&render_tv_show_metadata_details(metadata));
             }
         }
-        return format!(
-            r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
-            html(title),
-            overview,
-            details
+        return metadata_panel_with_cover(
+            format!(
+                r#"<section class="metadata-panel"><h2>{}</h2>{}<div class="metadata-details">{}</div></section>"#,
+                html(title),
+                description,
+                details
+            ),
+            cover_artwork,
         );
     }
     stored_metadata
-        .map(|metadata| render_metadata_info_panel(metadata, None))
+        .map(|metadata| {
+            metadata_panel_with_cover(
+                render_metadata_info_panel(metadata, None),
+                cover_artwork,
+            )
+        })
         .unwrap_or_default()
+}
+
+fn metadata_panel_with_cover(panel: String, cover_artwork: Option<&str>) -> String {
+    let Some(cover_artwork) = cover_artwork.filter(|_| !panel.is_empty()) else {
+        return panel;
+    };
+    format!(
+        r#"<div class="metadata-panel-layout"><img class="metadata-panel-cover" src="{}" alt="Cover artwork" onerror="this.parentElement.classList.add('metadata-panel-layout-no-cover');this.remove()">{}</div>"#,
+        html(cover_artwork),
+        panel
+    )
 }
 
 fn render_tv_show_metadata_details(metadata: &serde_json::Value) -> String {
