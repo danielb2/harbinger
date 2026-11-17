@@ -6,6 +6,7 @@ Harbringer is an alternative, independent implementation of Plex Media Server. I
 
 ## What you can do
 
+- Watch movies/tv media with [Plezy](https://github.com/edde746/plezy) or Plex desktop
 - Create movie, TV, and other libraries from folders on your server.
 - Browse cover artwork and folders in the built-in web client.
 - Connect compatible Plex clients to your server.
