@@ -2785,12 +2785,28 @@ async fn translate_subtitle_cached_cancellable(
     .await
 }
 
-/// Google's `client=gtx` endpoint rejects reqwest's rustls TLS fingerprint with
-/// HTTP 429 ("automated queries") even for the first cue. The platform TLS
-/// backend used by the Ruby translator is accepted, so translation must use it.
+/// Google's `client=gtx` endpoint returns HTTP 429 when a client advertises
+/// `http/1.1` via ALPN. reqwest's rustls backend does that by default; the Ruby
+/// translator sends no ALPN. Keep rustls (no OpenSSL dependency for Docker) but
+/// send the same ClientHello shape Google accepts.
 fn translation_http_client() -> Result<reqwest::Client, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().map(|trust| {
+        rustls::pki_types::TrustAnchor {
+            subject: trust.subject.clone(),
+            subject_public_key_info: trust.subject_public_key_info.clone(),
+            name_constraints: trust.name_constraints.clone(),
+        }
+    }));
+    let provider = std::sync::Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|_| "Could not initialize Google Translate".to_owned())?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols.clear();
     reqwest::Client::builder()
-        .use_native_tls()
+        .use_preconfigured_tls(tls)
         .timeout(Duration::from_secs(45))
         .build()
         .map_err(|_| "Could not initialize Google Translate".to_owned())
