@@ -1,6 +1,7 @@
 use super::{
-    build_app, build_plex_listener_app, build_web_listener_app, migrate_library_model, open_database, plex_external_subtitle_id, plex_part_id,
-    plex_remux_audio_mode, sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls,
+    build_app, build_plex_listener_app, build_web_listener_app, migrate_library_model,
+    open_database, plex_external_subtitle_id, plex_part_id, plex_remux_audio_mode,
+    sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls, SkipMode,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -138,6 +139,8 @@ fn fixture() -> Fixture {
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
         bilingual_subtitles_enabled: true,
+        skip_intro_mode: SkipMode::Manual,
+        skip_credits_mode: SkipMode::Manual,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -248,6 +251,8 @@ fn tv_fixture() -> Fixture {
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
         bilingual_subtitles_enabled: true,
+        skip_intro_mode: SkipMode::Manual,
+        skip_credits_mode: SkipMode::Manual,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -293,12 +298,26 @@ fn tv_fixture() -> Fixture {
 fn authorize_test_fixture(db: &rusqlite::Connection) {
     let token = "unit-test-session";
     let token_hash = format!("{:x}", super::Sha256::digest(token.as_bytes()));
-    db.execute("INSERT INTO web_admin (id, password_hash) VALUES (1, 'test-hash')", []).unwrap();
-    db.execute("INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, 4102444800)", [&token_hash]).unwrap();
+    db.execute(
+        "INSERT INTO web_admin (id, password_hash) VALUES (1, 'test-hash')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, 4102444800)",
+        [&token_hash],
+    )
+    .unwrap();
 }
 
-async fn inject_test_cookie(mut request: Request<Body>, next: axum::middleware::Next) -> axum::response::Response {
-    request.headers_mut().insert(header::COOKIE, "harbringer_session=unit-test-session".parse().unwrap());
+async fn inject_test_cookie(
+    mut request: Request<Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    request.headers_mut().insert(
+        header::COOKIE,
+        "harbringer_session=unit-test-session".parse().unwrap(),
+    );
     next.run(request).await
 }
 
@@ -360,13 +379,36 @@ async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
     let fixture = fixture();
     let app = build_app(fixture.state.clone());
     for path in ["/", "/settings", "/web/watch-action"] {
-        let response = app.clone().oneshot(Request::builder().uri(path).body(Body::empty()).unwrap()).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::SEE_OTHER, "{path}");
         assert_eq!(response.headers()[header::LOCATION], "/auth");
     }
-    let spoofed = app.clone().oneshot(Request::builder().uri("/settings").header("X-Plex-Product", "Plex Web").body(Body::empty()).unwrap()).await.unwrap();
+    let spoofed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .header("X-Plex-Product", "Plex Web")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(spoofed.status(), StatusCode::SEE_OTHER);
-    let plex = app.oneshot(Request::builder().uri("/library/sections").header("X-Plex-Product", "Plex Web").body(Body::empty()).unwrap()).await.unwrap();
+    let plex = app
+        .oneshot(
+            Request::builder()
+                .uri("/library/sections")
+                .header("X-Plex-Product", "Plex Web")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(plex.status(), StatusCode::OK);
 }
 
@@ -377,13 +419,23 @@ async fn web_and_plex_listener_surfaces_are_separated() {
     let plex = build_plex_listener_app(fixture.state.clone());
 
     let web_plex_request = web
-        .oneshot(Request::builder().uri("/identity").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/identity")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(web_plex_request.status(), StatusCode::NOT_FOUND);
 
     let plex_web_request = plex
-        .oneshot(Request::builder().uri("/settings").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(plex_web_request.status(), StatusCode::NOT_FOUND);
@@ -405,7 +457,10 @@ async fn web_and_plex_listener_surfaces_are_separated() {
         .await
         .unwrap();
     assert_eq!(legacy_web.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(legacy_web.headers()[header::LOCATION], "http://localhost:4826/");
+    assert_eq!(
+        legacy_web.headers()[header::LOCATION],
+        "http://localhost:4826/"
+    );
 
     let legacy_web_root = build_plex_listener_app(fixture.state.clone())
         .oneshot(
@@ -418,7 +473,10 @@ async fn web_and_plex_listener_surfaces_are_separated() {
         .await
         .unwrap();
     assert_eq!(legacy_web_root.status(), StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(legacy_web_root.headers()[header::LOCATION], "http://localhost:4826/");
+    assert_eq!(
+        legacy_web_root.headers()[header::LOCATION],
+        "http://localhost:4826/"
+    );
 
     let web_root = build_web_listener_app(fixture.state.clone())
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -432,14 +490,42 @@ async fn web_and_plex_listener_surfaces_are_separated() {
 async fn first_run_creates_admin_and_starts_an_authenticated_session() {
     let fixture = fixture();
     let app = build_app(fixture.state.clone());
-    fixture.db.lock().unwrap().execute("DELETE FROM web_admin", []).unwrap();
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM web_admin", [])
+        .unwrap();
     let setup = send(&app, Method::GET, "/auth", Body::empty()).await;
     assert_eq!(setup.status(), StatusCode::OK);
-    let created = send_form(&app, Method::POST, "/auth/setup", "password=correct-horse-battery&confirm_password=correct-horse-battery").await;
+    let created = send_form(
+        &app,
+        Method::POST,
+        "/auth/setup",
+        "password=correct-horse-battery&confirm_password=correct-horse-battery",
+    )
+    .await;
     assert_eq!(created.status(), StatusCode::SEE_OTHER);
-    assert!(created.headers()[header::SET_COOKIE].to_str().unwrap().contains("SameSite=Lax"));
-    let cookie = created.headers()[header::SET_COOKIE].to_str().unwrap().split(';').next().unwrap();
-    let settings = app.oneshot(Request::builder().uri("/settings").header(header::COOKIE, cookie).body(Body::empty()).unwrap()).await.unwrap();
+    assert!(created.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .contains("SameSite=Lax"));
+    let cookie = created.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap();
+    let settings = app
+        .oneshot(
+            Request::builder()
+                .uri("/settings")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
     assert_eq!(settings.status(), StatusCode::OK);
 }
 
@@ -472,7 +558,9 @@ fn plex_auth_keeps_product_identity_separate_from_server_display_name() {
     assert!(auth_url.contains("clientID=stable-client-id"));
     assert!(auth_url.contains("context%5Bdevice%5D%5Bproduct%5D=harbringer"));
     assert!(auth_url.contains("context%5Bdevice%5D%5BdeviceName%5D=Living%20Room%20Server"));
-    assert!(auth_url.contains("forwardUrl=http%3A%2F%2Flocalhost%3A32400%2Fsettings%2Fplex%2Fcallback%3Fpin_id%3D1234"));
+    assert!(auth_url.contains(
+        "forwardUrl=http%3A%2F%2Flocalhost%3A32400%2Fsettings%2Fplex%2Fcallback%3Fpin_id%3D1234"
+    ));
 }
 
 #[test]
@@ -486,7 +574,6 @@ fn plex_auth_uses_a_stable_auth_client_identifier_and_product_for_pin_creation_a
     );
     assert_eq!(super::plex_auth_product(&fixture.state), "harbringer");
 }
-
 
 #[test]
 fn plex_device_jwk_declares_signing_use() {
@@ -505,7 +592,9 @@ fn plex_pin_status_request_uses_the_documented_device_jwt_parameter() {
     let url = super::plex_pin_status_url(1234, "signed-device-jwt");
     let query = url.query_pairs().collect::<Vec<_>>();
 
-    assert!(query.iter().any(|(key, value)| key == "deviceJWT" && value == "signed-device-jwt"));
+    assert!(query
+        .iter()
+        .any(|(key, value)| key == "deviceJWT" && value == "signed-device-jwt"));
     assert!(!query.iter().any(|(key, _)| key == "code"));
 }
 
@@ -579,13 +668,21 @@ fn plex_server_registration_keeps_instance_identity_distinct() {
 
     assert!(first_xml.contains("name=\"harbringer-ace\" host=\"\" localAddresses=\"10.20.61.51\""));
     assert!(second_xml.contains("name=\"hb-nico\" host=\"\" localAddresses=\"10.20.61.172\""));
-    assert!(first_xml.contains(&format!("machineIdentifier=\"{}\"", first.state.machine_identifier)));
-    assert!(second_xml.contains(&format!("machineIdentifier=\"{}\"", second.state.machine_identifier)));
-    assert_ne!(first.state.machine_identifier, second.state.machine_identifier);
+    assert!(first_xml.contains(&format!(
+        "machineIdentifier=\"{}\"",
+        first.state.machine_identifier
+    )));
+    assert!(second_xml.contains(&format!(
+        "machineIdentifier=\"{}\"",
+        second.state.machine_identifier
+    )));
+    assert_ne!(
+        first.state.machine_identifier,
+        second.state.machine_identifier
+    );
     assert!(!first_xml.contains(" port=\""));
     assert!(!second_xml.contains(" port=\""));
 }
-
 
 #[test]
 fn plex_server_registration_uses_reference_pms_endpoint() {
@@ -853,7 +950,12 @@ async fn library_rename_rejects_blank_names_and_unknown_libraries() {
 async fn plex_artwork_serves_config_sidecar_cover() {
     let fixture = fixture();
     fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
-    let artwork_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    let artwork_dir = fixture
+        .state
+        .config_path
+        .parent()
+        .unwrap()
+        .join(".hbgr/1-1");
     std::fs::create_dir_all(&artwork_dir).unwrap();
     std::fs::write(artwork_dir.join("cover.jpg"), b"cover bytes").unwrap();
 
@@ -888,7 +990,12 @@ async fn plex_artwork_serves_config_sidecar_cover() {
 async fn hbweb_serves_config_sidecar_banner() {
     let fixture = fixture();
     fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
-    let artwork_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    let artwork_dir = fixture
+        .state
+        .config_path
+        .parent()
+        .unwrap()
+        .join(".hbgr/1-1");
     std::fs::create_dir_all(&artwork_dir).unwrap();
     std::fs::write(artwork_dir.join("banner.jpg"), b"banner bytes").unwrap();
 
@@ -907,7 +1014,6 @@ async fn hbweb_serves_config_sidecar_banner() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body.as_ref(), b"banner bytes");
 }
-
 
 #[tokio::test]
 async fn hbweb_uses_config_sidecar_banner_as_show_background() {
@@ -972,7 +1078,6 @@ async fn hbweb_uses_config_sidecar_banner_as_show_background() {
     assert!(episode_body.contains("path=Example%20Show"));
 }
 
-
 #[tokio::test]
 async fn hbweb_show_backdrop_main_tag_closes_its_style_attribute() {
     let fixture = tv_fixture();
@@ -1002,7 +1107,6 @@ async fn hbweb_show_backdrop_main_tag_closes_its_style_attribute() {
         "show backdrop main tag must close its style attribute so the backdrop stays valid CSS"
     );
 }
-
 
 #[test]
 fn startup_retries_saved_plex_token_after_publication_failure() {
@@ -1072,10 +1176,7 @@ fn plex_local_http_connection_keeps_registration_usable_without_local_https() {
         }]
     }]);
 
-    assert!(super::plex_resources_contain(
-        &resources,
-        "server-id"
-    ));
+    assert!(super::plex_resources_contain(&resources, "server-id"));
     assert!(super::plex_resources_contain_local_connection(
         &resources,
         "server-id"
@@ -1099,11 +1200,8 @@ fn plex_registration_contract_accepts_local_http_with_remote_plex_direct_https()
         )
         .unwrap();
 
-    let urls = super::plex_publish_urls(
-        &["10.20.61.51".parse().unwrap()],
-        32400,
-        Some("cert-hash"),
-    );
+    let urls =
+        super::plex_publish_urls(&["10.20.61.51".parse().unwrap()], 32400, Some("cert-hash"));
     assert_eq!(
         urls,
         [
@@ -1139,9 +1237,18 @@ fn plex_registration_contract_accepts_local_http_with_remote_plex_direct_https()
             }
         ]
     }]);
-    assert!(super::plex_resources_contain(&resources, machine_identifier));
-    assert!(super::plex_resources_contain_local_connection(&resources, machine_identifier));
-    assert!(!super::plex_resources_contain_local_https(&resources, machine_identifier));
+    assert!(super::plex_resources_contain(
+        &resources,
+        machine_identifier
+    ));
+    assert!(super::plex_resources_contain_local_connection(
+        &resources,
+        machine_identifier
+    ));
+    assert!(!super::plex_resources_contain_local_https(
+        &resources,
+        machine_identifier
+    ));
 
     assert_eq!(
         super::plex_startup_registration(&fixture.db.lock().unwrap()),
@@ -1597,14 +1704,12 @@ async fn manual_scan_updates_web_and_plex_inventory_without_changing_existing_id
     assert_eq!(second_items[0]["title"], "SectionTwo");
 }
 
-
 #[test]
 fn manual_scans_match_existing_unmatched_media() {
     assert!(!crate::metadata_scan_assets_only(0, true));
     assert!(crate::metadata_scan_assets_only(0, false));
     assert!(!crate::metadata_scan_assets_only(1, false));
 }
-
 
 #[tokio::test]
 async fn scans_keep_existing_supported_media_omitted_by_scan() {
@@ -2884,8 +2989,9 @@ async fn web_and_plex_clients_share_subtitle_selection() {
     assert!(web_player.contains("class=\"translation-progress\""));
     assert!(web_player.contains("new WebSocket(subtitleSocketUrl)"));
     assert!(!web_player.contains("setInterval(syncSubtitleSelection, 3000)"));
-    assert!(web_player.contains("const hasPlayer = Boolean(current?.querySelector(\"video[data-progress-path]\"))"));
-
+    assert!(web_player.contains(
+        "const hasPlayer = Boolean(current?.querySelector(\"video[data-progress-path]\"))"
+    ));
 
     let plex_selection = send(
         &fixture.app,
@@ -2947,13 +3053,7 @@ async fn built_in_player_lists_embedded_text_subtitle_tracks() {
 #[tokio::test]
 async fn translation_settings_do_not_require_credentials() {
     let fixture = fixture();
-    let response = send(
-        &fixture.app,
-        Method::GET,
-        "/settings",
-        Body::empty(),
-    )
-    .await;
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let page = String::from_utf8(
         to_bytes(response.into_body(), usize::MAX)
@@ -2986,24 +3086,36 @@ async fn bilingual_subtitles_can_be_disabled_globally() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
-    assert!(!fixture
-        .state
-        .config
-        .lock()
-        .unwrap()
-        .bilingual_subtitles_enabled);
+    assert!(
+        !fixture
+            .state
+            .config
+            .lock()
+            .unwrap()
+            .bilingual_subtitles_enabled
+    );
 
-    let metadata = send(&fixture.app, Method::GET, "/library/metadata/1-1", Body::empty()).await;
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &to_bytes(metadata.into_body(), usize::MAX).await.unwrap(),
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
     )
-    .unwrap();
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
     let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
         .as_array()
         .unwrap();
-    assert!(!streams.iter().any(|stream| stream["extendedDisplayTitle"] == "Bilingual VTT External"));
-    assert!(streams.iter().any(|stream| stream["displayTitle"] == "English"));
-    assert!(!streams.iter().any(|stream| stream["displayTitle"] == "English + Vietnamese"));
+    assert!(!streams
+        .iter()
+        .any(|stream| stream["extendedDisplayTitle"] == "Bilingual VTT External"));
+    assert!(streams
+        .iter()
+        .any(|stream| stream["displayTitle"] == "English"));
+    assert!(!streams
+        .iter()
+        .any(|stream| stream["displayTitle"] == "English + Vietnamese"));
 
     let media = fixture.state.media.read().unwrap()[0].clone();
     let web_tracks = super::subtitle_tracks(
@@ -3044,7 +3156,8 @@ async fn captured_client_hello(client: &reqwest::Client) -> Vec<u8> {
 
 #[tokio::test]
 async fn translation_client_avoids_the_rustls_fingerprint_google_rejects() {
-    let advertises_http_1_1_alpn = |hello: &[u8]| hello.windows(8).any(|window| window == b"http/1.1");
+    let advertises_http_1_1_alpn =
+        |hello: &[u8]| hello.windows(8).any(|window| window == b"http/1.1");
 
     let rustls_client = reqwest::Client::builder().use_rustls_tls().build().unwrap();
     assert!(advertises_http_1_1_alpn(
@@ -3149,8 +3262,11 @@ async fn successful_translation_removes_its_part_checkpoint_but_failures_keep_it
         "{}.part",
         super::bilingual_subtitle_path(&media, "en", "vi", "vtt").display()
     ));
-    std::fs::write(&checkpoint, "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n")
-        .unwrap();
+    std::fs::write(
+        &checkpoint,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+    )
+    .unwrap();
 
     super::finalize_bilingual_translation(
         &sidecar,
@@ -3186,11 +3302,23 @@ async fn changing_translation_source_resets_the_partial_without_mixing_cues() {
     let source_a = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
     let source_b = "1\n00:00:01,000 --> 00:00:02,000\nGoodbye\n";
     let fingerprint_a = super::subtitle_translation_fingerprint(
-        &media, source_a, "en", "srt", "en", "vi", Some("stream:1"),
+        &media,
+        source_a,
+        "en",
+        "srt",
+        "en",
+        "vi",
+        Some("stream:1"),
     )
     .unwrap();
     let fingerprint_b = super::subtitle_translation_fingerprint(
-        &media, source_b, "en", "srt", "en", "vi", Some("stream:2"),
+        &media,
+        source_b,
+        "en",
+        "srt",
+        "en",
+        "vi",
+        Some("stream:2"),
     )
     .unwrap();
     assert_ne!(fingerprint_a, fingerprint_b);
@@ -3203,22 +3331,14 @@ async fn changing_translation_source_resets_the_partial_without_mixing_cues() {
         .await
         .unwrap();
 
-    super::prepare_translation_checkpoint(
-        &checkpoint,
-        source_b,
-        &fingerprint_b,
-        Some("stream:2"),
-    )
-    .await
-    .unwrap();
+    super::prepare_translation_checkpoint(&checkpoint, source_b, &fingerprint_b, Some("stream:2"))
+        .await
+        .unwrap();
 
     assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), "WEBVTT\n\n");
-    assert!(super::subtitle_source_marker_matches(
-        &checkpoint,
-        &fingerprint_b,
-        Some("stream:2")
-    )
-    .await);
+    assert!(
+        super::subtitle_source_marker_matches(&checkpoint, &fingerprint_b, Some("stream:2")).await
+    );
 }
 
 #[tokio::test]
@@ -3269,11 +3389,15 @@ async fn individual_language_sidecars_are_merged_and_marked_in_extended_title() 
     let (display, extended) = super::external_subtitle_titles(&media.path, &merged);
     assert_eq!(display, "English + Vietnamese");
     assert_eq!(extended, "Bilingual SRT External · Merged");
-    let metadata = send(&fixture.app, Method::GET, "/library/metadata/1-1", Body::empty()).await;
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &to_bytes(metadata.into_body(), usize::MAX).await.unwrap(),
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
     )
-    .unwrap();
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
     let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
         .as_array()
         .unwrap();
@@ -3309,7 +3433,9 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
             false,
             true,
             true,
-            move |_cancelled| async move { let _ = wait_for_resume.await; },
+            move |_cancelled| async move {
+                let _ = wait_for_resume.await;
+            },
         ),
     )
     .await
@@ -3322,33 +3448,25 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
 async fn plex_translated_subtitle_stream_serves_only_manually_generated_files() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
-    let missing = super::translated_subtitle_stream_response(
-        &fixture.state,
-        &media,
-        "en",
-        "vi",
-        "vtt",
-    )
-    .await;
+    let missing =
+        super::translated_subtitle_stream_response(&fixture.state, &media, "en", "vi", "vtt").await;
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
-    let final_path = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    let final_path =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
     std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
     std::fs::write(
         &final_path,
         "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
     )
     .unwrap();
-    let response = super::translated_subtitle_stream_response(
-        &fixture.state,
-        &media,
-        "en",
-        "vi",
-        "vtt",
-    )
-    .await;
+    let response =
+        super::translated_subtitle_stream_response(&fixture.state, &media, "en", "vi", "vtt").await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()[header::CONTENT_TYPE], "text/vtt; charset=utf-8");
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/vtt; charset=utf-8"
+    );
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.starts_with("WEBVTT\n\n"));
@@ -3358,18 +3476,12 @@ async fn plex_translated_subtitle_stream_serves_only_manually_generated_files() 
 #[test]
 fn stopping_playback_cancels_stream_translation_but_preserves_explicit_preparation() {
     let media_id = format!("test-{}", NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed));
-    let streaming = super::start_translation_job(
-        format!("{media_id}.stream"),
-        media_id.clone(),
-        false,
-    )
-    .unwrap();
-    let prepared = super::start_translation_job(
-        format!("{media_id}.prepared"),
-        media_id.clone(),
-        true,
-    )
-    .unwrap();
+    let streaming =
+        super::start_translation_job(format!("{media_id}.stream"), media_id.clone(), false)
+            .unwrap();
+    let prepared =
+        super::start_translation_job(format!("{media_id}.prepared"), media_id.clone(), true)
+            .unwrap();
     super::cancel_streaming_translation_jobs(&media_id);
     assert!(streaming.load(std::sync::atomic::Ordering::Acquire));
     assert!(!prepared.load(std::sync::atomic::Ordering::Acquire));
@@ -3382,8 +3494,8 @@ async fn plex_stopped_timeline_cancels_streaming_subtitle_generation() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
     let job_key = format!("{}.stream", media.path.display());
-    let cancellation = super::start_translation_job(job_key.clone(), media.id.clone(), false)
-        .unwrap();
+    let cancellation =
+        super::start_translation_job(job_key.clone(), media.id.clone(), false).unwrap();
     let rating_key = super::plex_rating_key(&media);
     let response = send(
         &fixture.app,
@@ -3437,12 +3549,12 @@ async fn embedded_text_subtitle_can_be_selected_as_translation_source() {
     assert!(message.contains("Embedded subtitles could not be read"));
 }
 
-
 #[tokio::test]
 async fn unprepared_subtitle_requests_are_rejected_without_creating_output() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
-    let output = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    let output =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
     let response = fixture
         .app
         .clone()
@@ -3497,26 +3609,25 @@ async fn web_translation_progress_reports_staged_cues_and_completed_srt() {
     };
     let response = fixture.app.clone().oneshot(request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    let progress: serde_json::Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let progress: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(progress["completed"], 1);
     assert_eq!(progress["total"], 1);
     assert_eq!(progress["percent"], 100);
     assert_eq!(progress["complete"], false);
 
     let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
-    std::fs::write(&final_path, "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n")
-        .unwrap();
+    std::fs::write(
+        &final_path,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
+    )
+    .unwrap();
     super::write_subtitle_source_marker(&final_path, "test-source", Some("stream:7"))
         .await
         .unwrap();
     let response = fixture.app.clone().oneshot(request()).await.unwrap();
-    let progress: serde_json::Value = serde_json::from_slice(
-        &to_bytes(response.into_body(), usize::MAX).await.unwrap(),
-    )
-    .unwrap();
+    let progress: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
     assert_eq!(progress["percent"], 100);
     assert_eq!(progress["complete"], true);
 }
@@ -3536,15 +3647,22 @@ async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
     .await;
     let metadata: serde_json::Value =
         serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(!metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|stream| stream["id"] == translated_id));
+    assert!(
+        !metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stream| stream["id"] == translated_id)
+    );
 
-    let saved_path = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    let saved_path =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
     std::fs::create_dir_all(saved_path.parent().unwrap()).unwrap();
-    std::fs::write(&saved_path, "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n").unwrap();
+    std::fs::write(
+        &saved_path,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
+    )
+    .unwrap();
     let metadata = send(
         &fixture.app,
         Method::GET,
@@ -3554,11 +3672,13 @@ async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
     .await;
     let metadata: serde_json::Value =
         serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|stream| stream["id"] == translated_id && stream["external"] == true));
+    assert!(
+        metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|stream| stream["id"] == translated_id && stream["external"] == true)
+    );
     let selection = send(
         &fixture.app,
         Method::PUT,
@@ -4113,7 +4233,10 @@ async fn home_page_renders_the_fix_match_dialog_for_home_card_actions() {
     let response = send(&fixture.app, Method::GET, "/", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = String::from_utf8(
-        to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec(),
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
     )
     .unwrap();
     assert!(body.contains("data-fix-match data-library=\"0\""));
@@ -4428,7 +4551,12 @@ async fn tv_season_without_description_has_no_empty_metadata_panel() {
 async fn config_sidecar_metadata_renders_in_the_selected_movie_view() {
     let fixture = fixture();
     fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
-    let sidecar_dir = fixture.state.config_path.parent().unwrap().join(".hbgr/1-1");
+    let sidecar_dir = fixture
+        .state
+        .config_path
+        .parent()
+        .unwrap()
+        .join(".hbgr/1-1");
     std::fs::create_dir_all(&sidecar_dir).unwrap();
     std::fs::write(
         sidecar_dir.join("data.json"),
@@ -4579,7 +4707,11 @@ fn metadata_sidecar_reads_prefer_selected_location_and_fall_back() {
         technical: None,
         show_id: None,
     };
-    std::fs::write(&media_sidecar_path, serde_json::to_vec(&media_info).unwrap()).unwrap();
+    std::fs::write(
+        &media_sidecar_path,
+        serde_json::to_vec(&media_info).unwrap(),
+    )
+    .unwrap();
     assert!(super::write_config_metadata(
         &fixture.state,
         &media_key,
@@ -4608,7 +4740,6 @@ fn metadata_sidecar_reads_prefer_selected_location_and_fall_back() {
         101
     );
 }
-
 
 #[test]
 fn legacy_database_metadata_migrates_to_config_sidecars() {
@@ -4655,7 +4786,6 @@ fn legacy_database_metadata_migrates_to_config_sidecars() {
     let group_path = super::metadata_group_path(&root, &media.path, "movie");
     assert!(!super::metadata_sidecar_info_path(&group_path).is_file());
 }
-
 
 #[test]
 fn media_cards_use_the_selected_media_cover_and_path() {
@@ -7313,4 +7443,294 @@ async fn web_ui_pages_show_the_build_version_and_commit() {
         assert!(page.contains("position:fixed;left:.75rem;bottom:.65rem"));
         assert!(page.contains("box-sizing:border-box;width:100%;height:100%"));
     }
+}
+
+#[tokio::test]
+async fn marker_routes_create_edit_delete_and_project_markers() {
+    let fixture = fixture();
+    let create = send(
+        &fixture.app,
+        Method::POST,
+        "/library/metadata/1-1/marker?type=1&startTimeOffset=5000&endTimeOffset=45000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let created: serde_json::Value =
+        serde_json::from_slice(&to_bytes(create.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let marker = created["MediaContainer"]["Marker"][0].clone();
+    assert_eq!(marker["type"], "intro");
+    assert_eq!(marker["startTimeOffset"], 5_000);
+    assert_eq!(marker["endTimeOffset"], 45_000);
+    let marker_id = marker["id"].as_u64().expect("created marker has an id");
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1?includeMarkers=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let item = &metadata["MediaContainer"]["Metadata"][0];
+    assert_eq!(item["Marker"][0]["id"], marker_id);
+    assert_eq!(item["Marker"][0]["type"], "intro");
+
+    let plain = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let plain: serde_json::Value =
+        serde_json::from_slice(&to_bytes(plain.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(plain["MediaContainer"]["Metadata"][0]
+        .get("Marker")
+        .is_none());
+
+    let edit = send(
+        &fixture.app,
+        Method::PUT,
+        &format!("/library/metadata/1-1/marker/{marker_id}?type=2&startTimeOffset=300000&endTimeOffset=345000"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(edit.status(), StatusCode::OK);
+    let edited: serde_json::Value =
+        serde_json::from_slice(&to_bytes(edit.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(edited["MediaContainer"]["Marker"][0]["id"], marker_id);
+    assert_eq!(edited["MediaContainer"]["Marker"][0]["type"], "credits");
+    assert_eq!(
+        edited["MediaContainer"]["Marker"][0]["startTimeOffset"],
+        300_000
+    );
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1?includeMarkers=1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(
+        metadata["MediaContainer"]["Metadata"][0]["Marker"][0]["type"],
+        "credits"
+    );
+
+    let delete = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/library/metadata/1-1/marker/{marker_id}"),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(delete.status(), StatusCode::OK);
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1?includeMarkers=1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(metadata["MediaContainer"]["Metadata"][0]
+        .get("Marker")
+        .is_none());
+}
+
+#[tokio::test]
+async fn marker_detection_and_section_delete_routes_are_wired() {
+    let fixture = fixture();
+    let create = send(
+        &fixture.app,
+        Method::POST,
+        "/library/metadata/1-1/marker?type=intro&startTimeOffset=5000&endTimeOffset=45000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+
+    for marker_type in ["intro", "credits"] {
+        let response = send(
+            &fixture.app,
+            Method::PUT,
+            &format!("/library/metadata/1-1/{marker_type}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK, "{marker_type} detection");
+    }
+    let unknown = send(
+        &fixture.app,
+        Method::PUT,
+        "/library/metadata/missing/intro",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+
+    let clear = send(
+        &fixture.app,
+        Method::DELETE,
+        "/library/sections/1/intros",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(clear.status(), StatusCode::OK);
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1?includeMarkers=1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(metadata["MediaContainer"]["Metadata"][0]
+        .get("Marker")
+        .is_none());
+}
+
+#[test]
+fn season_directory_media_is_recognized_for_marker_groups() {
+    let root = PathBuf::from("/tv");
+    assert!(super::media_has_season_directory(
+        &root,
+        Path::new("/tv/Bones/season.9/Bones - S09E04.mkv")
+    ));
+    assert!(!super::media_has_season_directory(
+        &root,
+        Path::new("/tv/Bones/Bones - S09E04.mkv")
+    ));
+}
+
+#[tokio::test]
+async fn skipping_settings_render_validate_and_persist_both_modes() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("id=\"skip-settings\""));
+    assert!(page.contains("name=\"skip_intro_mode\""));
+    assert!(page.contains("name=\"skip_credits_mode\""));
+    assert_eq!(page.matches("<option value=\"automatic\"").count(), 2);
+    assert_eq!(
+        page.matches("<option value=\"manual\" selected>Manual</option>")
+            .count(),
+        2
+    );
+    assert_eq!(page.matches("<option value=\"off\"").count(), 2);
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/skipping",
+        "skip_intro_mode=automatic&skip_credits_mode=off",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/settings#skip-settings"
+    );
+    {
+        let config = fixture.state.config.lock().unwrap();
+        assert_eq!(config.skip_intro_mode, super::SkipMode::Automatic);
+        assert_eq!(config.skip_credits_mode, super::SkipMode::Off);
+    }
+
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("<option value=\"automatic\" selected>Automatic</option>"));
+    assert!(page.contains("<option value=\"off\" selected>Off</option>"));
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/skipping",
+        "skip_intro_mode=sometimes&skip_credits_mode=manual",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    {
+        let config = fixture.state.config.lock().unwrap();
+        assert_eq!(config.skip_intro_mode, super::SkipMode::Automatic);
+        assert_eq!(config.skip_credits_mode, super::SkipMode::Off);
+    }
+}
+
+#[tokio::test]
+async fn web_player_receives_markers_and_independent_skip_modes() {
+    let fixture = fixture();
+    for (kind, start, end) in [("intro", 5_000, 45_000), ("2", 300_000, 345_000)] {
+        let response = send(
+            &fixture.app,
+            Method::POST,
+            &format!("/library/metadata/1-1/marker?type={kind}&startTimeOffset={start}&endTimeOffset={end}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/skipping",
+        "skip_intro_mode=automatic&skip_credits_mode=off",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("data-skip-intro-mode=\"automatic\""));
+    assert!(page.contains("data-skip-credits-mode=\"off\""));
+    assert_eq!(page.matches("data-skip-markers=\"[{&quot;id&quot;:").count(), 2);
+    assert!(page.contains("&quot;startTimeOffset&quot;:5000"));
+    assert!(page.contains("&quot;type&quot;:&quot;credits&quot;"));
+    assert!(page.contains("class=\"skip-intro-button\" data-skip-kind=\"intro\""));
+    assert!(page.contains("aria-label=\"Skip intro\""));
+    assert!(page.contains("class=\"skip-credits-button\" data-skip-kind=\"credits\""));
+    assert!(page.contains("aria-label=\"Skip credits\""));
+    assert!(page.contains("const syncSkipMarkers ="));
+    assert!(page.contains("mode === \"automatic\""));
+    assert!(page.contains("mode === \"manual\""));
+    assert!(page.contains("(Number(marker.endTimeOffset) / 1000) - 2"));
+    assert!(page.contains("function renderMarkerInfo"));
+    assert!(page.contains("function formatMarkerTime"));
+    assert!(page.contains("addInfoRow(infoContent, \"Markers\", \"None detected\")"));
+    assert!(page.contains("? \"Credits\" : \"Introduction\""));
 }

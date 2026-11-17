@@ -61,7 +61,7 @@ The decision endpoint and ranged file route are necessary pieces, not proof that
 
 - [ ] Complete the P0 Play-button and playback gate before expanding to lower-priority endpoints.
 - [ ] Inventory and implement decision, direct-play, direct-stream, subtitle, session, and playback-control operations from the PMS specification.
-- [ ] Support the media formats and client profiles required for replacement parity, with cross-platform Rust libraries; do not depend on installed `ffmpeg` or `ffprobe` commands.
+- [ ] Support the media formats and client profiles required for replacement parity. Prefer cross-platform Rust libraries where practical; bundled FFmpeg-backed decoding and `ffmpeg`/`ffprobe` binaries are acceptable in supported distributions.
 - [ ] Implement transcoding, remuxing, and subtitle conversion as required by those profiles, or make an explicit product decision if a feature cannot be supported.
 - [ ] Verify multiple simultaneous clients, bandwidth/network modes, alternate audio and subtitle selection, seeking, and interruption recovery.
 

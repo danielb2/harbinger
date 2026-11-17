@@ -40,6 +40,14 @@ Acceptance: complete the hosted sign-in; receive and persist the account token; 
 
 The user prefers JavaScript and does not want TypeScript added. Keep the current UI implementation unless the user asks for a framework change. A framework proposal does not replace the requirement that every action work and report errors clearly.
 
+## Intro and credits skipping
+
+**Status: Broken / in progress.**
+
+Harbringer must detect intro and credits ranges from episode audio per season, using bundled FFmpeg-backed decoding in supported distributions, persist those ranges, expose them through Plex-compatible marker APIs and metadata, and honor separate intro/credits settings in Harbringer's web player. Each setting must offer Automatic, Manual, and Off: Automatic seeks to two seconds before the marker ends; Manual shows an accessible Skip Intro or Skip Credits button while playback is inside the marker; Off suppresses both detection-driven playback behavior and skip buttons. Plex clients must receive the same marker ranges through the documented marker/metadata surface; client-visible parity requires checking an official client, not endpoint tests alone.
+
+Acceptance: with at least two episodes in a season, common intro and credits segments are detected using bundled FFmpeg-backed decoding in supported distributions; markers survive restarts and can be created, edited, and deleted through the documented PMS routes; Harbringer's player follows all three modes independently for intros and credits; official Plex clients show the skip affordance when given the markers. Detection must fail closed on unsupported audio rather than inventing ranges.
+
 ## Working with these contracts
 
 Before changing a covered feature, read its entry here and relevant history in `CHANGELOG.md`. Preserve the stated user goal even when implementation details change. If a protocol constraint appears to conflict with a user-visible contract, keep the user-visible contract and find a compatible implementation; do not redefine the feature to fit the first implementation idea. Update status only with evidence, and record regressions as regressions rather than describing them as new feature work.

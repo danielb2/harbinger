@@ -450,7 +450,7 @@
       "path": "/library/metadata/{ids}/credits",
       "operation_id": "libraryMetadataPutCredits",
       "summary": "Credit detect a metadata item",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",
@@ -485,14 +485,14 @@
       "path": "/library/metadata/{ids}/intro",
       "operation_id": "libraryMetadataPutIntro",
       "summary": "Intro detect an item",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "POST",
       "path": "/library/metadata/{ids}/marker",
       "operation_id": "libraryMetadataPostMarker",
       "summary": "Create a marker",
-      "expected_status": 404
+      "expected_status": 400
     },
     {
       "method": "DELETE",
@@ -506,7 +506,7 @@
       "path": "/library/metadata/{ids}/marker/{marker}",
       "operation_id": "libraryMetadataPutMarkerMarker",
       "summary": "Edit a marker",
-      "expected_status": 404
+      "expected_status": 400
     },
     {
       "method": "PUT",
@@ -926,7 +926,7 @@
       "path": "/library/sections/{sectionId}/intros",
       "operation_id": "librarySectionDeleteIntros",
       "summary": "Delete section intro markers",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",

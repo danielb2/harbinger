@@ -1,6 +1,11 @@
 use crate::plex::{plex_remux, plex_tls};
+mod markers;
 mod subtitles;
 
+use argon2::{
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     body::Body,
     extract::{
@@ -12,10 +17,6 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{any, delete, get, post, put},
     Json, Router,
-};
-use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use clap::Parser;
@@ -52,12 +53,36 @@ const PLEX_DEFAULT_AUDIO_LANGUAGE: &str = "en";
 const WEB_UI_PORT: u16 = 4826;
 const USER_ID: &str = "mplex-user";
 
+static MARKER_DETECTION_GROUPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn begin_marker_detection_group(key: String) -> bool {
+    MARKER_DETECTION_GROUPS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut groups| groups.insert(key))
+        .unwrap_or(false)
+}
+
+fn end_marker_detection_group(key: &str) {
+    if let Ok(mut groups) = MARKER_DETECTION_GROUPS.get_or_init(Default::default).lock() {
+        groups.remove(key);
+    }
+}
+
 #[derive(Parser, Debug, Clone)]
 struct Args {
     #[arg(long, value_name = "DIRECTORY")]
     config: Option<PathBuf>,
     #[arg(long)]
     bind: Option<SocketAddr>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SkipMode {
+    Automatic,
+    Manual,
+    Off,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -76,8 +101,53 @@ struct Config {
     subtitle_language_secondary: String,
     #[serde(default = "default_true")]
     bilingual_subtitles_enabled: bool,
+    #[serde(default = "default_skip_mode")]
+    skip_intro_mode: SkipMode,
+    #[serde(default = "default_skip_mode")]
+    skip_credits_mode: SkipMode,
     #[serde(default)]
     plex_account_preferences: BTreeMap<String, String>,
+}
+
+impl SkipMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Manual => "manual",
+            Self::Off => "off",
+        }
+    }
+}
+
+fn parse_skip_mode(value: &str) -> Option<SkipMode> {
+    match value.trim() {
+        "automatic" => Some(SkipMode::Automatic),
+        "manual" => Some(SkipMode::Manual),
+        "off" => Some(SkipMode::Off),
+        _ => None,
+    }
+}
+
+fn skip_mode_options(selected: SkipMode) -> String {
+    [
+        (SkipMode::Automatic, "Automatic"),
+        (SkipMode::Manual, "Manual"),
+        (SkipMode::Off, "Off"),
+    ]
+    .into_iter()
+    .map(|(mode, label)| {
+        format!(
+            "<option value=\"{}\"{}>{}</option>",
+            mode.as_str(),
+            if mode == selected { " selected" } else { "" },
+            label
+        )
+    })
+    .collect()
+}
+
+fn default_skip_mode() -> SkipMode {
+    SkipMode::Manual
 }
 
 fn default_subtitle_language_primary() -> String {
@@ -252,13 +322,23 @@ fn cancel_streaming_translation_jobs(media_id: &str) {
     if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
         if let Ok(jobs) = jobs.lock() {
             let mut cancelled = 0;
-            for job in jobs.values().filter(|job| job.media_id == media_id && !job.explicit) {
-                if !job.cancelled.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            for job in jobs
+                .values()
+                .filter(|job| job.media_id == media_id && !job.explicit)
+            {
+                if !job
+                    .cancelled
+                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
                     cancelled += 1;
                 }
             }
             if cancelled > 0 {
-                info!(media_id, jobs = cancelled, "playback stopped; cancelling streaming subtitle translation");
+                info!(
+                    media_id,
+                    jobs = cancelled,
+                    "playback stopped; cancelling streaming subtitle translation"
+                );
             }
         }
     }
@@ -268,7 +348,8 @@ fn cancel_all_translation_jobs() {
     if let Some(jobs) = ACTIVE_TRANSLATION_JOBS.get() {
         if let Ok(jobs) = jobs.lock() {
             for job in jobs.values() {
-                job.cancelled.store(true, std::sync::atomic::Ordering::Release);
+                job.cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
         }
     }
@@ -322,10 +403,8 @@ static WEB_SUBTITLE_SELECTION_BROADCAST: OnceLock<tokio::sync::broadcast::Sender
     OnceLock::new();
 
 fn web_subtitle_selection_broadcast() -> &'static tokio::sync::broadcast::Sender<(u64, u64)> {
-    WEB_SUBTITLE_SELECTION_BROADCAST
-        .get_or_init(|| tokio::sync::broadcast::channel(128).0)
+    WEB_SUBTITLE_SELECTION_BROADCAST.get_or_init(|| tokio::sync::broadcast::channel(128).0)
 }
-
 
 #[derive(Clone)]
 struct LogBufferMakeWriter;
@@ -694,11 +773,9 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
                 }
                 Err(error) => {
                     if let Ok(connection) = publication_state.db.lock() {
-                        if let Err(save_error) = set_plex_registration_state(
-                            &connection,
-                            false,
-                            Some(&error),
-                        ) {
+                        if let Err(save_error) =
+                            set_plex_registration_state(&connection, false, Some(&error))
+                        {
                             warn!(%save_error, "could not save failed Plex registration state");
                         }
                     }
@@ -845,6 +922,7 @@ fn build_app(state: AppState) -> Router {
         .route("/web/tv-match/select", post(tv_match_select))
         .route("/settings", get(settings_page).post(save_translation_settings))
         .route("/settings/translation", get(translation_settings_page).post(save_translation_settings))
+        .route("/settings/skipping", post(save_skip_settings))
         .route("/settings/logs/socket", get(settings_logs_socket))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
@@ -952,11 +1030,19 @@ fn build_app(state: AppState) -> Router {
         .route("/library/sections/:section/firstCharacter", get(plex_section_first_characters))
         .route("/library/sections/:section/firstCharacter/:letter", get(plex_section_first_character_items))
         .route("/library/sections/:section/firstCharacters", get(plex_section_first_characters))
+        .route("/library/sections/:section/intros", delete(plex_delete_section_markers))
         .route("/library/search", get(plex_library_search))
         .route("/library/all", get(plex_library_all))
         .route("/library/sections/:section/all", get(plex_all))
         .route("/library/metadata/:id", get(plex_item))
         .route("/library/metadata/:id/children", get(plex_item))
+        .route("/library/metadata/:ids/intro", put(plex_detect_markers))
+        .route("/library/metadata/:ids/credits", put(plex_detect_markers))
+        .route("/library/metadata/:ids/marker", post(plex_create_marker))
+        .route(
+            "/library/metadata/:ids/marker/:marker",
+            put(plex_edit_marker).delete(plex_delete_marker),
+        )
         .route("/library/metadata/:id/related", get(plex_related_hubs))
         .route("/library/metadata/:id/extras", get(plex_extras))
         .route("/library/metadata/:id/media/:part", get(plex_part))
@@ -1053,27 +1139,31 @@ enum ListenerSurface {
 }
 
 fn build_web_listener_app(state: AppState) -> Router {
-    build_app(state).layer(middleware::from_fn(|mut request: Request<Body>, next: Next| async move {
-        if !is_web_surface_path(request.uri().path()) {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        request.extensions_mut().insert(ListenerSurface::Web);
-        next.run(request).await
-    }))
+    build_app(state).layer(middleware::from_fn(
+        |mut request: Request<Body>, next: Next| async move {
+            if !is_web_surface_path(request.uri().path()) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            request.extensions_mut().insert(ListenerSurface::Web);
+            next.run(request).await
+        },
+    ))
 }
 
 fn build_plex_listener_app(state: AppState) -> Router {
-    build_app(state).layer(middleware::from_fn(|mut request: Request<Body>, next: Next| async move {
-        if is_web_surface_path(request.uri().path())
-            && request.uri().path() != "/"
-            && request.uri().path() != "/web/index.html"
-            && request.uri().path() != "/web/"
-        {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        request.extensions_mut().insert(ListenerSurface::Plex);
-        next.run(request).await
-    }))
+    build_app(state).layer(middleware::from_fn(
+        |mut request: Request<Body>, next: Next| async move {
+            if is_web_surface_path(request.uri().path())
+                && request.uri().path() != "/"
+                && request.uri().path() != "/web/index.html"
+                && request.uri().path() != "/web/"
+            {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            request.extensions_mut().insert(ListenerSurface::Plex);
+            next.run(request).await
+        },
+    ))
 }
 
 fn is_web_surface_path(path: &str) -> bool {
@@ -1379,7 +1469,6 @@ pub(crate) fn metadata_scan_assets_only(newly_found: usize, match_unmatched: boo
     newly_found == 0 && !match_unmatched
 }
 
-
 pub(crate) async fn scan_library_inventory(
     state: &AppState,
     library_id: usize,
@@ -1593,6 +1682,21 @@ pub(crate) async fn scan_library_inventory(
             info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
         }
     }
+    if library.kind == "tv" {
+        let detection_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = detect_markers_for_library(
+                detection_state,
+                library_id + 1,
+                false,
+                markers::detection_threshold(None),
+            )
+            .await
+            {
+                warn!(%error, "automatic marker detection failed");
+            }
+        });
+    }
     Ok(scanned_count)
 }
 
@@ -1634,6 +1738,8 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             subtitle_language_primary: default_subtitle_language_primary(),
             subtitle_language_secondary: default_subtitle_language_secondary(),
             bilingual_subtitles_enabled: default_true(),
+            skip_intro_mode: default_skip_mode(),
+            skip_credits_mode: default_skip_mode(),
             plex_account_preferences: BTreeMap::new(),
         });
     }
@@ -1930,6 +2036,7 @@ fn open_database(
          CREATE UNIQUE INDEX IF NOT EXISTS collection_items_collection_media
              ON collection_items(collection_id, media_key);",
     )?;
+    markers::ensure_marker_schema(&connection)?;
 
     let _ = connection.execute(
         "ALTER TABLE server_identity ADD COLUMN plex_last_error TEXT",
@@ -2374,7 +2481,10 @@ async fn web_translation_progress(
         .lock()
         .is_ok_and(|config| config.bilingual_subtitles_enabled)
     {
-        return (StatusCode::FORBIDDEN, "Bilingual subtitles are disabled in Settings")
+        return (
+            StatusCode::FORBIDDEN,
+            "Bilingual subtitles are disabled in Settings",
+        )
             .into_response();
     }
     if request.first_language == request.second_language
@@ -2399,12 +2509,19 @@ async fn web_translation_progress(
     };
     let total = match request.total_cues {
         Some(total) if total <= 20_000 => total,
-        Some(_) => return (StatusCode::BAD_REQUEST, "Subtitle track contains too many cues").into_response(),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Subtitle track contains too many cues",
+            )
+                .into_response()
+        }
         None => {
-            let (contents, _, format) = match read_subtitle_source(&state, &media, request.stream_id).await {
-                Ok(source) => source,
-                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-            };
+            let (contents, _, format) =
+                match read_subtitle_source(&state, &media, request.stream_id).await {
+                    Ok(source) => source,
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                };
             match subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &format)) {
                 Ok(cues) => cues.len(),
                 Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
@@ -2426,14 +2543,16 @@ async fn web_translation_progress(
         "vtt",
     );
     let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
-    let finished = if subtitle_marker_source_matches(&final_path, request.source_key.as_deref()).await {
-        tokio::fs::read_to_string(&final_path).await.ok()
-    } else {
-        None
-    };
+    let finished =
+        if subtitle_marker_source_matches(&final_path, request.source_key.as_deref()).await {
+            tokio::fs::read_to_string(&final_path).await.ok()
+        } else {
+            None
+        };
     let staged = if let Some(contents) = finished.as_ref() {
         contents.clone()
-    } else if subtitle_marker_source_matches(&checkpoint_path, request.source_key.as_deref()).await {
+    } else if subtitle_marker_source_matches(&checkpoint_path, request.source_key.as_deref()).await
+    {
         tokio::fs::read_to_string(&checkpoint_path)
             .await
             .unwrap_or_default()
@@ -2483,7 +2602,10 @@ async fn web_translated_subtitle(
         .lock()
         .is_ok_and(|config| config.bilingual_subtitles_enabled)
     {
-        return (StatusCode::FORBIDDEN, "Bilingual subtitles are disabled in Settings")
+        return (
+            StatusCode::FORBIDDEN,
+            "Bilingual subtitles are disabled in Settings",
+        )
             .into_response();
     }
     if !request.prepared {
@@ -2536,7 +2658,10 @@ async fn web_translated_subtitle(
         }
     };
     let (contents, format) = if request.prepared {
-        (vtt_to_srt(&subtitle_to_vtt(&contents, &format)), "srt".to_owned())
+        (
+            vtt_to_srt(&subtitle_to_vtt(&contents, &format)),
+            "srt".to_owned(),
+        )
     } else {
         (contents, format)
     };
@@ -2556,7 +2681,10 @@ async fn web_translated_subtitle(
     );
     let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true) else {
         warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
-        return (StatusCode::CONFLICT, "This bilingual subtitle is already being prepared")
+        return (
+            StatusCode::CONFLICT,
+            "This bilingual subtitle is already being prepared",
+        )
             .into_response();
     };
     let translated = translate_subtitle_cached_cancellable(
@@ -2828,7 +2956,8 @@ async fn translate_subtitle_cached_with_progress(
         "srt" | "vtt" | "ass" => extension.to_ascii_lowercase(),
         _ => return Err("This subtitle format cannot be translated".to_owned()),
     };
-    let sidecar_path = configured_bilingual_subtitle_path(state, media, first, second, &output_extension);
+    let sidecar_path =
+        configured_bilingual_subtitle_path(state, media, first, second, &output_extension);
     let media_sidecar_path = bilingual_subtitle_path(media, first, second, &output_extension);
     if media_sidecar_path != sidecar_path
         && tokio::fs::metadata(&media_sidecar_path).await.is_ok()
@@ -2851,7 +2980,9 @@ async fn translate_subtitle_cached_with_progress(
             .is_err()
     {
         if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-            if let Ok(vtt) = subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &output_extension)) {
+            if let Ok(vtt) =
+                subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &output_extension))
+            {
                 if !vtt.is_empty() {
                     return Ok(subtitle_to_vtt(&contents, &output_extension));
                 }
@@ -2968,18 +3099,14 @@ async fn translate_subtitle_cached_with_progress(
         .await
     };
     let vtt = translated?;
-    if cancellation.as_ref().is_some_and(|token| {
-        token.load(std::sync::atomic::Ordering::Acquire)
-    }) {
+    if cancellation
+        .as_ref()
+        .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
+    {
         return Err("Bilingual translation stopped with playback".to_owned());
     }
-    finalize_bilingual_translation(
-        &sidecar_path,
-        &sidecar_part_path,
-        &vtt,
-        &output_extension,
-    )
-    .await?;
+    finalize_bilingual_translation(&sidecar_path, &sidecar_part_path, &vtt, &output_extension)
+        .await?;
     write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
     Ok(vtt)
 }
@@ -3045,7 +3172,6 @@ async fn save_bilingual_sidecar(
         .map_err(|_| "Could not finalize bilingual subtitle sidecar".to_owned())
 }
 
-
 async fn translated_subtitle_stream_response(
     state: &AppState,
     media: &Media,
@@ -3083,7 +3209,9 @@ where
     F: FnOnce(Arc<std::sync::atomic::AtomicBool>) -> Fut + Send + 'static,
     Fut: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Some(cancellation) = start_translation_job(job_key.clone(), media_id.to_owned(), explicit) {
+    if let Some(cancellation) =
+        start_translation_job(job_key.clone(), media_id.to_owned(), explicit)
+    {
         tokio::spawn(async move {
             background_job(cancellation).await;
             finish_translation_job(&job_key);
@@ -3092,11 +3220,11 @@ where
 
     if allow_final {
         if let Ok(contents) = tokio::fs::read_to_string(final_path).await {
-        let extension = final_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("srt");
-        return subtitle_to_vtt(&contents, extension);
+            let extension = final_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("srt");
+            return subtitle_to_vtt(&contents, extension);
         }
     }
     let mut preview = if allow_checkpoint {
@@ -3533,11 +3661,11 @@ async fn start_plex_auth(State(state): State<AppState>, headers: HeaderMap) -> R
         )
         .is_err()
         || connection
-        .execute(
-            "INSERT OR REPLACE INTO plex_auth (id, code, created_at) VALUES (?1, ?2, ?3)",
-            (pin.id, &pin.code, created_at),
-        )
-        .is_err()
+            .execute(
+                "INSERT OR REPLACE INTO plex_auth (id, code, created_at) VALUES (?1, ?2, ?3)",
+                (pin.id, &pin.code, created_at),
+            )
+            .is_err()
     {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -3863,13 +3991,8 @@ async fn claim_and_publish_plex_server(
     if let Some(error) = &tls_error {
         warn!(error = %error, "Plex TLS certificate unavailable; publishing the HTTP connection fallback");
     }
-    if let Err(error) = publish_plex_connections(
-        &client,
-        state,
-        &configured_server_name,
-        &server_token,
-    )
-    .await
+    if let Err(error) =
+        publish_plex_connections(&client, state, &configured_server_name, &server_token).await
     {
         return Ok((server_token, false, Some(error)));
     }
@@ -3990,14 +4113,10 @@ async fn verify_plex_resource(
         );
 
         let has_server = plex_resources_contain(&resources, state.machine_identifier.as_ref());
-        let has_local_https = plex_resources_contain_local_https(
-            &resources,
-            state.machine_identifier.as_ref(),
-        );
-        let has_local_connection = plex_resources_contain_local_connection(
-            &resources,
-            state.machine_identifier.as_ref(),
-        );
+        let has_local_https =
+            plex_resources_contain_local_https(&resources, state.machine_identifier.as_ref());
+        let has_local_connection =
+            plex_resources_contain_local_connection(&resources, state.machine_identifier.as_ref());
         if has_server && has_local_connection {
             if state.plex_tls.hash().is_some() && !has_local_https {
                 warn!(
@@ -4011,10 +4130,8 @@ async fn verify_plex_resource(
             return Ok(());
         }
         last_error = "Plex.tv did not publish a usable local Harbringer connection".to_owned();
-        last_resources = plex_resource_connection_summary(
-            &resources,
-            state.machine_identifier.as_ref(),
-        );
+        last_resources =
+            plex_resource_connection_summary(&resources, state.machine_identifier.as_ref());
         if attempt + 1 < ATTEMPTS {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -4307,7 +4424,6 @@ async fn publish_plex_device(
     Ok(())
 }
 
-
 fn plex_server_registration_url() -> &'static str {
     "https://plex.tv/servers.xml"
 }
@@ -4471,7 +4587,9 @@ fn plex_resources_contain_local_connection(
                             && connection
                                 .get("uri")
                                 .and_then(serde_json::Value::as_str)
-                                .is_some_and(|uri| uri.starts_with("http://") || uri.starts_with("https://"))
+                                .is_some_and(|uri| {
+                                    uri.starts_with("http://") || uri.starts_with("https://")
+                                })
                     })
                 })
     })
@@ -4509,7 +4627,8 @@ fn plex_publish_urls(
     port: u16,
     plex_direct_hash: Option<&str>,
 ) -> Vec<String> {
-    let mut urls = Vec::with_capacity(addresses.len() * if plex_direct_hash.is_some() { 2 } else { 1 });
+    let mut urls =
+        Vec::with_capacity(addresses.len() * if plex_direct_hash.is_some() { 2 } else { 1 });
     for address in addresses {
         urls.push(format!("http://{address}:{port}"));
         if let (Some(hash), std::net::IpAddr::V4(address)) = (plex_direct_hash, address) {
@@ -4600,11 +4719,50 @@ async fn save_translation_settings(
     Redirect::to("/settings#subtitle-settings").into_response()
 }
 
+#[derive(Deserialize)]
+struct SkipSettingsForm {
+    skip_intro_mode: String,
+    skip_credits_mode: String,
+}
+
+async fn save_skip_settings(
+    State(state): State<AppState>,
+    Form(form): Form<SkipSettingsForm>,
+) -> Response {
+    let (Some(skip_intro_mode), Some(skip_credits_mode)) = (
+        parse_skip_mode(&form.skip_intro_mode),
+        parse_skip_mode(&form.skip_credits_mode),
+    ) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Choose Automatic, Manual, or Off for both skip settings",
+        )
+            .into_response();
+    };
+    let Ok(mut config) = state.config.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    config.skip_intro_mode = skip_intro_mode;
+    config.skip_credits_mode = skip_credits_mode;
+    if save_config(&state.config_path, &config).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    Redirect::to("/settings#skip-settings").into_response()
+}
+
 async fn settings_page(
     State(state): State<AppState>,
     Query(query): Query<SettingsQuery>,
 ) -> Response {
-    let (libraries, tmdb_token_saved, bilingual_enabled, subtitle_language_primary, subtitle_language_secondary) = {
+    let (
+        libraries,
+        tmdb_token_saved,
+        bilingual_enabled,
+        subtitle_language_primary,
+        subtitle_language_secondary,
+        skip_intro_mode,
+        skip_credits_mode,
+    ) = {
         let Ok(config) = state.config.lock() else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
@@ -4640,6 +4798,8 @@ async fn settings_page(
             config.bilingual_subtitles_enabled,
             config.subtitle_language_primary.clone(),
             config.subtitle_language_secondary.clone(),
+            config.skip_intro_mode,
+            config.skip_credits_mode,
         )
     };
     let list = libraries
@@ -4721,6 +4881,11 @@ async fn settings_page(
         if bilingual_enabled { " checked" } else { "" },
         translation_language_options(&subtitle_language_primary),
         translation_language_options(&subtitle_language_secondary),
+    );
+    let skip_settings = format!(
+        r#"<details class="settings-card settings-section" id="skip-settings"><summary class="settings-section-summary"><span><strong>Intro and credits skipping</strong><small>Choose how Harbringer's player reacts to detected markers.</small></span></summary><form method="post" action="/settings/skipping" class="settings-form settings-section-content"><p class="note">Automatic seeks to two seconds before a marker ends. Manual shows a Skip Intro or Skip Credits button while playback is inside the marker. Off hides skip controls and disables automatic skipping.</p><div class="form-grid"><label class="field"><span>Intro skipping</span><select name="skip_intro_mode">{}</select></label><label class="field"><span>Credits skipping</span><select name="skip_credits_mode">{}</select></label></div><div><button type="submit">Save skipping settings</button></div></form></details>"#,
+        skip_mode_options(skip_intro_mode),
+        skip_mode_options(skip_credits_mode),
     );
     let error = query
         .error
@@ -5010,7 +5175,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbringer to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbringer.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata and artwork are written only to the selected location.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
-{}
+{}{}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
 </div>{}
@@ -5173,6 +5338,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
         if config_selected { "" } else { "(current)" },
         tmdb_token_status,
         subtitle_settings,
+        skip_settings,
         html(query.folder.as_deref().unwrap_or("")),
         if list.is_empty() { "<p class=\"empty-state\">No libraries yet. Add a library to start organizing your media.</p>".to_owned() } else { list },
         logs_content
@@ -5228,7 +5394,9 @@ async fn update_preferences(
             Ok(count) => Some(count),
             Err(error) => {
                 warn!(%error, "metadata storage copy failed");
-                return settings_error("Storage changed, but some existing metadata could not be copied");
+                return settings_error(
+                    "Storage changed, but some existing metadata could not be copied",
+                );
             }
         }
     } else {
@@ -5239,9 +5407,7 @@ async fn update_preferences(
         None if new_storage != previous_storage => {
             "/settings?metadata_status=Storage%20location%20changed".to_owned()
         }
-        None if token_saved => {
-            "/settings?metadata_status=TMDB%20token%20accepted".to_owned()
-        }
+        None if token_saved => "/settings?metadata_status=TMDB%20token%20accepted".to_owned(),
         _ => "/settings?metadata_status=TMDB%20token%20cleared".to_owned(),
     };
     Redirect::to(&location).into_response()
@@ -5336,7 +5502,6 @@ fn copy_sidecar_tree(
     }
     Ok(copied)
 }
-
 
 async fn update_server_name(
     State(state): State<AppState>,
@@ -5532,7 +5697,6 @@ async fn scan_library_metadata(
                                 "Could not migrate matched metadata to the JSON sidecar",
                             );
                         }
-
                     } else {
                         for media in &group {
                             let key = database_media_key(library_id + 1, &media.id);
@@ -5818,13 +5982,13 @@ async fn refresh_matched_metadata(
 ) -> Result<(), String> {
     let media_key = database_media_key(library_id + 1, &group[0].id);
     let metadata = read_metadata_sidecar(state, &media_key, group_path)
-    .filter(|metadata| {
-        metadata
-            .get("id")
-            .and_then(serde_json::Value::as_i64)
-            .is_some()
-    })
-    .ok_or_else(|| "Refresh requires an existing metadata match".to_owned())?;
+        .filter(|metadata| {
+            metadata
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .is_some()
+        })
+        .ok_or_else(|| "Refresh requires an existing metadata match".to_owned())?;
     let token =
         token.ok_or_else(|| "Add a TMDB bearer token before refreshing metadata".to_owned())?;
     let details = if kind == "tv" {
@@ -6322,7 +6486,6 @@ fn metadata_group_path(root: &PathBuf, media: &std::path::Path, kind: &str) -> P
     }
 }
 
-
 fn tv_episode_show_directory(root: &PathBuf, media_path: &std::path::Path) -> Option<PathBuf> {
     tv_episode_info(root, media_path)?;
     let relative = media_path.strip_prefix(root).ok()?;
@@ -6405,19 +6568,13 @@ fn read_metadata_sidecar(
         .lock()
         .is_ok_and(|config| config.metadata_storage == "config");
     if config_mode {
-        read_config_metadata(state, media_key)
-            .or_else(|| read_sidecar_metadata(group_path))
+        read_config_metadata(state, media_key).or_else(|| read_sidecar_metadata(group_path))
     } else {
-        read_sidecar_metadata(group_path)
-            .or_else(|| read_config_metadata(state, media_key))
+        read_sidecar_metadata(group_path).or_else(|| read_config_metadata(state, media_key))
     }
 }
 
-fn write_config_metadata(
-    state: &AppState,
-    media_key: &str,
-    metadata: &serde_json::Value,
-) -> bool {
+fn write_config_metadata(state: &AppState, media_key: &str, metadata: &serde_json::Value) -> bool {
     let path = config_metadata_sidecar_path(state, media_key);
     let Some(directory) = path.parent() else {
         return false;
@@ -6452,7 +6609,6 @@ fn write_config_metadata(
         .is_some_and(|contents| std::fs::write(path, contents).is_ok())
 }
 
-
 fn migrate_legacy_database_metadata(state: &AppState) {
     if !state
         .config
@@ -6469,7 +6625,10 @@ fn migrate_legacy_database_metadata(state: &AppState) {
         let mut keys = HashMap::new();
         for (library_index, library) in config.libraries.iter().enumerate() {
             let section = library_index + 1;
-            for media in media_index.iter().filter(|media| media_in_library(media, library)) {
+            for media in media_index
+                .iter()
+                .filter(|media| media_in_library(media, library))
+            {
                 let media_key = database_media_key(section, &media.id);
                 keys.insert(
                     (section, media.path.to_string_lossy().into_owned()),
@@ -6525,7 +6684,6 @@ fn migrate_legacy_database_metadata(state: &AppState) {
         }
     }
 }
-
 
 fn metadata_group_title(group: &std::path::Path, root: &PathBuf) -> String {
     if group.is_file() {
@@ -6782,6 +6940,20 @@ fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeI
         episode_end: episode.1,
         episode_title: clean_episode_title(&stem[marker_end..]),
     })
+}
+
+fn media_has_season_directory(root: &PathBuf, media: &std::path::Path) -> bool {
+    let Ok(relative) = media.strip_prefix(root) else {
+        return false;
+    };
+    let components = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .collect::<Vec<_>>();
+    components
+        .iter()
+        .take(components.len().saturating_sub(1))
+        .any(|name| parse_tv_season_directory(name).is_some())
 }
 
 fn tv_season_number(root: &PathBuf, media_path: &std::path::Path) -> Option<u32> {
@@ -7430,12 +7602,8 @@ async fn add_plex_technical_metadata(
             .lock()
             .is_ok_and(|config| config.metadata_storage == "media")
         {
-            let _ = ensure_merged_bilingual_sidecar(
-                media,
-                &language_primary,
-                &language_secondary,
-            )
-            .await;
+            let _ = ensure_merged_bilingual_sidecar(media, &language_primary, &language_secondary)
+                .await;
         }
         external_subtitle_files(&media.path).await
     } else {
@@ -8276,7 +8444,6 @@ async fn ensure_tv_season_metadata(
     Ok(())
 }
 
-
 fn settings_error(message: &str) -> Response {
     let location = format!("/settings?error={}", url_encode(message));
     Redirect::to(&location).into_response()
@@ -8863,7 +9030,6 @@ struct WebPath {
     season: Option<u32>,
 }
 
-
 fn selected_library_folder_root(
     state: &AppState,
     library: Option<usize>,
@@ -9231,7 +9397,13 @@ fn cover_artwork_markup(url: &str, label: &str) -> String {
 }
 
 async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>) -> Response {
-    let (bilingual_enabled, language_primary, language_secondary) = s
+    let (
+        bilingual_enabled,
+        language_primary,
+        language_secondary,
+        skip_intro_mode,
+        skip_credits_mode,
+    ) = s
         .config
         .lock()
         .ok()
@@ -9240,9 +9412,17 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 config.bilingual_subtitles_enabled,
                 config.subtitle_language_primary.clone(),
                 config.subtitle_language_secondary.clone(),
+                config.skip_intro_mode.as_str().to_owned(),
+                config.skip_credits_mode.as_str().to_owned(),
             )
         })
-        .unwrap_or((false, "en".to_owned(), "vi".to_owned()));
+        .unwrap_or((
+            false,
+            "en".to_owned(),
+            "vi".to_owned(),
+            default_skip_mode().as_str().to_owned(),
+            default_skip_mode().as_str().to_owned(),
+        ));
     if query.library.is_none() {
         query.library = s
             .config
@@ -9322,10 +9502,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                             library_kind.as_deref().unwrap_or("movie"),
                         );
                         if group_path.is_file() {
-                            group_path
-                                .parent()
-                                .unwrap_or(&group_path)
-                                .to_path_buf()
+                            group_path.parent().unwrap_or(&group_path).to_path_buf()
                         } else {
                             group_path
                         }
@@ -9410,11 +9587,10 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                         .parent()
                         .map(|directory| directory.join("cover.jpg"))
                 });
-            let media_cover_exists = tokio::fs::metadata(
-                show_metadata_directory.join(".hbgr/cover.jpg"),
-            )
-            .await
-            .is_ok();
+            let media_cover_exists =
+                tokio::fs::metadata(show_metadata_directory.join(".hbgr/cover.jpg"))
+                    .await
+                    .is_ok();
             let config_cover_exists = if let Some(path) = config_cover {
                 tokio::fs::metadata(path).await.is_ok()
             } else {
@@ -9515,8 +9691,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                                 .iter()
                                 .find(|folder| media.path.starts_with(folder))?;
                             let key = database_media_key(library_id, &media.id);
-                            let group_path =
-                                metadata_group_path(root, &media.path, &library.kind);
+                            let group_path = metadata_group_path(root, &media.path, &library.kind);
                             read_metadata_sidecar(&s, &key, &group_path)
                         })
                         .and_then(|metadata| {
@@ -10042,6 +10217,15 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 .and_then(|metadata| metadata.get("name"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(&name);
+            let marker_json = matched_media
+                .as_ref()
+                .and_then(|media| {
+                    s.db.lock()
+                        .ok()
+                        .and_then(|db| markers::markers_for_media(&db, &media.id).ok())
+                })
+                .and_then(|markers| serde_json::to_string(&markers).ok())
+                .unwrap_or_else(|| "[]".to_owned());
             items.push_str(&web_client_item(
                 player_title,
                 &child_relative.to_string_lossy(),
@@ -10054,6 +10238,9 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
                 bilingual_enabled,
                 &language_primary,
                 &language_secondary,
+                &marker_json,
+                &skip_intro_mode,
+                &skip_credits_mode,
             ));
         } else {
             items.push_str(&file_item(&name));
@@ -10129,7 +10316,13 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     article, .folder-card {{ width: 100%; box-sizing: border-box; }}
     article {{ grid-column: span 4; min-width: 0; }}
     article {{ overflow: hidden; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; }}
+    .player-stage {{ position: relative; }}
     video {{ display: block; width: 100%; aspect-ratio: 16 / 9; margin: 0 auto; background: #000; }}
+    .skip-controls {{ position: absolute; right: .9rem; bottom: 4.2rem; z-index: 3; display: flex; gap: .5rem; }}
+    .skip-controls button[hidden] {{ display: none; }}
+    .skip-controls button {{ padding: .55rem .8rem; border: 1px solid rgba(255,255,255,.3); border-radius: .45rem; color: #f9fafb; background: rgba(17,24,39,.88); font: inherit; font-weight: 700; cursor: pointer; }}
+    .skip-controls button:hover, .skip-controls button:focus-visible {{ border-color: #93c5fd; background: #1d4ed8; }}
+    body.theatre-mode .theatre-card .skip-controls {{ bottom: 5rem; }}
     .details {{ padding: .9rem 1rem 1rem; }}
     h2 {{ font-size: 1rem; margin: 0 0 .4rem; overflow-wrap: anywhere; }}
     .play-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .7rem 0; }}
@@ -10222,37 +10415,60 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
         }}
       }});
     }}
-    function renderTechnicalInfo(value) {{
-      infoContent.replaceChildren();
-      const add = (parent, key, item) => {{
-        if (item && typeof item === "object") {{
-          if (Array.isArray(item)) item.forEach((entry, index) => add(parent, `${{key}} ${{index + 1}}`, entry));
-          else Object.entries(item).forEach(([childKey, childValue]) => add(parent, key ? `${{key}} / ${{childKey}}` : childKey, childValue));
-          return;
-        }}
-        const row = document.createElement("div");
-        row.className = "info-row";
-        const label = document.createElement("span");
-        label.className = "info-key";
-        label.textContent = key.replaceAll("_", " ");
-        const content = document.createElement("span");
-        content.className = "info-value";
-        content.textContent = String(item ?? "");
-        row.append(label, content);
-        parent.append(row);
-      }};
-      add(infoContent, "", value);
+    function addInfoRow(parent, key, item) {{
+      if (item && typeof item === "object") {{
+        if (Array.isArray(item)) item.forEach((entry, index) => addInfoRow(parent, `${{key}} ${{index + 1}}`, entry));
+        else Object.entries(item).forEach(([childKey, childValue]) => addInfoRow(parent, key ? `${{key}} / ${{childKey}}` : childKey, childValue));
+        return;
+      }}
+      const row = document.createElement("div");
+      row.className = "info-row";
+      const label = document.createElement("span");
+      label.className = "info-key";
+      label.textContent = key.replaceAll("_", " ");
+      const content = document.createElement("span");
+      content.className = "info-value";
+      content.textContent = String(item ?? "");
+      row.append(label, content);
+      parent.append(row);
+      return row;
+    }}
+    function renderTechnicalInfo(value, append = false) {{
+      if (!append) infoContent.replaceChildren();
+      addInfoRow(infoContent, "", value);
+    }}
+    function formatMarkerTime(value) {{
+      const seconds = Math.max(0, Math.round(Number(value) / 1000));
+      return `${{Math.floor(seconds / 60)}}:${{String(seconds % 60).padStart(2, "0")}}`;
+    }}
+    function renderMarkerInfo(button) {{
+      let markers = [];
+      try {{ markers = JSON.parse(button.dataset.skipMarkers || "[]"); }} catch (_) {{ markers = []; }}
+      if (!Array.isArray(markers) || markers.length === 0) {{
+        addInfoRow(infoContent, "Markers", "None detected");
+        return;
+      }}
+      markers.forEach(marker => {{
+        const kind = marker && (marker.type === "credits" || marker.type === "credit") ? "Credits" : "Introduction";
+        addInfoRow(infoContent, kind, `${{formatMarkerTime(marker.startTimeOffset)}}–${{formatMarkerTime(marker.endTimeOffset)}}`);
+      }});
     }}
     document.querySelectorAll(".info-button").forEach(button => {{
       button.addEventListener("click", async () => {{
-        infoContent.textContent = "Loading…";
+        infoContent.replaceChildren();
+        renderMarkerInfo(button);
+        const loadingRow = addInfoRow(infoContent, "Technical details", "Loading…");
         infoModal.showModal();
         try {{
           const response = await fetch(button.dataset.infoUrl, {{ cache: "no-store" }});
-          if (response.ok) renderTechnicalInfo(await response.json());
-          else infoContent.textContent = "No cached technical analysis found. Run Scan metadata or Force rescan in Settings.";
+          if (response.ok) {{
+            loadingRow.remove();
+            renderTechnicalInfo(await response.json(), true);
+          }} else {{
+            loadingRow.querySelector(".info-value").textContent = "No cached technical analysis found. Run Scan metadata or Force rescan in Settings.";
+          }}
         }} catch (_) {{
-          infoContent.textContent = "Media analysis could not be loaded.";
+          loadingRow.querySelector(".info-value").textContent = "Media analysis could not be loaded.";
         }}
       }});
     }});
@@ -10282,6 +10498,56 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
       const path = video.dataset.progressPath;
       const library = video.dataset.library;
       const folder = video.dataset.folder;
+      let skipMarkers = [];
+      try {{ skipMarkers = JSON.parse(video.dataset.skipMarkers || "[]"); }} catch (_) {{ skipMarkers = []; }}
+      if (!Array.isArray(skipMarkers)) skipMarkers = [];
+      const skipModes = {{ intro: video.dataset.skipIntroMode || "manual", credits: video.dataset.skipCreditsMode || "manual" }};
+      const skipHandled = new Set();
+      const skipButtons = [...(video.closest("article")?.querySelectorAll(".skip-controls button") || [])];
+      const markerKind = marker => marker && (marker.type === "credits" || marker.type === "credit") ? "credits" : "intro";
+      const markerTarget = marker => Math.max(0, (Number(marker.endTimeOffset) / 1000) - 2);
+      const setSkipButton = (kind, visible) => {{
+        const button = skipButtons.find(candidate => candidate.dataset.skipKind === kind);
+        if (button) button.hidden = !visible;
+      }};
+      const syncSkipMarkers = (allowAutomatic = !video.paused) => {{
+        const current = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+        let visibleIntro = false;
+        let visibleCredits = false;
+        skipMarkers.forEach((marker, index) => {{
+          const kind = markerKind(marker);
+          const start = Number(marker.startTimeOffset) / 1000;
+          const end = Number(marker.endTimeOffset) / 1000;
+          if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return;
+          const key = String(marker.id ?? index);
+          const inside = current >= start && current < end;
+          const mode = skipModes[kind];
+          if (inside && mode === "automatic" && allowAutomatic && !skipHandled.has(key)) {{
+            skipHandled.add(key);
+            const target = Math.max(start, markerTarget(marker));
+            if (Math.abs(video.currentTime - target) > 0.1) video.currentTime = target;
+            return;
+          }}
+          if (inside && mode === "manual" && !skipHandled.has(key)) {{
+            if (kind === "intro") visibleIntro = true;
+            else visibleCredits = true;
+          }}
+        }});
+        setSkipButton("intro", visibleIntro);
+        setSkipButton("credits", visibleCredits);
+      }};
+      skipButtons.forEach(button => button.addEventListener("click", () => {{
+        const kind = button.dataset.skipKind;
+        const marker = skipMarkers.find(candidate => markerKind(candidate) === kind
+          && Number(candidate.startTimeOffset) / 1000 <= video.currentTime
+          && Number(candidate.endTimeOffset) / 1000 >= video.currentTime);
+        if (!marker) return;
+        skipHandled.add(String(marker.id ?? skipMarkers.indexOf(marker)));
+        video.currentTime = Math.max(Number(marker.startTimeOffset) / 1000, markerTarget(marker));
+        button.hidden = true;
+      }}));
+      video.addEventListener("loadedmetadata", () => syncSkipMarkers(false));
+      video.addEventListener("play", () => syncSkipMarkers(true));
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
       let activeStreamingSourceKey = null;
       let activeStreamingSourceName = null;
@@ -10615,7 +10881,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
           if (!video.paused) sendProgress(false);
         }}, delay);
       }};
-      video.addEventListener("timeupdate", () => {{ if (!video.paused) save(false); }});
+      video.addEventListener("timeupdate", () => {{ syncSkipMarkers(); if (!video.paused) save(false); }});
       video.addEventListener("pause", () => save(false));
       const translationStopRequest = JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null }});
       const cancelStreamingTranslation = () => fetch("/web/translation-stop", {{
@@ -10865,7 +11131,6 @@ async fn read_subtitle_source(
     Ok((contents, language, "srt".to_owned()))
 }
 
-
 fn extract_matroska_subtitle(
     video: &std::path::Path,
     container_track_id: Option<u64>,
@@ -10998,7 +11263,8 @@ fn extract_mp4_mov_text_subtitle(
     video: &std::path::Path,
     container_track_id: Option<u64>,
 ) -> Result<String, String> {
-    let file = std::fs::File::open(video).map_err(|_| "Media file could not be opened".to_owned())?;
+    let file =
+        std::fs::File::open(video).map_err(|_| "Media file could not be opened".to_owned())?;
     let size = file
         .metadata()
         .map_err(|_| "Media file size could not be read".to_owned())?
@@ -11246,7 +11512,6 @@ fn bilingual_subtitle_path(media: &Media, first: &str, second: &str, extension: 
         ))
 }
 
-
 fn configured_bilingual_subtitle_path(
     state: &AppState,
     media: &Media,
@@ -11277,7 +11542,10 @@ fn merged_bilingual_subtitle_path(
     extension: &str,
 ) -> PathBuf {
     let path = bilingual_subtitle_path(media, first, second, extension);
-    let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("subtitle");
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("subtitle");
     path.with_file_name(format!("{stem}.merge.{extension}"))
 }
 
@@ -11313,12 +11581,8 @@ async fn ensure_merged_bilingual_sidecar(
     } else {
         "srt"
     };
-    let output_path = merged_bilingual_subtitle_path(
-        media,
-        first_language,
-        second_language,
-        output_extension,
-    );
+    let output_path =
+        merged_bilingual_subtitle_path(media, first_language, second_language, output_extension);
     if tokio::fs::metadata(&output_path).await.is_ok() {
         return Ok(Some(output_path));
     }
@@ -11328,8 +11592,10 @@ async fn ensure_merged_bilingual_sidecar(
     let second_contents = tokio::fs::read_to_string(second_path)
         .await
         .map_err(|_| "Could not read the second subtitle track for merging".to_owned())?;
-    let first_cues = subtitles::parse_subtitles(&subtitle_to_vtt(&first_contents, &first_extension))?;
-    let second_cues = subtitles::parse_subtitles(&subtitle_to_vtt(&second_contents, &second_extension))?;
+    let first_cues =
+        subtitles::parse_subtitles(&subtitle_to_vtt(&first_contents, &first_extension))?;
+    let second_cues =
+        subtitles::parse_subtitles(&subtitle_to_vtt(&second_contents, &second_extension))?;
     let merged = merge_subtitle_cues(&first_cues, &second_cues)?;
     save_bilingual_sidecar(&output_path, &merged, output_extension).await?;
     Ok(Some(output_path))
@@ -11362,18 +11628,41 @@ fn merge_subtitle_cues(
                 let close = (start - other_start).abs() <= 1_500
                     && start <= other_end
                     && other_start <= end;
-                close.then_some((index, candidate, other_start, other_end, (start - other_start).abs()))
+                close.then_some((
+                    index,
+                    candidate,
+                    other_start,
+                    other_end,
+                    (start - other_start).abs(),
+                ))
             })
             .min_by_key(|(_, _, _, _, distance)| *distance);
-        let (start_text, end_text, text) = if let Some((index, other, other_start, other_end, _)) = candidate {
-            used_second[index] = true;
-            let merged_start = if start <= other_start { &cue.start } else { &other.start };
-            let merged_end = if end >= other_end { &cue.end } else { &other.end };
-            (merged_start.clone(), merged_end.clone(), format!("{}\n{}", cue.text, other.text))
-        } else {
-            (cue.start.clone(), cue.end.clone(), cue.text.clone())
-        };
-        merged.push(subtitles::Cue { start: start_text, end: end_text, text });
+        let (start_text, end_text, text) =
+            if let Some((index, other, other_start, other_end, _)) = candidate {
+                used_second[index] = true;
+                let merged_start = if start <= other_start {
+                    &cue.start
+                } else {
+                    &other.start
+                };
+                let merged_end = if end >= other_end {
+                    &cue.end
+                } else {
+                    &other.end
+                };
+                (
+                    merged_start.clone(),
+                    merged_end.clone(),
+                    format!("{}\n{}", cue.text, other.text),
+                )
+            } else {
+                (cue.start.clone(), cue.end.clone(), cue.text.clone())
+            };
+        merged.push(subtitles::Cue {
+            start: start_text,
+            end: end_text,
+            text,
+        });
     }
     for (index, cue) in second.iter().enumerate() {
         if !used_second[index] {
@@ -11383,7 +11672,12 @@ fn merge_subtitle_cues(
     merged.sort_by_key(|cue| subtitle_time_ms(&cue.start).unwrap_or_default());
     let mut vtt = String::from("WEBVTT\n\n");
     for cue in merged {
-        vtt.push_str(&format!("{} --> {}\n{}\n\n", cue.start.replace(',', "."), cue.end.replace(',', "."), cue.text));
+        vtt.push_str(&format!(
+            "{} --> {}\n{}\n\n",
+            cue.start.replace(',', "."),
+            cue.end.replace(',', "."),
+            cue.text
+        ));
     }
     Ok(vtt)
 }
@@ -11393,12 +11687,27 @@ fn subtitle_time_ms(value: &str) -> Option<i64> {
     let parts = value.split(':').collect::<Vec<_>>();
     let (hours, minutes, seconds) = match parts.as_slice() {
         [minutes, seconds] => (0i64, minutes.parse::<i64>().ok()?, *seconds),
-        [hours, minutes, seconds] => (hours.parse::<i64>().ok()?, minutes.parse::<i64>().ok()?, *seconds),
+        [hours, minutes, seconds] => (
+            hours.parse::<i64>().ok()?,
+            minutes.parse::<i64>().ok()?,
+            *seconds,
+        ),
         _ => return None,
     };
     let (seconds, millis) = seconds.replace(',', ".").split_once('.').map_or_else(
         || Some((seconds.parse::<i64>().ok()?, 0i64)),
-        |(seconds, millis)| Some((seconds.parse::<i64>().ok()?, millis.chars().take(3).collect::<String>().parse::<i64>().ok()? * 10i64.pow(3u32.saturating_sub(millis.len().min(3) as u32)))),
+        |(seconds, millis)| {
+            Some((
+                seconds.parse::<i64>().ok()?,
+                millis
+                    .chars()
+                    .take(3)
+                    .collect::<String>()
+                    .parse::<i64>()
+                    .ok()?
+                    * 10i64.pow(3u32.saturating_sub(millis.len().min(3) as u32)),
+            ))
+        },
     )?;
     Some(((hours * 60 + minutes) * 60 + seconds) * 1000 + millis)
 }
@@ -11506,8 +11815,12 @@ async fn subtitle_tracks(
     let mut tracks = Vec::new();
     let library_query = format!(
         "{}{}",
-        library.map(|index| format!("library={index}&")).unwrap_or_default(),
-        folder.map(|index| format!("folder={index}&")).unwrap_or_default()
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        folder
+            .map(|index| format!("folder={index}&"))
+            .unwrap_or_default()
     );
     let languages = state.config.lock().ok().and_then(|config| {
         config.bilingual_subtitles_enabled.then(|| {
@@ -11691,10 +12004,7 @@ async fn media_info_panel(
     }
     stored_metadata
         .map(|metadata| {
-            metadata_panel_with_cover(
-                render_metadata_info_panel(metadata, None),
-                cover_artwork,
-            )
+            metadata_panel_with_cover(render_metadata_info_panel(metadata, None), cover_artwork)
         })
         .unwrap_or_default()
 }
@@ -11811,12 +12121,7 @@ fn render_metadata_info_panel(
         show_description
     };
     let description = description
-        .map(|value| {
-            format!(
-                r#"<p class="metadata-description">{}</p>"#,
-                html(value)
-            )
-        })
+        .map(|value| format!(r#"<p class="metadata-description">{}</p>"#, html(value)))
         .unwrap_or_default();
     let mut details = Vec::new();
     if let Some(episode) = episode {
@@ -12092,7 +12397,11 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
     let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(kind) = query.kind.as_deref().filter(|kind| matches!(*kind, "cover" | "banner")) else {
+    let Some(kind) = query
+        .kind
+        .as_deref()
+        .filter(|kind| matches!(*kind, "cover" | "banner"))
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if contains_hidden_component(&relative) {
@@ -12104,7 +12413,11 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
     let library_index = query.library.unwrap_or_default();
-    let library = s.config.lock().ok().and_then(|config| config.libraries.get(library_index).cloned());
+    let library = s
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(library_index).cloned());
     let Some(library) = library else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -12113,17 +12426,15 @@ async fn web_artwork(State(s): State<AppState>, Query(query): Query<WebPath>) ->
         .iter()
         .filter(|media| media_in_library(media, &library))
         .filter(|media| {
-            let group_directory = tv_episode_show_directory(&root, &media.path).unwrap_or_else(|| {
-                let group_path = metadata_group_path(&root, &media.path, &library.kind);
-                if group_path.is_file() {
-                    group_path
-                        .parent()
-                        .unwrap_or(&group_path)
-                        .to_path_buf()
-                } else {
-                    group_path
-                }
-            });
+            let group_directory =
+                tv_episode_show_directory(&root, &media.path).unwrap_or_else(|| {
+                    let group_path = metadata_group_path(&root, &media.path, &library.kind);
+                    if group_path.is_file() {
+                        group_path.parent().unwrap_or(&group_path).to_path_buf()
+                    } else {
+                        group_path
+                    }
+                });
             group_directory == directory
         })
         .collect::<Vec<_>>();
@@ -12335,6 +12646,9 @@ fn web_client_item(
     bilingual_enabled: bool,
     language_primary: &str,
     language_secondary: &str,
+    marker_json: &str,
+    skip_intro_mode: &str,
+    skip_credits_mode: &str,
 ) -> String {
     let stream_path = url_encode(relative);
     let library_query = format!(
@@ -12413,13 +12727,16 @@ fn web_client_item(
         .unwrap_or_default();
     format!(
         r#"<article>
-  <video controls preload="auto" data-library="{}" data-folder="{}" data-progress-path="{}"{} src="/web/stream?{}path={}" type="{}">
-    {}
-    Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
-  </video>
+  <div class="player-stage">
+    <video controls preload="auto" data-library="{}" data-folder="{}" data-progress-path="{}" data-skip-markers="{}" data-skip-intro-mode="{}" data-skip-credits-mode="{}"{} src="/web/stream?{}path={}" type="{}">
+      {}
+      Your browser does not support HTML video. <a href="/web/stream?{}path={}">Open the stream</a>.
+    </video>
+    <div class="skip-controls" role="group" aria-label="Skip controls"><button type="button" class="skip-intro-button" data-skip-kind="intro" title="Skip to two seconds before the intro ends" aria-label="Skip intro" hidden>Skip Intro</button><button type="button" class="skip-credits-button" data-skip-kind="credits" title="Skip to two seconds before the credits end" aria-label="Skip credits" hidden>Skip Credits</button></div>
+  </div>
   <div class="details">
     <h2>{}</h2>
-    <div class="play-actions"><button type="button" class="resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button><button type="button" class="start-button" title="Play from beginning" aria-label="Play from beginning">▶ Play from beginning</button><button type="button" class="theatre-button" title="Theatre mode" aria-label="Theatre mode">▣ Theatre</button><button type="button" class="info-button" data-info-url="{}" title="Show media information" aria-label="Show media information">ⓘ Info</button>{}</div>{}
+    <div class="play-actions"><button type="button" class="resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button><button type="button" class="start-button" title="Play from beginning" aria-label="Play from beginning">▶ Play from beginning</button><button type="button" class="theatre-button" title="Theatre mode" aria-label="Theatre mode">▣ Theatre</button><button type="button" class="info-button" data-info-url="{}" data-skip-markers="{}" title="Show media information" aria-label="Show media information">ⓘ Info</button>{}</div>{}
     <form class="match-form" method="post" action="/settings/media/scan"><input type="hidden" name="path" value="{}"><input type="hidden" name="library" value="{}"><input name="title" value="{}" aria-label="Metadata match title"><button type="submit">↻ Match metadata</button></form>
     <a href="/web/stream?{}path={}">Open stream</a>
   </div>
@@ -12427,6 +12744,9 @@ fn web_client_item(
         library.map(|index| index.to_string()).unwrap_or_default(),
         folder.map(|index| index.to_string()).unwrap_or_default(),
         html(relative),
+        html(marker_json),
+        html(skip_intro_mode),
+        html(skip_credits_mode),
         poster,
         library_query,
         stream_path,
@@ -12436,6 +12756,7 @@ fn web_client_item(
         url_encode(relative),
         html(name),
         html(&info_url),
+        html(&marker_json),
         subtitle_selector,
         translation_controls,
         html(relative),
@@ -15083,23 +15404,56 @@ struct AdminLoginForm {
 }
 
 fn web_admin_exists(state: &AppState) -> bool {
-    state.db.lock().ok().and_then(|db| {
-        db.query_row("SELECT EXISTS(SELECT 1 FROM web_admin WHERE id = 1)", [], |row| row.get::<_, bool>(0)).ok()
-    }).unwrap_or(false)
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM web_admin WHERE id = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(false)
 }
 
 fn web_session_valid(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
-        .and_then(|cookie| cookie.split(';').find_map(|part| part.trim().strip_prefix("harbringer_session="))) else { return false; };
+    let Some(token) = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookie| {
+            cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("harbringer_session="))
+        })
+    else {
+        return false;
+    };
     let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
-    state.db.lock().ok().and_then(|db| db.query_row(
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
         "SELECT EXISTS(SELECT 1 FROM web_sessions WHERE token_hash = ?1 AND expires_at > ?2)",
         (&token_hash, now), |row| row.get::<_, bool>(0)
-    ).ok()).unwrap_or(false)
+    ).ok()
+        })
+        .unwrap_or(false)
 }
 
-async fn web_auth_gate(State(state): State<AppState>, request: Request<Body>, next: Next) -> Response {
+async fn web_auth_gate(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
     if matches!(
         request.extensions().get::<ListenerSurface>(),
         Some(ListenerSurface::Plex)
@@ -15113,8 +15467,11 @@ async fn web_auth_gate(State(state): State<AppState>, request: Request<Body>, ne
         || plex_query_value(request.uri(), "X-Plex-Product").is_some()
         || plex_query_value(request.uri(), "X-Plex-Client-Identifier").is_some()
         || plex_query_value(request.uri(), "X-Plex-Token").is_some();
-    let web_page = path == "/" || path == "/web" || path.starts_with("/web/")
-        || path == "/settings" || path.starts_with("/settings/");
+    let web_page = path == "/"
+        || path == "/web"
+        || path.starts_with("/web/")
+        || path == "/settings"
+        || path.starts_with("/settings/");
     if !web_page || (path == "/" && plex_client) || path.starts_with("/auth") {
         return next.run(request).await;
     }
@@ -15127,27 +15484,63 @@ async fn web_auth_gate(State(state): State<AppState>, request: Request<Body>, ne
 async fn auth_page(State(state): State<AppState>) -> Response {
     let setup = !web_admin_exists(&state);
     let (title, description, button) = if setup {
-        ("Create administrator login", "Set a password for the Harbringer web interface.", "Create login")
+        (
+            "Create administrator login",
+            "Set a password for the Harbringer web interface.",
+            "Create login",
+        )
     } else {
-        ("Sign in", "Sign in to manage your Harbringer server.", "Sign in")
+        (
+            "Sign in",
+            "Sign in to manage your Harbringer server.",
+            "Sign in",
+        )
     };
     let action = if setup { "/auth/setup" } else { "/auth/login" };
-    let confirm = if setup { r#"<label>Confirm password<input name="confirm_password" type="password" autocomplete="new-password" required></label>"# } else { "" };
-    let body = format!(r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · harbringer</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#f9fafb;font:16px system-ui}}main{{box-sizing:border-box;width:min(92vw,410px);padding:2rem;border:1px solid #374151;border-radius:1rem;background:#111827}}h1{{margin-top:0}}p{{color:#9ca3af}}form,label{{display:grid;gap:.7rem}}form{{gap:1rem}}input,button{{box-sizing:border-box;width:100%;padding:.8rem;border-radius:.5rem;font:inherit}}input{{border:1px solid #4b5563;background:#0b1020;color:white}}button{{border:0;background:#2563eb;color:white;font-weight:700;cursor:pointer}}</style><main><h1>{title}</h1><p>{description}</p><form method="post" action="{action}"><label>Administrator password<input name="password" type="password" minlength="8" autocomplete="{autocomplete}" required></label>{confirm}<button>{button}</button></form></main></html>"#,
-        autocomplete = if setup { "new-password" } else { "current-password" });
+    let confirm = if setup {
+        r#"<label>Confirm password<input name="confirm_password" type="password" autocomplete="new-password" required></label>"#
+    } else {
+        ""
+    };
+    let body = format!(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · harbringer</title><style>body{{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1020;color:#f9fafb;font:16px system-ui}}main{{box-sizing:border-box;width:min(92vw,410px);padding:2rem;border:1px solid #374151;border-radius:1rem;background:#111827}}h1{{margin-top:0}}p{{color:#9ca3af}}form,label{{display:grid;gap:.7rem}}form{{gap:1rem}}input,button{{box-sizing:border-box;width:100%;padding:.8rem;border-radius:.5rem;font:inherit}}input{{border:1px solid #4b5563;background:#0b1020;color:white}}button{{border:0;background:#2563eb;color:white;font-weight:700;cursor:pointer}}</style><main><h1>{title}</h1><p>{description}</p><form method="post" action="{action}"><label>Administrator password<input name="password" type="password" minlength="8" autocomplete="{autocomplete}" required></label>{confirm}<button>{button}</button></form></main></html>"#,
+        autocomplete = if setup {
+            "new-password"
+        } else {
+            "current-password"
+        }
+    );
     Html(add_build_info_footer(body)).into_response()
 }
 
 async fn auth_setup(State(state): State<AppState>, Form(form): Form<AdminLoginForm>) -> Response {
-    if form.password.len() < 8 || form.password != form.confirm_password || web_admin_exists(&state) {
-        return (StatusCode::BAD_REQUEST, "Setup is unavailable, passwords do not match, or the password is too short").into_response();
+    if form.password.len() < 8 || form.password != form.confirm_password || web_admin_exists(&state)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Setup is unavailable, passwords do not match, or the password is too short",
+        )
+            .into_response();
     }
     let salt = SaltString::generate(&mut OsRng);
-    let Ok(hash) = Argon2::default().hash_password(form.password.as_bytes(), &salt) else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
-    let Ok(db) = state.db.lock() else { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); };
-    match db.execute("INSERT OR IGNORE INTO web_admin (id, password_hash) VALUES (1, ?1)", [hash.to_string()]) {
+    let Ok(hash) = Argon2::default().hash_password(form.password.as_bytes(), &salt) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(db) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match db.execute(
+        "INSERT OR IGNORE INTO web_admin (id, password_hash) VALUES (1, ?1)",
+        [hash.to_string()],
+    ) {
         Ok(1) => {}
-        Ok(_) => return (StatusCode::CONFLICT, "Administrator setup has already completed").into_response(),
+        Ok(_) => {
+            return (
+                StatusCode::CONFLICT,
+                "Administrator setup has already completed",
+            )
+                .into_response()
+        }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
     drop(db);
@@ -15155,9 +15548,30 @@ async fn auth_setup(State(state): State<AppState>, Form(form): Form<AdminLoginFo
 }
 
 async fn auth_login(State(state): State<AppState>, Form(form): Form<AdminLoginForm>) -> Response {
-    let hash = state.db.lock().ok().and_then(|db| db.query_row("SELECT password_hash FROM web_admin WHERE id = 1", [], |row| row.get::<_, String>(0)).ok());
-    let valid = hash.and_then(|hash| PasswordHash::new(&hash).ok().map(|parsed| Argon2::default().verify_password(form.password.as_bytes(), &parsed).is_ok())).unwrap_or(false);
-    if !valid { return (StatusCode::UNAUTHORIZED, Html("<p>Incorrect password. <a href=\"/auth\">Try again</a></p>")).into_response(); }
+    let hash = state.db.lock().ok().and_then(|db| {
+        db.query_row(
+            "SELECT password_hash FROM web_admin WHERE id = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+    });
+    let valid = hash
+        .and_then(|hash| {
+            PasswordHash::new(&hash).ok().map(|parsed| {
+                Argon2::default()
+                    .verify_password(form.password.as_bytes(), &parsed)
+                    .is_ok()
+            })
+        })
+        .unwrap_or(false);
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Html("<p>Incorrect password. <a href=\"/auth\">Try again</a></p>"),
+        )
+            .into_response();
+    }
     issue_web_session(&state)
 }
 
@@ -15166,10 +15580,25 @@ fn issue_web_session(state: &AppState) -> Response {
     OsRng.fill_bytes(&mut bytes);
     let token = URL_SAFE_NO_PAD.encode(bytes);
     let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or_default();
-    if state.db.lock().ok().is_none_or(|db| db.execute("INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)", (&token_hash, now + 60 * 60 * 24 * 14)).is_err()) { return StatusCode::INTERNAL_SERVER_ERROR.into_response(); }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+    if state.db.lock().ok().is_none_or(|db| {
+        db.execute(
+            "INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)",
+            (&token_hash, now + 60 * 60 * 24 * 14),
+        )
+        .is_err()
+    }) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
     let mut response = Redirect::to("/").into_response();
-    if let Ok(value) = HeaderValue::from_str(&format!("harbringer_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600")) { response.headers_mut().insert(header::SET_COOKIE, value); }
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "harbringer_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=1209600"
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
     response
 }
 
@@ -15193,13 +15622,28 @@ fn refresh_web_session_cookie(headers: &HeaderMap, response: &mut Response) {
 }
 
 async fn auth_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(token) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
-        .and_then(|cookie| cookie.split(';').find_map(|part| part.trim().strip_prefix("harbringer_session="))) {
+    if let Some(token) = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|cookie| {
+            cookie
+                .split(';')
+                .find_map(|part| part.trim().strip_prefix("harbringer_session="))
+        })
+    {
         let token_hash = format!("{:x}", Sha256::digest(token.as_bytes()));
-        if let Ok(db) = state.db.lock() { let _ = db.execute("DELETE FROM web_sessions WHERE token_hash = ?1", [&token_hash]); }
+        if let Ok(db) = state.db.lock() {
+            let _ = db.execute(
+                "DELETE FROM web_sessions WHERE token_hash = ?1",
+                [&token_hash],
+            );
+        }
     }
     let mut response = Redirect::to("/auth").into_response();
-    response.headers_mut().insert(header::SET_COOKIE, HeaderValue::from_static("harbringer_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"));
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_static("harbringer_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
     response
 }
 
@@ -17185,6 +17629,436 @@ fn plex_genre_tokens(metadata: Option<&serde_json::Value>) -> BTreeSet<String> {
         );
     }
     tokens
+}
+
+fn query_bool(query: &BTreeMap<String, String>, key: &str) -> bool {
+    matches!(
+        query.get(key).map(String::as_str),
+        Some("1") | Some("true") | Some("TRUE")
+    )
+}
+
+fn query_i64(query: &BTreeMap<String, String>, key: &str) -> Option<i64> {
+    query.get(key).and_then(|value| value.trim().parse().ok())
+}
+
+fn marker_include_value(value: Option<&str>) -> bool {
+    matches!(value, Some("1") | Some("true") | Some("TRUE"))
+}
+
+fn marker_include_requested(uri: &Uri) -> bool {
+    marker_include_value(plex_query_value(uri, "includeMarkers"))
+}
+
+fn attach_markers_to_item(
+    state: &AppState,
+    item: &mut serde_json::Value,
+    media_key: &str,
+    include_markers: bool,
+) {
+    if !include_markers {
+        return;
+    }
+    let Ok(markers) = state
+        .db
+        .lock()
+        .map_err(|_| ())
+        .and_then(|db| markers::markers_for_media(&db, media_key).map_err(|_| ()))
+    else {
+        return;
+    };
+    if !markers.is_empty() {
+        item["Marker"] = serde_json::json!(markers);
+    }
+}
+
+fn marker_response(markers: Vec<markers::SkipMarker>) -> Response {
+    plex_json(serde_json::json!({
+        "MediaContainer": {
+            "size": markers.len(),
+            "Marker": markers,
+        }
+    }))
+}
+
+async fn media_duration_ms(media: &Media) -> Option<i64> {
+    inspect_media(&media.path)
+        .await
+        .and_then(|info| technical_duration_ms(&info))
+}
+
+fn media_fingerprint(media: &Media) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(media.id.as_bytes());
+    hasher.update(media.path.to_string_lossy().as_bytes());
+    hasher.update(media.size.to_le_bytes());
+    hasher.update(media.metadata_revision.to_le_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn group_fingerprint(episodes: &[Media]) -> String {
+    let mut fingerprints = episodes.iter().map(media_fingerprint).collect::<Vec<_>>();
+    fingerprints.sort();
+    let mut hasher = Sha256::new();
+    for fingerprint in fingerprints {
+        hasher.update(fingerprint.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn season_episode_candidates(
+    state: &AppState,
+    library: &ConfigLibrary,
+    root: &PathBuf,
+    show_title: &str,
+    season: u32,
+) -> Vec<Media> {
+    let mut episodes = BTreeMap::<u32, Media>::new();
+    for candidate in media_snapshot(state).iter() {
+        let Some(candidate_root) = library
+            .folders
+            .iter()
+            .find(|folder| candidate.path.starts_with(folder))
+        else {
+            continue;
+        };
+        if candidate_root != root || !media_in_library(candidate, library) {
+            continue;
+        }
+        let Some(info) = tv_episode_info(candidate_root, &candidate.path) else {
+            continue;
+        };
+        if info.season != season || tv_show_title(candidate_root, &candidate.path) != show_title {
+            continue;
+        }
+        let in_season_directory = media_has_season_directory(candidate_root, &candidate.path);
+        match episodes.entry(info.episode) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((*candidate).clone());
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let existing_has_season_directory =
+                    media_has_season_directory(candidate_root, &entry.get().path);
+                if in_season_directory && !existing_has_season_directory {
+                    entry.insert((*candidate).clone());
+                }
+            }
+        }
+    }
+    episodes.into_values().collect()
+}
+
+async fn detect_markers_for_episode(
+    state: AppState,
+    media: Media,
+    kind: markers::MarkerKind,
+    force: bool,
+    threshold: f32,
+) -> Result<usize, String> {
+    let (_, library) = media_library(&state, &media)
+        .ok_or_else(|| "media item is not in a configured library".to_owned())?;
+    if library.kind != "tv" {
+        return Err("marker detection is only available for TV episodes".to_owned());
+    }
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))
+        .cloned()
+        .ok_or_else(|| "episode library folder was not found".to_owned())?;
+    let episode_info = tv_episode_info(&root, &media.path)
+        .ok_or_else(|| "media item is not a recognizable TV episode".to_owned())?;
+    let show_title = tv_show_title(&root, &media.path);
+    let episodes =
+        season_episode_candidates(&state, &library, &root, &show_title, episode_info.season);
+    if episodes.len() < 2 {
+        return Err("at least two episodes are required for audio marker detection".to_owned());
+    }
+
+    let group_fingerprint = group_fingerprint(&episodes);
+    if !force {
+        let fresh = state
+            .db
+            .lock()
+            .ok()
+            .and_then(|db| {
+                episodes
+                    .iter()
+                    .all(|episode| {
+                        matches!(
+                            markers::marker_fingerprints(&db, &episode.id, kind),
+                            Ok(Some((media, group)))
+                                if media == media_fingerprint(episode)
+                                    && group == group_fingerprint
+                        )
+                    })
+                    .then_some(())
+            })
+            .is_some();
+        if fresh {
+            return Ok(0);
+        }
+    }
+
+    let mut decoded = Vec::new();
+    for episode in &episodes {
+        let duration = media_duration_ms(episode).await;
+        if kind == markers::MarkerKind::Credits && duration.is_none() {
+            warn!(path = %episode.path.display(), "skipping credits detection: duration is unknown");
+            continue;
+        }
+        match markers::decode_audio_window(&episode.path, kind, duration).await {
+            Ok(audio) => decoded.push((episode.clone(), duration.unwrap_or(i64::MAX), audio)),
+            Err(error) => warn!(
+                path = %episode.path.display(),
+                %error,
+                "skipping episode in marker detection"
+            ),
+        }
+    }
+    if decoded.len() < 2 {
+        return Err("fewer than two episodes had decodable audio".to_owned());
+    }
+
+    let ranges = markers::detect_shared_ranges(
+        &decoded
+            .iter()
+            .map(|(_, _, audio)| audio.clone())
+            .collect::<Vec<_>>(),
+        threshold,
+    );
+    let mut updated = 0usize;
+    let Ok(db) = state.db.lock() else {
+        return Err("marker database is unavailable".to_owned());
+    };
+    for (index, (episode, duration, _)) in decoded.iter().enumerate() {
+        match markers::replace_detected_markers(
+            &db,
+            &episode.id,
+            kind,
+            ranges[index].as_ref(),
+            &media_fingerprint(episode),
+            &group_fingerprint,
+            *duration,
+        ) {
+            Ok(()) => updated += 1,
+            Err(error) => warn!(
+                path = %episode.path.display(),
+                %error,
+                "could not persist detected marker"
+            ),
+        }
+    }
+    Ok(updated)
+}
+
+async fn detect_markers_for_library(
+    state: AppState,
+    library_id: usize,
+    force: bool,
+    threshold: f32,
+) -> Result<usize, String> {
+    let library = state
+        .config
+        .lock()
+        .ok()
+        .and_then(|config| config.libraries.get(library_id - 1).cloned())
+        .ok_or_else(|| "library was not found".to_owned())?;
+    if library.kind != "tv" {
+        return Ok(0);
+    }
+
+    let mut groups = BTreeMap::<(String, u32), Media>::new();
+    for media in media_snapshot(&state).iter() {
+        let Some(root) = library
+            .folders
+            .iter()
+            .find(|folder| media.path.starts_with(folder))
+        else {
+            continue;
+        };
+        let Some(info) = tv_episode_info(root, &media.path) else {
+            continue;
+        };
+        groups
+            .entry((tv_show_title(root, &media.path), info.season))
+            .or_insert_with(|| (*media).clone());
+    }
+
+    let mut updated = 0usize;
+    for ((show, season), media) in groups {
+        for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
+            let key = format!("{}|{}|{}|{}", library_id, show, season, kind.as_str());
+            if !begin_marker_detection_group(key.clone()) {
+                continue;
+            }
+            match detect_markers_for_episode(state.clone(), media.clone(), kind, force, threshold)
+                .await
+            {
+                Ok(count) => updated += count,
+                Err(error) => warn!(
+                    library_id,
+                    %show,
+                    season,
+                    marker_type = kind.as_str(),
+                    %error,
+                    "automatic marker detection failed"
+                ),
+            }
+            end_marker_detection_group(&key);
+        }
+    }
+    Ok(updated)
+}
+
+async fn plex_detect_markers(
+    State(state): State<AppState>,
+    Path(ids): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+    uri: Uri,
+) -> Response {
+    let Some(media) = find_media(&state, &ids) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let kind = if uri.path().ends_with("/credits") {
+        markers::MarkerKind::Credits
+    } else {
+        markers::MarkerKind::Intro
+    };
+    let force = query_bool(&query, "force");
+    let threshold = markers::detection_threshold(
+        query
+            .get("threshold")
+            .and_then(|value| value.parse::<f64>().ok()),
+    );
+    tokio::spawn(async move {
+        if let Err(error) = detect_markers_for_episode(state, media, kind, force, threshold).await {
+            warn!(%error, marker_type = kind.as_str(), "marker detection failed");
+        }
+    });
+    StatusCode::OK.into_response()
+}
+
+async fn plex_create_marker(
+    State(state): State<AppState>,
+    Path(ids): Path<String>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(media) = find_media(&state, &ids) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Some(kind) = query
+        .get("type")
+        .and_then(|value| markers::MarkerKind::from_marker_input(value))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let (Some(start_ms), Some(end_ms)) = (
+        query_i64(&query, "startTimeOffset"),
+        query_i64(&query, "endTimeOffset"),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if start_ms < 0 || end_ms <= start_ms {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let duration_ms = media_duration_ms(&media).await.unwrap_or(i64::MAX);
+    let Ok(db) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match markers::create_user_marker(&db, &media.id, kind, start_ms, end_ms, duration_ms) {
+        Ok(marker) => marker_response(vec![marker]),
+        Err(error) => {
+            warn!(%error, "could not create marker");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn plex_edit_marker(
+    State(state): State<AppState>,
+    Path((ids, marker_id)): Path<(String, String)>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let Some(media) = find_media(&state, &ids) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(marker_id) = marker_id.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(kind) = query
+        .get("type")
+        .and_then(|value| markers::MarkerKind::from_marker_input(value))
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(start_ms) = query_i64(&query, "startTimeOffset") else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let duration_ms = media_duration_ms(&media).await.unwrap_or(i64::MAX);
+    let Ok(db) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Ok(existing) = markers::markers_for_media(&db, &media.id) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(current) = existing.iter().find(|marker| marker.id == marker_id) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let end_ms = query_i64(&query, "endTimeOffset").unwrap_or(current.end_ms);
+    if start_ms < 0 || end_ms <= start_ms {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    match markers::update_marker(&db, marker_id, kind, start_ms, end_ms, duration_ms) {
+        Ok(Some(marker)) => marker_response(vec![marker]),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(%error, "could not edit marker");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn plex_delete_marker(
+    State(state): State<AppState>,
+    Path((ids, marker_id)): Path<(String, String)>,
+) -> Response {
+    let Some(media) = find_media(&state, &ids) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(marker_id) = marker_id.parse::<i64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(db) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    match markers::delete_marker(&db, &media.id, marker_id) {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(%error, "could not delete marker");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+async fn plex_delete_section_markers(
+    State(state): State<AppState>,
+    Path(section): Path<String>,
+) -> Response {
+    let Ok(section) = section.parse::<u64>() else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    match state
+        .db
+        .lock()
+        .map_err(|_| ())
+        .and_then(|db| markers::delete_section_markers(&db, section).map_err(|_| ()))
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 fn plex_library_for_metadata(state: &AppState, id: &str) -> Option<(usize, ConfigLibrary)> {
@@ -19429,6 +20303,7 @@ async fn plex_item(
 ) -> Response {
     let wants_children = uri.path().ends_with("/children");
     let include_children = plex_query_value(&uri, "includeChildren") == Some("1");
+    let include_markers = marker_include_requested(&uri);
     let media_index = media_snapshot(&s);
     if let Some((section, library, mut show, season)) =
         find_plex_tv_location(&s, media_index.as_ref(), &id)
@@ -19452,7 +20327,7 @@ async fn plex_item(
             let mut episodes = Vec::with_capacity(season_episodes.len());
             for (index, episode) in season_episodes.iter().enumerate() {
                 let episode_number = episode.episode.unwrap_or(index as u32 + 1);
-                let item = plex_tv_episode_json(
+                let mut item = plex_tv_episode_json(
                     &s,
                     episode,
                     &show,
@@ -19464,6 +20339,9 @@ async fn plex_item(
                     &show_guid,
                 )
                 .await;
+                if let Some(file) = episode.files.first() {
+                    attach_markers_to_item(&s, &mut item, &file.id, include_markers);
+                }
                 episodes.push(item);
             }
             if wants_children {
@@ -19615,6 +20493,7 @@ async fn plex_item(
         add_plex_technical_metadata(&s, &mut video, &media).await;
         video
     };
+    attach_markers_to_item(&s, &mut video, &media.id, include_markers);
     // Plex for Mac refetches the selected item after creating the queue and
     // bases its playability check on this metadata response as well.
     plex_mark_direct_play(&mut video);
@@ -20691,6 +21570,8 @@ async fn plex_create_play_queue(
         add_plex_technical_metadata(&state, &mut item, &media).await;
         item
     };
+    let include_markers = marker_include_value(query.get("includeMarkers").map(String::as_str));
+    attach_markers_to_item(&state, &mut item, &media.id, include_markers);
     let direct_play = query.get("directPlay").map(String::as_str) != Some("0");
     if direct_play {
         plex_mark_direct_play(&mut item);
@@ -21220,21 +22101,13 @@ async fn plex_stream(
                 .get("format")
                 .map(|format| format.to_ascii_lowercase())
                 .unwrap_or_else(|| extension.unwrap_or("vtt").to_owned());
-            return translated_subtitle_stream_response(
-                &state,
-                media,
-                first,
-                second,
-                &requested,
-            )
-            .await;
+            return translated_subtitle_stream_response(&state, media, first, second, &requested)
+                .await;
         }
     }
     for media in media_index.iter() {
         for subtitle_path in external_subtitle_files(&media.path).await {
-            if !bilingual_enabled
-                && external_subtitle_pair(&media.path, &subtitle_path).is_some()
-            {
+            if !bilingual_enabled && external_subtitle_pair(&media.path, &subtitle_path).is_some() {
                 continue;
             }
             if plex_external_subtitle_id(media, &subtitle_path) != stream_id {
@@ -21411,18 +22284,33 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
     };
     let season_directory = media.path.parent().unwrap_or(root);
     let media_artwork = if library.kind == "tv" && filename == "cover.jpg" {
-        [season_directory.join(".hbgr").join(filename), group_directory.join(".hbgr").join(filename)]
+        [
+            season_directory.join(".hbgr").join(filename),
+            group_directory.join(".hbgr").join(filename),
+        ]
     } else {
-        [group_directory.join(".hbgr").join(filename), season_directory.join(".hbgr").join(filename)]
+        [
+            group_directory.join(".hbgr").join(filename),
+            season_directory.join(".hbgr").join(filename),
+        ]
     };
     let artwork_paths = if config_mode {
-        std::iter::once(config_artwork).chain(media_artwork).collect::<Vec<_>>()
+        std::iter::once(config_artwork)
+            .chain(media_artwork)
+            .collect::<Vec<_>>()
     } else {
-        media_artwork.into_iter().chain(std::iter::once(config_artwork)).collect::<Vec<_>>()
+        media_artwork
+            .into_iter()
+            .chain(std::iter::once(config_artwork))
+            .collect::<Vec<_>>()
     };
     for artwork in &artwork_paths {
         if let Ok(bytes) = tokio::fs::read(artwork).await {
-            return ([(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))], bytes).into_response();
+            return (
+                [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                bytes,
+            )
+                .into_response();
         }
     }
     if matches!(library.kind.as_str(), "movie" | "tv") {
@@ -21444,7 +22332,11 @@ async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> Response {
             }
             for artwork in &artwork_paths {
                 if let Ok(bytes) = tokio::fs::read(artwork).await {
-                    return ([(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))], bytes).into_response();
+                    return (
+                        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
+                        bytes,
+                    )
+                        .into_response();
                 }
             }
         }
