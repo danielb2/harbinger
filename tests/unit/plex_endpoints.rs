@@ -3017,19 +3017,46 @@ async fn bilingual_subtitles_can_be_disabled_globally() {
     assert!(!web_tracks.iter().any(|track| track.bilingual));
 }
 
-#[tokio::test]
-async fn translation_client_uses_the_platform_tls_backend() {
-    // `translation_http_client` calls `use_native_tls()`; keeping that call in
-    // the client used for Google Translate is what prevents the upstream 429.
-    let client = super::translation_http_client().expect("translation client");
-    let stub = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+async fn captured_client_hello(client: &reqwest::Client) -> Vec<u8> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, stub).await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let captured = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0_u8; 4096];
+        let size = tokio::io::AsyncReadExt::read(&mut socket, &mut buffer)
+            .await
+            .unwrap_or(0);
+        buffer[..size].to_vec()
     });
-    let response = client.get(format!("http://{address}/")).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    // The handshake never completes; the ClientHello alone identifies the TLS
+    // backend. reqwest's rustls backend advertises http/1.1 via ALPN while the
+    // platform backend used by the Ruby translator does not.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.get(format!("https://127.0.0.1:{port}/")).send(),
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), captured)
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn translation_client_avoids_the_rustls_fingerprint_google_rejects() {
+    let advertises_http_1_1_alpn = |hello: &[u8]| hello.windows(8).any(|window| window == b"http/1.1");
+
+    let rustls_client = reqwest::Client::builder().use_rustls_tls().build().unwrap();
+    assert!(advertises_http_1_1_alpn(
+        &captured_client_hello(&rustls_client).await
+    ));
+
+    let translation_client = super::translation_http_client().expect("translation client");
+    let hello = captured_client_hello(&translation_client).await;
+    assert!(
+        !advertises_http_1_1_alpn(&hello),
+        "Google Translate client fell back to rustls; Google returns HTTP 429 for that TLS fingerprint"
+    );
 }
 
 #[tokio::test]
