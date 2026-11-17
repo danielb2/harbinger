@@ -9579,7 +9579,12 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     files.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
 
     let mut items = String::new();
-    items.push_str(&breadcrumb_nav(&relative, query.library, files_view));
+    items.push_str(&breadcrumb_nav(
+        &relative,
+        &query,
+        selected_relative.as_deref(),
+        library_kind.as_deref(),
+    ));
     let view_library = query.library.unwrap_or_default();
     let view_path = url_encode(&relative.to_string_lossy());
     let media_view_href = format!("/?library={view_library}&path={view_path}");
@@ -12565,31 +12570,81 @@ fn sidebar_nav_with_library_links(
     )
 }
 
-fn breadcrumb_nav(relative: &std::path::Path, library: Option<usize>, files_view: bool) -> String {
-    if relative.as_os_str().is_empty() {
+fn breadcrumb_nav(
+    relative: &std::path::Path,
+    query: &WebPath,
+    selected_relative: Option<&std::path::Path>,
+    library_kind: Option<&str>,
+) -> String {
+    if relative.as_os_str().is_empty() && query.season.is_none() && selected_relative.is_none() {
         return String::new();
     }
-    let mut nav = String::from(r#"<nav class="breadcrumb" aria-label="Breadcrumb">"#);
-    let prefix = library
-        .map(|index| format!("library={index}&"))
-        .unwrap_or_default();
-    let view = if files_view { "view=files&" } else { "" };
+    let files_view = query.view.as_deref() == Some("files");
+    let mut prefix = String::new();
+    if let Some(library) = query.library {
+        prefix.push_str(&format!("library={library}&"));
+    }
+    if let Some(folder) = query.folder {
+        prefix.push_str(&format!("folder={folder}&"));
+    }
+    if files_view {
+        prefix.push_str("view=files&");
+    }
+    let href = |path: &std::path::Path, extra: &str| {
+        format!(
+            "/?{}path={}{}",
+            prefix,
+            url_encode(&path.to_string_lossy()),
+            extra
+        )
+    };
+    let mut crumbs = Vec::new();
     let mut current = PathBuf::new();
-    for (index, component) in relative.components().enumerate() {
+    for component in relative.components() {
         let Component::Normal(name) = component else {
             continue;
         };
         current.push(name);
-        let label = name.to_string_lossy();
+        crumbs.push((name.to_string_lossy().into_owned(), href(&current, "")));
+    }
+
+    if library_kind == Some("tv") && !files_view {
+        let season_from_episode = selected_relative.and_then(|selected| {
+            selected
+                .components()
+                .filter_map(|component| component.as_os_str().to_str())
+                .find_map(parse_tv_season_directory)
+                .or_else(|| {
+                    selected
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .and_then(|stem| parse_tv_episode_marker(stem))
+                        .and_then(|(season, _, _)| season)
+                })
+        });
+        let season = query.season.or(season_from_episode);
+        let directory_is_season = relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_tv_season_directory)
+            .is_some();
+        if let (Some(season), false) = (season, directory_is_season) {
+            crumbs.push((
+                format!("Season {season:02}"),
+                href(relative, &format!("&season={season}")),
+            ));
+        }
+    }
+
+    let mut nav = String::from(r#"<nav class="breadcrumb" aria-label="Breadcrumb">"#);
+    for (index, (label, link)) in crumbs.iter().enumerate() {
         if index > 0 {
             nav.push_str(r#"<span class="breadcrumb-separator">/</span>"#);
         }
         nav.push_str(&format!(
-            r#"<a data-spa-link href="/?{}{}path={}">{}</a>"#,
-            prefix,
-            view,
-            url_encode(&current.to_string_lossy()),
-            html(&label)
+            r#"<a data-spa-link href="{}">{}</a>"#,
+            link,
+            html(label)
         ));
     }
     nav.push_str("</nav>");

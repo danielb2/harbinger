@@ -4122,6 +4122,145 @@ async fn home_page_renders_the_fix_match_dialog_for_home_card_actions() {
     assert!(body.contains("if (!fixMatchDialog || !fixMatchQuery"));
 }
 
+fn rendered_breadcrumb(body: &str) -> String {
+    let start = body
+        .find("class=\"breadcrumb\"")
+        .map(|index| body[..index].rfind("<nav").unwrap_or(index))
+        .expect("breadcrumb navigation");
+    let end = body[start..]
+        .find("</nav>")
+        .map(|offset| start + offset + 6)
+        .unwrap_or(body.len());
+    body[start..end].to_owned()
+}
+
+#[tokio::test]
+async fn tv_episode_breadcrumbs_link_back_to_season_and_show() {
+    let fixture = tv_fixture();
+    let episode = "Example Show/Season 01/Example.Show.S01E01.Pilot.mkv";
+    let uri = format!(
+        "/?library=0&path=Example%20Show&season=1&episode={}",
+        super::url_encode(episode)
+    );
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let breadcrumb = rendered_breadcrumb(&body);
+
+    let show_href = "/?library=0&path=Example%20Show";
+    let season_href = "/?library=0&path=Example%20Show&season=1";
+    assert!(
+        breadcrumb.contains(&format!(r#"href="{show_href}">Example Show</a>"#)),
+        "{breadcrumb}"
+    );
+    assert!(
+        breadcrumb.contains(&format!(r#"href="{season_href}">Season 01</a>"#)),
+        "{breadcrumb}"
+    );
+    assert!(breadcrumb.find(show_href).unwrap() < breadcrumb.find(season_href).unwrap());
+    assert!(
+        !breadcrumb.contains("&episode="),
+        "the current episode must not be a self-referential breadcrumb: {breadcrumb}"
+    );
+
+    for parent in [show_href, season_href] {
+        let response = send(&fixture.app, Method::GET, parent, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{parent}");
+    }
+}
+
+#[tokio::test]
+async fn tv_breadcrumbs_derive_the_season_from_the_selected_episode() {
+    let fixture = tv_fixture();
+    let episode = "Example Show/Season 01/Example.Show.S01E01.Pilot.mkv";
+    let uri = format!(
+        "/?library=0&path=Example%20Show&episode={}",
+        super::url_encode(episode)
+    );
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let breadcrumb = rendered_breadcrumb(&body);
+
+    assert!(breadcrumb.contains(r#"href="/?library=0&path=Example%20Show">Example Show</a>"#));
+    assert!(breadcrumb.contains(r#"href="/?library=0&path=Example%20Show&season=1">Season 01</a>"#));
+    assert!(
+        !breadcrumb.contains("&episode="),
+        "the current episode must not be a self-referential breadcrumb: {breadcrumb}"
+    );
+}
+
+#[tokio::test]
+async fn tv_breadcrumbs_preserve_the_selected_library_folder() {
+    let fixture = tv_fixture();
+    let second_root = fixture.root.join("second-media");
+    let episode_relative = "Another Show/Season 01/Another.Show.S01E01.Pilot.mkv";
+    let second_path = second_root.join(episode_relative);
+    std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    std::fs::write(&second_path, b"second-folder-episode").unwrap();
+    fixture.config.lock().unwrap().libraries[0]
+        .folders
+        .push(second_root);
+    let mut media = fixture.state.media.read().unwrap().as_ref().clone();
+    let mut episode = media[0].clone();
+    episode.id = "tv-second".to_owned();
+    episode.path = second_path;
+    media.push(episode);
+    *fixture.state.media.write().unwrap() = Arc::new(media);
+
+    let uri = format!(
+        "/?library=0&folder=1&path=Another%20Show%2FSeason%2001&episode={}",
+        super::url_encode(episode_relative)
+    );
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let breadcrumb = rendered_breadcrumb(&body);
+
+    let show_href = "/?library=0&folder=1&path=Another%20Show";
+    let season_href = "/?library=0&folder=1&path=Another%20Show%2FSeason%2001";
+    assert!(
+        breadcrumb.contains(&format!(r#"href="{show_href}">Another Show</a>"#)),
+        "{breadcrumb}"
+    );
+    assert!(
+        breadcrumb.contains(&format!(r#"href="{season_href}">Season 01</a>"#)),
+        "{breadcrumb}"
+    );
+    assert!(breadcrumb.contains("folder=1"));
+
+    for parent in [show_href, season_href] {
+        let response = send(&fixture.app, Method::GET, parent, Body::empty()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{parent}");
+        let body = String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body.contains("Another Show"), "{parent}");
+    }
+}
+
 #[tokio::test]
 async fn tv_show_view_places_show_description_above_the_library_items() {
     let fixture = tv_fixture();
