@@ -9300,7 +9300,7 @@ async fn web_client(State(s): State<AppState>, Query(mut query): Query<WebPath>)
     let pane_banner = if banner_directory.join(".hbgr/banner.jpg").is_file() || config_banner_exists
     {
         format!(
-            r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')"#,
+            r#" style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('{}')""#,
             artwork_url(&banner_relative, query.library, "banner")
         )
     } else {

@@ -973,6 +973,37 @@ async fn hbweb_uses_config_sidecar_banner_as_show_background() {
 }
 
 
+#[tokio::test]
+async fn hbweb_show_backdrop_main_tag_closes_its_style_attribute() {
+    let fixture = tv_fixture();
+    let show_artwork = fixture.root.join("media/Example Show/.hbgr");
+    std::fs::create_dir_all(&show_artwork).unwrap();
+    std::fs::write(show_artwork.join("banner.jpg"), b"show banner").unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&path=Example%20Show",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+
+    let expected_main = r#"<main style="background-size:cover;background-position:center;background-attachment:fixed;background-image:linear-gradient(180deg,rgba(17,24,39,.72),rgba(17,24,39,.96)),url('/web/artwork?library=0&path=Example%20Show&kind=banner')">"#;
+    assert!(
+        body.contains(expected_main),
+        "show backdrop main tag must close its style attribute so the backdrop stays valid CSS"
+    );
+}
+
+
 #[test]
 fn startup_retries_saved_plex_token_after_publication_failure() {
     let fixture = fixture();
