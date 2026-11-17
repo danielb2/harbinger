@@ -17707,14 +17707,14 @@ fn group_fingerprint(episodes: &[Media]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn season_episode_candidates(
+fn season_episode_candidates_by_number(
     state: &AppState,
     library: &ConfigLibrary,
     root: &PathBuf,
     show_title: &str,
     season: u32,
-) -> Vec<Media> {
-    let mut episodes = BTreeMap::<u32, Media>::new();
+) -> BTreeMap<u32, Vec<Media>> {
+    let mut episodes = BTreeMap::<u32, Vec<Media>>::new();
     for candidate in media_snapshot(state).iter() {
         let Some(candidate_root) = library
             .folders
@@ -17733,20 +17733,17 @@ fn season_episode_candidates(
             continue;
         }
         let in_season_directory = media_has_season_directory(candidate_root, &candidate.path);
-        match episodes.entry(info.episode) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert((*candidate).clone());
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => {
-                let existing_has_season_directory =
-                    media_has_season_directory(candidate_root, &entry.get().path);
-                if in_season_directory && !existing_has_season_directory {
-                    entry.insert((*candidate).clone());
-                }
-            }
+        let files = episodes.entry(info.episode).or_default();
+        let preferred_in_season_directory = files
+            .first()
+            .is_some_and(|existing| media_has_season_directory(candidate_root, &existing.path));
+        if in_season_directory && !preferred_in_season_directory {
+            files.insert(0, (*candidate).clone());
+        } else {
+            files.push((*candidate).clone());
         }
     }
-    episodes.into_values().collect()
+    episodes
 }
 
 async fn detect_markers_for_episode(
@@ -17770,11 +17767,16 @@ async fn detect_markers_for_episode(
     let episode_info = tv_episode_info(&root, &media.path)
         .ok_or_else(|| "media item is not a recognizable TV episode".to_owned())?;
     let show_title = tv_show_title(&root, &media.path);
-    let episodes =
-        season_episode_candidates(&state, &library, &root, &show_title, episode_info.season);
-    if episodes.len() < 2 {
+    let episode_groups =
+        season_episode_candidates_by_number(&state, &library, &root, &show_title, episode_info.season);
+    if episode_groups.len() < 2 {
         return Err("at least two episodes are required for audio marker detection".to_owned());
     }
+    let episodes = episode_groups
+        .values()
+        .filter_map(|files| files.first().cloned())
+        .collect::<Vec<_>>();
+    let all_episode_files = episode_groups.values().flatten().collect::<Vec<_>>();
 
     let group_fingerprint = group_fingerprint(&episodes);
     if !force {
@@ -17783,7 +17785,7 @@ async fn detect_markers_for_episode(
             .lock()
             .ok()
             .and_then(|db| {
-                episodes
+                all_episode_files
                     .iter()
                     .all(|episode| {
                         matches!(
@@ -17803,13 +17805,23 @@ async fn detect_markers_for_episode(
 
     let mut decoded = Vec::new();
     for episode in &episodes {
+        let Some(episode_number) = tv_episode_info(&root, &episode.path).map(|info| info.episode)
+        else {
+            warn!(path = %episode.path.display(), "skipping episode without a number in marker detection");
+            continue;
+        };
         let duration = media_duration_ms(episode).await;
         if kind == markers::MarkerKind::Credits && duration.is_none() {
             warn!(path = %episode.path.display(), "skipping credits detection: duration is unknown");
             continue;
         }
         match markers::decode_audio_window(&episode.path, kind, duration).await {
-            Ok(audio) => decoded.push((episode.clone(), duration.unwrap_or(i64::MAX), audio)),
+            Ok(audio) => decoded.push((
+                episode.clone(),
+                episode_number,
+                duration.unwrap_or(i64::MAX),
+                audio,
+            )),
             Err(error) => warn!(
                 path = %episode.path.display(),
                 %error,
@@ -17824,7 +17836,7 @@ async fn detect_markers_for_episode(
     let ranges = markers::detect_shared_ranges(
         &decoded
             .iter()
-            .map(|(_, _, audio)| audio.clone())
+            .map(|(_, _, _, audio)| audio.clone())
             .collect::<Vec<_>>(),
         threshold,
     );
@@ -17832,22 +17844,28 @@ async fn detect_markers_for_episode(
     let Ok(db) = state.db.lock() else {
         return Err("marker database is unavailable".to_owned());
     };
-    for (index, (episode, duration, _)) in decoded.iter().enumerate() {
-        match markers::replace_detected_markers(
-            &db,
-            &episode.id,
-            kind,
-            ranges[index].as_ref(),
-            &media_fingerprint(episode),
-            &group_fingerprint,
-            *duration,
-        ) {
-            Ok(()) => updated += 1,
-            Err(error) => warn!(
-                path = %episode.path.display(),
-                %error,
-                "could not persist detected marker"
-            ),
+    for (index, (episode, episode_number, duration, _)) in decoded.iter().enumerate() {
+        let files = episode_groups
+            .get(episode_number)
+            .map(Vec::as_slice)
+            .unwrap_or(std::slice::from_ref(episode));
+        for file in files {
+            match markers::replace_detected_markers(
+                &db,
+                &file.id,
+                kind,
+                ranges[index].as_ref(),
+                &media_fingerprint(file),
+                &group_fingerprint,
+                *duration,
+            ) {
+                Ok(()) => updated += 1,
+                Err(error) => warn!(
+                    path = %file.path.display(),
+                    %error,
+                    "could not persist detected marker"
+                ),
+            }
         }
     }
     Ok(updated)

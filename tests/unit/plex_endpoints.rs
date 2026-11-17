@@ -7612,6 +7612,43 @@ fn season_directory_media_is_recognized_for_marker_groups() {
     ));
 }
 
+#[test]
+fn marker_detection_groups_keep_duplicate_episode_files() {
+    let fixture = tv_fixture();
+    let media_dir = fixture.root.join("media");
+    let preferred = media_dir.join("Example Show/Season 01/Example.Show.S01E01.Pilot.mkv");
+    let duplicate = media_dir.join("Example Show/Example.Show.S01E01.Pilot.mkv");
+    std::fs::create_dir_all(duplicate.parent().unwrap()).unwrap();
+    std::fs::write(&duplicate, b"0123456789abcdef").unwrap();
+
+    {
+        let mut media = fixture.state.media.read().unwrap().as_ref().clone();
+        media.push(Media {
+            id: "tv-duplicate".to_owned(),
+            title: "Episode 1 duplicate".to_owned(),
+            path: duplicate.clone(),
+            size: 16,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
+        });
+        *fixture.state.media.write().unwrap() = Arc::new(media);
+    }
+    let library = fixture.state.config.lock().unwrap().libraries[0].clone();
+    let groups = super::season_episode_candidates_by_number(
+        &fixture.state,
+        &library,
+        &media_dir,
+        "Example Show",
+        1,
+    );
+
+    let episode_one = groups.get(&1).expect("episode 1 group is missing");
+    assert_eq!(episode_one.first().unwrap().path, preferred);
+    assert!(episode_one.iter().any(|media| media.path == duplicate));
+    assert_eq!(groups.get(&2).unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn skipping_settings_render_validate_and_persist_both_modes() {
     let fixture = fixture();
