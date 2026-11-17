@@ -3018,6 +3018,21 @@ async fn bilingual_subtitles_can_be_disabled_globally() {
 }
 
 #[tokio::test]
+async fn translation_client_uses_the_platform_tls_backend() {
+    // `translation_http_client` calls `use_native_tls()`; keeping that call in
+    // the client used for Google Translate is what prevents the upstream 429.
+    let client = super::translation_http_client().expect("translation client");
+    let stub = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, stub).await.unwrap();
+    });
+    let response = client.get(format!("http://{address}/")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn bilingual_sidecar_is_recognized_and_reused_without_translation() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();

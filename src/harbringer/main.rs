@@ -2785,6 +2785,17 @@ async fn translate_subtitle_cached_cancellable(
     .await
 }
 
+/// Google's `client=gtx` endpoint rejects reqwest's rustls TLS fingerprint with
+/// HTTP 429 ("automated queries") even for the first cue. The platform TLS
+/// backend used by the Ruby translator is accepted, so translation must use it.
+fn translation_http_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .use_native_tls()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .map_err(|_| "Could not initialize Google Translate".to_owned())
+}
+
 async fn translate_subtitle_cached_with_progress(
     state: &AppState,
     media: &Media,
@@ -2890,10 +2901,7 @@ async fn translate_subtitle_cached_with_progress(
         send_vtt_progress(progress.as_ref(), &cached)?;
         return Ok(cached);
     }
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(45))
-        .build()
-        .map_err(|_| "Could not initialize Google Translate".to_owned())?;
+    let client = translation_http_client()?;
     tokio::fs::create_dir_all(state.subtitle_checkpoints_dir.as_path())
         .await
         .map_err(|_| "Could not create subtitle checkpoint directory".to_owned())?;

@@ -24,7 +24,7 @@ form_urlencoded = "1.2"
 serde_urlencoded = "0.7"
 toml = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "multipart", "native-tls", "rustls-tls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
