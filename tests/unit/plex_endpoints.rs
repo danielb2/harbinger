@@ -3277,26 +3277,29 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
 }
 
 #[tokio::test]
-async fn plex_translated_subtitle_stream_returns_a_finite_checkpoint_snapshot() {
+async fn plex_translated_subtitle_stream_serves_only_manually_generated_files() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
-    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
-    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    let missing = super::translated_subtitle_stream_response(
+        &fixture.state,
+        &media,
+        "en",
+        "vi",
+        "vtt",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let final_path = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    std::fs::create_dir_all(final_path.parent().unwrap()).unwrap();
     std::fs::write(
-        &checkpoint,
-        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
+        &final_path,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
     )
     .unwrap();
-    let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "srt");
-    let job_key = final_path.to_string_lossy().into_owned();
-    let _active_job = super::start_translation_job(job_key.clone(), media.id.clone(), false).unwrap();
-
     let response = super::translated_subtitle_stream_response(
         &fixture.state,
         &media,
-        "1\n00:00:01,000 --> 00:00:02,000\nHello\n",
-        "en",
-        "srt",
         "en",
         "vi",
         "vtt",
@@ -3308,8 +3311,6 @@ async fn plex_translated_subtitle_stream_returns_a_finite_checkpoint_snapshot() 
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.starts_with("WEBVTT\n\n"));
     assert!(body.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
-    super::cancel_streaming_translation_jobs(&media.id);
-    super::finish_translation_job(&job_key);
 }
 
 #[test]
@@ -3375,7 +3376,7 @@ async fn embedded_text_subtitle_can_be_selected_as_translation_source() {
                 .body(Body::from(
                     serde_json::json!({
                         "path":"Demo.mkv", "library":0, "stream_id":3,
-                        "first_language":"en", "second_language":"vi"
+                        "first_language":"en", "second_language":"vi", "prepared":true
                     })
                     .to_string(),
                 ))
@@ -3392,6 +3393,35 @@ async fn embedded_text_subtitle_can_be_selected_as_translation_source() {
     )
     .unwrap();
     assert!(message.contains("Embedded subtitles could not be read"));
+}
+
+
+#[tokio::test]
+async fn unprepared_subtitle_requests_are_rejected_without_creating_output() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let output = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/translated-subtitle")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path":"Demo.mkv", "library":0, "stream_id":3,
+                        "first_language":"en", "second_language":"vi", "prepared":false
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(!output.exists());
 }
 
 #[tokio::test]
@@ -3453,6 +3483,7 @@ async fn web_translation_progress_reports_staged_cues_and_completed_srt() {
 async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
     let translated_id = super::plex_translated_subtitle_id(&media, "en", "vi");
     let metadata = send(
         &fixture.app,
@@ -3463,13 +3494,29 @@ async fn plex_metadata_and_selection_expose_configured_bilingual_track() {
     .await;
     let metadata: serde_json::Value =
         serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
-    assert!(
-        metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|stream| stream["id"] == translated_id && stream["external"] == true)
-    );
+    assert!(!metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stream| stream["id"] == translated_id));
+
+    let saved_path = super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    std::fs::create_dir_all(saved_path.parent().unwrap()).unwrap();
+    std::fs::write(&saved_path, "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n").unwrap();
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|stream| stream["id"] == translated_id && stream["external"] == true));
     let selection = send(
         &fixture.app,
         Method::PUT,

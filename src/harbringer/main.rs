@@ -2486,6 +2486,13 @@ async fn web_translated_subtitle(
         return (StatusCode::FORBIDDEN, "Bilingual subtitles are disabled in Settings")
             .into_response();
     }
+    if !request.prepared {
+        return (
+            StatusCode::FORBIDDEN,
+            "Use the Generate bilingual subtitle button to start generation",
+        )
+            .into_response();
+    }
     if request.first_language == request.second_language
         || isolang::Language::from_639_1(&request.first_language).is_none()
         || isolang::Language::from_639_1(&request.second_language).is_none()
@@ -2543,45 +2550,28 @@ async fn web_translated_subtitle(
         client_source_cues = request.source_cues.len(),
         "bilingual subtitle generation started"
     );
-    let translated = if request.prepared {
-        let job_key = format!(
-            "prepared:{}:{}:{}",
-            media.id, request.first_language, request.second_language
-        );
-        let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true)
-        else {
-            warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
-
-            return (StatusCode::CONFLICT, "This bilingual subtitle is already being prepared")
-                .into_response();
-        };
-        let result = translate_subtitle_cached_cancellable(
-            &state,
-            &media,
-            &contents,
-            &source_language,
-            &format,
-            &request.first_language,
-            &request.second_language,
-            Some(cancellation),
-            request.source_key.as_deref(),
-        )
-        .await;
-        finish_translation_job(&job_key);
-        result
-    } else {
-        Ok(translated_subtitle_preview(
-            &state,
-            &media,
-            &contents,
-            &source_language,
-            &format,
-            &request.first_language,
-            &request.second_language,
-            request.source_key.as_deref(),
-        )
-        .await)
+    let job_key = format!(
+        "prepared:{}:{}:{}",
+        media.id, request.first_language, request.second_language
+    );
+    let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true) else {
+        warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
+        return (StatusCode::CONFLICT, "This bilingual subtitle is already being prepared")
+            .into_response();
     };
+    let translated = translate_subtitle_cached_cancellable(
+        &state,
+        &media,
+        &contents,
+        &source_language,
+        &format,
+        &request.first_language,
+        &request.second_language,
+        Some(cancellation),
+        request.source_key.as_deref(),
+    )
+    .await;
+    finish_translation_job(&job_key);
     match translated {
         Ok(vtt) => {
             info!(
@@ -3031,122 +3021,30 @@ async fn save_bilingual_sidecar(
         .map_err(|_| "Could not finalize bilingual subtitle sidecar".to_owned())
 }
 
-async fn translated_subtitle_preview(
-    state: &AppState,
-    media: &Media,
-    source_contents: &str,
-    source_language: &str,
-    source_format: &str,
-    first: &str,
-    second: &str,
-    source_key: Option<&str>,
-) -> String {
-    let extension = source_format.to_ascii_lowercase();
-    let final_path = configured_bilingual_subtitle_path(state, media, first, second, &extension);
-    let Ok(fingerprint) = subtitle_translation_fingerprint(
-        media,
-        source_contents,
-        source_language,
-        &extension,
-        first,
-        second,
-        source_key,
-    ) else {
-        return "WEBVTT\n\n".to_owned();
-    };
-    let final_matches = subtitle_source_marker_matches(&final_path, &fingerprint, source_key).await;
-    if final_matches {
-        if let Ok(contents) = tokio::fs::read_to_string(&final_path).await {
-            let _ = write_subtitle_source_marker(&final_path, &fingerprint, source_key).await;
-            return subtitle_to_vtt(&contents, &extension);
-        }
-    }
-
-    let checkpoint_path = configured_bilingual_subtitle_path(state, media, first, second, "vtt");
-    let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
-    let source_input = match extension.as_str() {
-        "ass" => ass_to_vtt(source_contents),
-        _ => subtitle_to_vtt(source_contents, &extension),
-    };
-    let marker_matches = subtitle_source_marker_matches(&checkpoint_path, &fingerprint, source_key).await;
-    let legacy_matches = !marker_matches
-        && tokio::fs::metadata(subtitle_source_marker_path(&checkpoint_path)).await.is_err()
-        && subtitles::staged_vtt_matches_source(&checkpoint_path, &source_input).await;
-    let allow_checkpoint = marker_matches || legacy_matches;
-    let job_key = format!("{}:{fingerprint}", final_path.to_string_lossy());
-    let state = state.clone();
-    let media = media.clone();
-    let source_contents = source_contents.to_owned();
-    let source_language = source_language.to_owned();
-    let source_format = source_format.to_owned();
-    let first = first.to_owned();
-    let second = second.to_owned();
-    let source_key = source_key.map(str::to_owned);
-    let media_id = media.id.clone();
-    staged_subtitle_preview(
-        &final_path,
-        &checkpoint_path,
-        &media_id,
-        job_key,
-        false,
-        final_matches,
-        allow_checkpoint,
-        move |cancellation| async move {
-            if let Err(error) = translate_subtitle_cached_cancellable(
-                &state,
-                &media,
-                &source_contents,
-                &source_language,
-                &source_format,
-                &first,
-                &second,
-                Some(cancellation),
-                source_key.as_deref(),
-            )
-            .await
-            {
-                if error == "Bilingual translation stopped with playback" {
-                    info!(media = %media.title, "background bilingual subtitle generation paused with playback");
-                } else {
-                    tracing::error!(media = %media.title, error = %error, "background bilingual subtitle generation failed");
-                }
-            }
-        },
-    )
-    .await
-}
 
 async fn translated_subtitle_stream_response(
     state: &AppState,
     media: &Media,
-    source_contents: &str,
-    source_language: &str,
-    source_format: &str,
     first: &str,
     second: &str,
     requested_format: &str,
 ) -> Response {
-    let output_srt = requested_format == "srt";
-    let content_type = if output_srt {
-        "text/srt; charset=utf-8"
-    } else {
-        "text/vtt; charset=utf-8"
-    };
-    let vtt = translated_subtitle_preview(
-        state,
-        media,
-        source_contents,
-        source_language,
-        source_format,
-        first,
-        second,
-        None,
-    )
-    .await;
-    let body = if output_srt { vtt_to_srt(&vtt) } else { vtt };
-    ([(header::CONTENT_TYPE, content_type)], body).into_response()
+    for extension in ["srt", "vtt", "ass"] {
+        let path = configured_bilingual_subtitle_path(state, media, first, second, extension);
+        let Ok(contents) = tokio::fs::read_to_string(&path).await else {
+            continue;
+        };
+        let Some((content_type, contents)) =
+            external_subtitle_content(&contents, extension, requested_format)
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        return ([(header::CONTENT_TYPE, content_type)], contents).into_response();
+    }
+    StatusCode::NOT_FOUND.into_response()
 }
 
+#[cfg(test)]
 async fn staged_subtitle_preview<F, Fut>(
     final_path: &std::path::Path,
     checkpoint_path: &std::path::Path,
@@ -7528,14 +7426,17 @@ async fn add_plex_technical_metadata(
             first == language_primary && second == language_secondary
         })
     });
-    let has_translation_source = external_subtitles
-        .iter()
-        .any(|path| external_subtitle_pair(&media.path, path).is_none())
-        || supports_embedded_subtitle_extraction(media)
-            && technical_tracks(&info)
-                .iter()
-                .any(is_translatable_embedded_track);
-    let translation_available = enabled && !has_requested_bilingual_file && has_translation_source;
+    let has_saved_translation = ["srt", "vtt", "ass"].iter().any(|extension| {
+        configured_bilingual_subtitle_path(
+            state,
+            media,
+            &language_primary,
+            &language_secondary,
+            extension,
+        )
+        .is_file()
+    });
+    let translation_available = enabled && has_saved_translation && !has_requested_bilingual_file;
     let selection = state
         .plex_stream_selections
         .lock()
@@ -10935,47 +10836,6 @@ async fn read_subtitle_source(
     Ok((contents, language, "srt".to_owned()))
 }
 
-async fn preferred_subtitle_source(
-    state: &AppState,
-    media: &Media,
-) -> Result<(String, String, String), String> {
-    if let Some(stream_id) = state
-        .plex_stream_selections
-        .lock()
-        .ok()
-        .and_then(|selections| selections.get(&plex_part_id(media)).copied())
-        .and_then(|selection| selection.subtitle_stream_id)
-        .filter(|id| *id != 0)
-    {
-        if let Ok(source) = read_subtitle_source(state, media, stream_id).await {
-            return Ok(source);
-        }
-    }
-    let external_subtitles = external_subtitle_files(&media.path).await;
-    if let Some(path) = external_subtitles
-        .iter()
-        .find(|path| external_subtitle_pair(&media.path, path).is_none())
-    {
-        let stream_id = plex_external_subtitle_id(media, path);
-        return read_subtitle_source(state, media, stream_id).await;
-    }
-    let info = state
-        .media_info
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&media.id).cloned());
-    let info = match info {
-        Some(info) => info,
-        None => inspect_media(&media.path)
-            .await
-            .ok_or_else(|| "No readable subtitle source was found".to_owned())?,
-    };
-    let track = technical_tracks(&info)
-        .into_iter()
-        .find(|track| is_translatable_embedded_track(track))
-        .ok_or_else(|| "No readable text subtitle source was found".to_owned())?;
-    read_subtitle_source(state, media, technical_track_id(track).saturating_add(1)).await
-}
 
 fn extract_matroska_subtitle(
     video: &std::path::Path,
@@ -21277,11 +21137,6 @@ async fn plex_stream(
             .iter()
             .find(|media| plex_translated_subtitle_id(media, first, second) == stream_id)
         {
-            let Ok((source, source_language, format)) =
-                preferred_subtitle_source(&state, media).await
-            else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
             let requested = query
                 .get("format")
                 .map(|format| format.to_ascii_lowercase())
@@ -21289,9 +21144,6 @@ async fn plex_stream(
             return translated_subtitle_stream_response(
                 &state,
                 media,
-                &source,
-                &source_language,
-                &format,
                 first,
                 second,
                 &requested,
