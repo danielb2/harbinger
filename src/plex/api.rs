@@ -4428,7 +4428,19 @@ pub(crate) async fn plex_detect_markers(
             .get("threshold")
             .and_then(|value| value.parse::<f64>().ok()),
     );
+    let activity_metrics = state.metrics.clone();
+    let activity_key = format!("manual-markers:{}:{}", media.id, kind.as_str());
+    let activity_kind = format!("{} detection (manual)", kind.as_str());
+    let activity_title = media.title.clone();
+    let activity_detail = format!("Library item {}", media.id);
     tokio::spawn(async move {
+        let _activity = crate::harbinger::metrics::ActivityGuard::begin(
+            &activity_metrics,
+            activity_key,
+            activity_kind,
+            activity_title,
+            activity_detail,
+        );
         if let Err(error) = detect_markers_for_episode(state, media, kind, force, threshold).await {
             warn!(%error, marker_type = kind.as_str(), "marker detection failed");
         }

@@ -31,11 +31,11 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 ## Commands
 
 - Build: `cargo build`
-- Test: `cargo test`
+- Test: `cargo test` for the full suite; regular interactive/manual testing uses `just dev`.
 - After every code change, run an appropriate build, test, or lint check and inspect its complete output for errors and warnings; fix new diagnostics instead of overlooking them.
 - Before every code handoff, run the full `cargo test` suite. If it cannot run or fails, report that clearly and do not claim verification is complete.
 - Run: `cargo run`
-- Restart the running server with `SIGHUP`; do not use `SIGTERM`.
+- Do not send `SIGHUP` or other process signals to the running server.
 
 ## Structure
 

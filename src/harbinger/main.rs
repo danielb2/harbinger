@@ -2,6 +2,7 @@ use crate::plex::plex_tls;
 #[path = "api.rs"]
 mod api;
 pub(crate) mod markers;
+pub(crate) mod metrics;
 mod subtitles;
 
 pub(crate) use api::{
@@ -103,12 +104,29 @@ pub(crate) const USER_ID: &str = "mplex-user";
 
 static MARKER_DETECTION_GROUPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
-fn begin_marker_detection_group(key: String) -> bool {
-    MARKER_DETECTION_GROUPS
+fn begin_marker_detection_group(
+    state: &AppState,
+    key: String,
+    library_name: String,
+    show: &str,
+    season: u32,
+    kind: markers::MarkerKind,
+) -> Option<metrics::ActivityGuard> {
+    let inserted = MARKER_DETECTION_GROUPS
         .get_or_init(Default::default)
         .lock()
-        .map(|mut groups| groups.insert(key))
-        .unwrap_or(false)
+        .map(|mut groups| groups.insert(key.clone()))
+        .unwrap_or(false);
+    if !inserted {
+        return None;
+    }
+    Some(metrics::ActivityGuard::begin(
+        &state.metrics,
+        format!("markers:{key}"),
+        format!("{} detection", kind.as_str()),
+        format!("{show} · Season {season}"),
+        format!("Library: {library_name}"),
+    ))
 }
 
 fn end_marker_detection_group(key: &str) {
@@ -271,6 +289,7 @@ pub(crate) struct AppState {
     pub(crate) plex_remux_sessions: Arc<Mutex<HashMap<String, PlexRemuxSession>>>,
     pub(crate) plex_scrobbled_sessions: Arc<Mutex<HashSet<String>>>,
     pub(crate) plex_webhook_delivery_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) metrics: metrics::Metrics,
 
     pub(crate) plex_tls: PlexTls,
 }
@@ -658,12 +677,14 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+        metrics: metrics::Metrics::new(),
 
         plex_tls,
     };
     migrate_legacy_database_metadata(&state);
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
+    let metrics_task = tokio::spawn(metrics::run_sampler(state.metrics.clone()));
     let remux_cleanup_state = state.clone();
     let remux_cleanup_task = tokio::spawn(async move {
         loop {
@@ -812,6 +833,7 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     gdm_task.abort();
     publication_task.abort();
     inventory_scan_task.abort();
+    metrics_task.abort();
     remux_cleanup_task.abort();
     Ok(outcome)
 }
@@ -1246,6 +1268,13 @@ pub(crate) async fn scan_library_inventory(
         .get(library_id)
         .cloned()
         .ok_or_else(|| "Library does not exist".to_owned())?;
+    let _scan_activity = metrics::ActivityGuard::begin(
+        &state.metrics,
+        format!("scan:{library_id}"),
+        "library scan",
+        library.name.clone(),
+        "Scanning configured folders",
+    );
     let mut roots = Vec::with_capacity(library.folders.len());
     for configured_root in &library.folders {
         let canonical_root = tokio::fs::canonicalize(configured_root)
@@ -7219,13 +7248,14 @@ pub(crate) async fn detect_markers_for_episode(
         return Err("fewer than two episodes had decodable audio".to_owned());
     }
 
-    let ranges = markers::detect_shared_ranges(
-        &decoded
-            .iter()
-            .map(|(_, _, _, audio)| audio.clone())
-            .collect::<Vec<_>>(),
-        threshold,
-    );
+    let episode_audio = decoded
+        .iter()
+        .map(|(_, _, _, audio)| audio.clone())
+        .collect::<Vec<_>>();
+    let ranges = markers::run_low_priority(move || {
+        markers::detect_shared_ranges(&episode_audio, threshold)
+    })
+    .await?;
     let mut updated = 0usize;
     let Ok(db) = state.db.lock() else {
         return Err("marker database is unavailable".to_owned());
@@ -7294,9 +7324,16 @@ async fn detect_markers_for_library(
     for ((show, season), media) in groups {
         for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
             let key = format!("{}|{}|{}|{}", library_id, show, season, kind.as_str());
-            if !begin_marker_detection_group(key.clone()) {
+            let Some(_detection_activity) = begin_marker_detection_group(
+                &state,
+                key.clone(),
+                library.name.clone(),
+                &show,
+                season,
+                kind,
+            ) else {
                 continue;
-            }
+            };
             match detect_markers_for_episode(state.clone(), media.clone(), kind, force, threshold)
                 .await
             {

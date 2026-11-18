@@ -1,7 +1,8 @@
 use super::{
     build_app, build_plex_listener_app, build_web_listener_app, migrate_library_model,
     open_database, plex_external_subtitle_id, plex_part_id, plex_remux_audio_mode,
-    sync_config_libraries, AppState, Config, ConfigLibrary, Media, PlexTls, SkipMode,
+    sidebar_nav_with_settings, sync_config_libraries, AppState, Config, ConfigLibrary, Media,
+    PlexTls, SkipMode,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -179,6 +180,7 @@ fn fixture() -> Fixture {
         plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+        metrics: super::metrics::Metrics::new(),
 
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
@@ -280,6 +282,7 @@ fn tv_fixture() -> Fixture {
         plex_remux_sessions: Arc::new(Mutex::new(HashMap::new())),
         plex_scrobbled_sessions: Arc::new(Mutex::new(HashSet::new())),
         plex_webhook_delivery_lock: Arc::new(tokio::sync::Mutex::new(())),
+        metrics: super::metrics::Metrics::new(),
 
         plex_tls: PlexTls::load(root.join("config/certs")).unwrap(),
     };
@@ -378,7 +381,13 @@ async fn send_async_form(
 async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
     let fixture = fixture();
     let app = build_app(fixture.state.clone());
-    for path in ["/", "/settings", "/web/watch-action"] {
+    for path in [
+        "/",
+        "/settings?tab=dashboard",
+        "/settings",
+        "/web/dashboard/stats",
+        "/web/watch-action",
+    ] {
         let response = app
             .clone()
             .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
@@ -439,6 +448,19 @@ async fn web_and_plex_listener_surfaces_are_separated() {
         .await
         .unwrap();
     assert_eq!(plex_web_request.status(), StatusCode::NOT_FOUND);
+
+    let web_dashboard = build_web_listener_app(fixture.state.clone())
+        .oneshot(Request::builder().uri("/settings?tab=dashboard").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(web_dashboard.status(), StatusCode::SEE_OTHER);
+    assert_eq!(web_dashboard.headers()[header::LOCATION], "/auth");
+
+    let plex_dashboard = build_plex_listener_app(fixture.state.clone())
+        .oneshot(Request::builder().uri("/settings?tab=dashboard").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(plex_dashboard.status(), StatusCode::NOT_FOUND);
 
     let plex_root = build_plex_listener_app(fixture.state.clone())
         .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -7422,6 +7444,87 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
 }
 
 #[tokio::test]
+async fn dashboard_settings_tab_shows_live_charts_without_entering_browse_navigation() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/settings?tab=dashboard", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let page = String::from_utf8(page.to_vec()).unwrap();
+    for needle in [
+        "<h2 id=\"dashboard-heading\">Server dashboard</h2>",
+        "class=\"active\" href=\"/settings?tab=dashboard\"",
+        "id=\"dashboard-cpu-chart\"",
+        "id=\"dashboard-memory-chart\"",
+        "id=\"dashboard-network-chart\"",
+        "id=\"dashboard-disk-chart\"",
+        "id=\"dashboard-activities-body\"",
+        "id=\"dashboard-disks-body\"",
+        "fetch(\"/web/dashboard/stats\"",
+        "window.__harbingerDashboardCleanup",
+        "setInterval(refresh, 2000)",
+        "</script><script>\n(() => {",
+        "})();\n</script>",
+    ] {
+        assert!(page.contains(needle), "dashboard is missing {needle}");
+    }
+    let sidebar = sidebar_nav_with_settings(false);
+    assert!(!sidebar.contains("href=\"/dashboard\""));
+    assert!(!sidebar.contains(">Dashboard<"));
+}
+
+#[tokio::test]
+async fn dashboard_stats_reports_samples_and_active_tasks() {
+    let fixture = fixture();
+    fixture
+        .state
+        .metrics
+        .record(super::metrics::MetricSample {
+            at: 1_700_000_000,
+            host_cpu_percent: 42.5,
+            process_cpu_percent: 12.25,
+            host_memory_used_bytes: 4_000,
+            host_memory_total_bytes: 16_000,
+            host_memory_percent: 25.0,
+            process_memory_bytes: 2_000,
+            network_received_bytes_per_sec: 1_024.0,
+            network_transmitted_bytes_per_sec: 512.0,
+            disk_read_bytes_per_sec: 2_048.0,
+            disk_write_bytes_per_sec: 256.0,
+            process_disk_read_bytes_per_sec: 128.0,
+            process_disk_write_bytes_per_sec: 64.0,
+        });
+    assert!(fixture.state.metrics.begin_activity(
+        "test:marker:1",
+        "intro detection",
+        "Example Show · Season 1",
+        "Library: TV Shows",
+    ));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/dashboard/stats",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let stats: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(stats["series"].as_array().map(Vec::len), Some(1));
+    assert_eq!(stats["current"]["host_cpu_percent"], 42.5);
+    assert_eq!(stats["current"]["process_cpu_percent"], 12.25);
+    assert_eq!(stats["current"]["host_memory_percent"], 25.0);
+    assert_eq!(stats["current"]["network_received_bytes_per_sec"], 1_024.0);
+    let activity = &stats["activities"][0];
+    assert_eq!(activity["kind"], "intro detection");
+    assert_eq!(activity["title"], "Example Show · Season 1");
+    assert_eq!(activity["detail"], "Library: TV Shows");
+    assert!(stats["library"]["libraries"].as_u64().is_some());
+    assert!(stats["library"]["media_items"].as_u64().is_some());
+}
+
+#[tokio::test]
 async fn web_ui_pages_show_the_build_version_and_commit() {
     let fixture = fixture();
     let expected = format!(
@@ -7430,7 +7533,14 @@ async fn web_ui_pages_show_the_build_version_and_commit() {
         env!("HARBINGER_GIT_COMMIT")
     );
 
-    for path in ["/", "/?path=", "/settings", "/settings/browse", "/auth"] {
+    for path in [
+        "/",
+        "/?path=",
+        "/settings?tab=dashboard",
+        "/settings",
+        "/settings/browse",
+        "/auth",
+    ] {
         let response = send(&fixture.app, Method::GET, path, Body::empty()).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();

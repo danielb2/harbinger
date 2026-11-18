@@ -13,6 +13,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 get_if_addrs = "0.5"
 isolang = { version = "2.4", features = ["lowercase_names"] }
+libc = "0.2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "http1", "tokio"] }
 rcgen = { version = "0.13", features = ["aws_lc_rs"] }
@@ -27,6 +28,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["gzip", "json", "multipart", "rustls-tls"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.10"
+sysinfo = "0.40.4"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 tokio-util = { version = "0.7", features = ["io"] }

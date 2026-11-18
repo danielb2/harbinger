@@ -17,6 +17,7 @@ const MIN_RUN_FRAMES: usize = 24;
 const MAX_RUN_FRAMES: usize = 360;
 const MIN_USEFUL_FRAME_RATIO: f32 = 0.8;
 const DEFAULT_THRESHOLD: f32 = 0.6;
+const DETECTION_NICE: i32 = 10;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -330,6 +331,59 @@ pub(crate) fn detection_threshold(value: Option<f64>) -> f32 {
     threshold.clamp(0.001, 1.0)
 }
 
+struct LowPriorityGuard {
+    restore: Box<dyn Fn()>,
+}
+
+impl Drop for LowPriorityGuard {
+    fn drop(&mut self) {
+        (self.restore)();
+    }
+}
+
+/// Lower the current thread's scheduling priority for the duration of a
+/// CPU-bound marker-detection step. macOS can mark a single thread as
+/// background work; Linux applies `nice` per thread. The guard restores the
+/// prior priority before a pooled blocking thread is reused.
+fn lower_current_thread_priority() -> LowPriorityGuard {
+    #[cfg(target_os = "macos")]
+    let restore: Box<dyn Fn()> = {
+        unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, libc::PRIO_DARWIN_BG);
+        }
+        Box::new(|| unsafe {
+            libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, 0);
+        })
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let restore: Box<dyn Fn()> = {
+        let previous = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, DETECTION_NICE);
+        }
+        let previous = if previous >= 0 { previous } else { 0 };
+        Box::new(move || unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, previous);
+        })
+    };
+    #[cfg(not(unix))]
+    let restore: Box<dyn Fn()> = Box::new(|| {});
+    LowPriorityGuard { restore }
+}
+
+pub(crate) async fn run_low_priority<F, T>(task: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(move || {
+        let _guard = lower_current_thread_priority();
+        task()
+    })
+    .await
+    .map_err(|error| format!("marker detection task failed: {error}"))
+}
+
 pub(crate) async fn decode_audio_window(
     path: &std::path::Path,
     kind: MarkerKind,
@@ -347,7 +401,8 @@ pub(crate) async fn decode_audio_window(
     let window_seconds = (window_ms as f64) / 1000.0;
     let start_seconds = (window_start_ms as f64) / 1000.0;
 
-    let output = Command::new(ffmpeg)
+    let mut command = Command::new(ffmpeg);
+    command
         .arg("-nostdin")
         .arg("-hide_banner")
         .arg("-loglevel")
@@ -372,7 +427,18 @@ pub(crate) async fn decode_audio_window(
         .arg("pipe:1")
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, DETECTION_NICE);
+                Ok(())
+            });
+        }
+    }
+    let output = command
         .output()
         .await
         .map_err(|error| format!("could not start ffmpeg audio decoder: {error}"))?;
@@ -386,7 +452,11 @@ pub(crate) async fn decode_audio_window(
         });
     }
 
-    let frames = frames_from_pcm(&output.stdout);
+    let frames = run_low_priority({
+        let pcm = output.stdout;
+        move || frames_from_pcm(&pcm)
+    })
+    .await?;
     if frames.len() < MIN_RUN_FRAMES {
         return Err("audio window is too short for marker detection".to_owned());
     }
@@ -839,6 +909,11 @@ mod tests {
         assert_eq!(json["startTimeOffset"], 1_000);
         assert_eq!(json["endTimeOffset"], 2_000);
         assert_eq!(json["final"], true);
+    }
+
+    #[tokio::test]
+    async fn low_priority_detection_task_returns_its_result() {
+        assert_eq!(run_low_priority(|| 6 * 7).await.unwrap(), 42);
     }
 
     #[test]

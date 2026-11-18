@@ -9,6 +9,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/auth/setup", post(auth_setup))
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
+        .route("/web/dashboard/stats", get(dashboard_stats))
         .route("/web/stream", any(web_stream))
         .route("/web/index.html", get(web_index_redirect))
         .route("/web/", get(web_index_redirect))
@@ -1121,7 +1122,8 @@ pub(crate) async fn settings_page(
         })
         .unwrap_or_default();
     let logs_active = query.tab.as_deref() == Some("logs");
-    let settings_stack_style = if logs_active {
+    let dashboard_active = query.tab.as_deref() == Some("dashboard");
+    let settings_stack_style = if logs_active || dashboard_active {
         " style=\"display:none\""
     } else {
         ""
@@ -1143,9 +1145,15 @@ pub(crate) async fn settings_page(
     } else {
         String::new()
     };
+    let dashboard_content_html = if dashboard_active {
+        dashboard_markup()
+    } else {
+        ""
+    };
     let notice = format!(
-        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{}<dialog id=\"folder-picker\" aria-labelledby=\"folder-picker-title\" style=\"position:relative;width:min(48rem,calc(100vw - 2rem));height:min(38rem,calc(100vh - 2rem));padding:3.5rem 0 0;border:1px solid #394a63;border-radius:1rem;color:#e5eaf4;background:#101a2b\"><header style=\"position:absolute;top:.65rem;left:1rem;right:1rem;display:flex;align-items:center;justify-content:space-between\"><h2 id=\"folder-picker-title\">Choose a media folder</h2><button id=\"folder-picker-close\" type=\"button\" aria-label=\"Close folder picker\" title=\"Close folder picker\">×</button></header><iframe id=\"folder-picker-frame\" title=\"Media folder browser\" src=\"/settings/browse\" style=\"width:100%;height:calc(100% - 1rem);border:0;border-radius:0 0 1rem 1rem\"></iframe></dialog><script>document.addEventListener('DOMContentLoaded',()=>{{const params=new URLSearchParams(location.search);if(params.get('add_library')==='true')document.querySelector('.add-library')?.setAttribute('open','');const openLibrary=Number(params.get('library_open'));if(Number.isInteger(openLibrary)&&openLibrary>=0)document.querySelectorAll('.library-list details.library-card')[openLibrary]?.setAttribute('open','');}});</script>",
-        if logs_active { "" } else { "active" },
+        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=dashboard\">Dashboard</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{}<dialog id=\"folder-picker\" aria-labelledby=\"folder-picker-title\" style=\"position:relative;width:min(48rem,calc(100vw - 2rem));height:min(38rem,calc(100vh - 2rem));padding:3.5rem 0 0;border:1px solid #394a63;border-radius:1rem;color:#e5eaf4;background:#101a2b\"><header style=\"position:absolute;top:.65rem;left:1rem;right:1rem;display:flex;align-items:center;justify-content:space-between\"><h2 id=\"folder-picker-title\">Choose a media folder</h2><button id=\"folder-picker-close\" type=\"button\" aria-label=\"Close folder picker\" title=\"Close folder picker\">×</button></header><iframe id=\"folder-picker-frame\" title=\"Media folder browser\" src=\"/settings/browse\" style=\"width:100%;height:calc(100% - 1rem);border:0;border-radius:0 0 1rem 1rem\"></iframe></dialog><script>document.addEventListener('DOMContentLoaded',()=>{{const params=new URLSearchParams(location.search);if(params.get('add_library')==='true')document.querySelector('.add-library')?.setAttribute('open','');const openLibrary=Number(params.get('library_open'));if(Number.isInteger(openLibrary)&&openLibrary>=0)document.querySelectorAll('.library-list details.library-card')[openLibrary]?.setAttribute('open','');}});</script>",
+        if logs_active || dashboard_active { "" } else { "active" },
+        if dashboard_active { "active" } else { "" },
         if logs_active { "active" } else { "" },
         notice
     );
@@ -1297,6 +1305,8 @@ if (!window.__mplexSettingsDeleteBound) {
                 .ok()
         })
         .unwrap_or((false, false, None));
+    let dashboard_styles_html = if dashboard_active { dashboard_styles() } else { "" };
+    let dashboard_script_html = if dashboard_active { dashboard_script() } else { "" };
     let plex_auth = if plex_status.1 {
         if let Some(error) = plex_status.2.as_deref() {
             format!(
@@ -1343,6 +1353,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 .settings-logs .log-timestamp {{ color: #4ade80; }} .settings-logs .log-level-info {{ color: #facc15; font-weight: 700; }} .settings-logs .log-level-warn {{ color: #fb923c; font-weight: 700; }} .settings-logs .log-level-error {{ color: #f87171; font-weight: 700; }} .settings-logs .log-level-debug, .settings-logs .log-level-trace {{ color: #94a3b8; }} .settings-logs .log-key {{ color: #7dd3fc; }} .settings-logs .log-value {{ color: #c4b5fd; }}
 .log-filters {{ display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }} .log-filters > label:first-child {{ display: grid; flex: 1 1 16rem; gap: .45rem; color: #c9d4e4; font-size: .84rem; font-weight: 650; }} .log-filters > label:first-child input {{ margin-top: 0; }} .log-filters > label:nth-child(2) {{ display: flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: #c9d4e4; font-size: .84rem; }} #settings-logs-count {{ margin-left: auto; color: #98a6bb; font-size: .82rem; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
+{dashboard_styles_html}
 .settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
 </style></head><body><div class="app-shell">{}
 <main><header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
@@ -1352,7 +1363,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 {}{}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
-</div>{}
+</div>{}{dashboard_content_html}
  </main></div><script>
 const shell = document.querySelector('.app-shell'); const toggle = document.querySelector('.sidebar-toggle');
 if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.add('sidebar-collapsed');
@@ -1499,7 +1510,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
   filterLogs();
   connectLogs();
 }}
-</script></body></html>"#,
+</script>{dashboard_script_html}</body></html>"#,
         sidebar_nav_for_settings(&state),
         error,
         notice,
@@ -5264,6 +5275,14 @@ pub(crate) fn sidebar_nav_with_library_links(
     settings_active: bool,
     library_links: &str,
 ) -> String {
+    sidebar_nav_markup(home_active, settings_active, library_links)
+}
+
+fn sidebar_nav_markup(
+    home_active: bool,
+    settings_active: bool,
+    library_links: &str,
+) -> String {
     format!(
         r#"<aside class="sidebar">
   <div class="sidebar-top">
@@ -6133,6 +6152,252 @@ pub(crate) fn contains_hidden_component(path: &std::path::Path) -> bool {
     path.components().any(|component| {
         matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with('.')))
     })
+}
+
+pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
+    let snapshot = state.metrics.snapshot();
+    let current = snapshot.latest.clone().unwrap_or_default();
+    let generated_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    let library_count = state
+        .config
+        .lock()
+        .map(|config| config.libraries.len())
+        .unwrap_or_default();
+    let media_count = media_snapshot(&state).len();
+    let (markers_total, markers_last_24h) = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            let total = db
+                .query_row("SELECT COUNT(*) FROM media_markers", [], |row| row.get::<_, i64>(0))
+                .ok()?;
+            let recent = db
+                .query_row(
+                    "SELECT COUNT(*) FROM media_markers WHERE created_at >= ?1",
+                    [generated_at - 86_400],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()?;
+            Some((total, recent))
+        })
+        .unwrap_or((0, 0));
+
+    Json(serde_json::json!({
+        "generated_at": generated_at,
+        "current": current,
+        "series": snapshot.series,
+        "activities": snapshot.activities,
+        "library": {
+            "libraries": library_count,
+            "media_items": media_count,
+            "markers_total": markers_total,
+            "markers_last_24h": markers_last_24h,
+        },
+        "disks": snapshot.disks,
+    }))
+    .into_response()
+}
+
+fn dashboard_styles() -> &'static str {
+    r##"
+#dashboard-status { display: inline-flex; align-items: center; gap: .65rem; margin: 0 0 1rem; padding: .5rem .8rem; border: 1px solid #26354a; border-radius: 999px; color: #bdebd1; background: rgba(18, 52, 38, .45); font-size: .82rem; }
+#dashboard-status.is-error { color: #ffd6dc; background: rgba(56, 29, 42, .55); }
+#dashboard-status.is-error .status-dot { background: #f87171; box-shadow: 0 0 0 .22rem rgba(248, 113, 113, .14); }
+.dashboard-stack { display: grid; gap: 1.1rem; } .chart-grid, .dashboard-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.1rem; } .dashboard-grid { grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); }
+.metric-value { flex: 0 0 auto; color: #dbeafe; font-size: .88rem; font-weight: 700; text-align: right; }
+.dashboard-stack canvas { display: block; width: 100%; height: 170px; border: 1px solid #243248; border-radius: .6rem; background: #0a111e; }
+.dashboard-stack .legend { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: .65rem; color: #93a4bd; font-size: .78rem; } .dashboard-stack .legend span::before { display: inline-block; width: .6rem; height: .6rem; margin-right: .4rem; border-radius: 50%; background: var(--legend-color); content: ""; }
+.dashboard-stack .stat-list { display: grid; gap: .75rem; margin: 0; } .dashboard-stack .stat-row { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; padding-bottom: .6rem; border-bottom: 1px solid #243248; } .dashboard-stack .stat-row:last-child { border-bottom: 0; padding-bottom: 0; } .dashboard-stack .stat-row dt { color: #98a6bb; font-size: .84rem; } .dashboard-stack .stat-row dd { margin: 0; color: #e8eef8; font-size: .95rem; font-weight: 700; text-align: right; }
+.dashboard-stack table { width: 100%; border-collapse: collapse; font-size: .84rem; } .dashboard-stack th, .dashboard-stack td { padding: .6rem .5rem; border-bottom: 1px solid #243248; text-align: left; vertical-align: top; } .dashboard-stack th { color: #93a4bd; font-size: .72rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; } .dashboard-stack td { color: #d7e0ee; } .dashboard-stack tbody tr:last-child td { border-bottom: 0; } .dashboard-stack .empty-note { margin: .5rem 0 0; color: #8fa0b8; font-size: .85rem; }
+@media (max-width: 900px) { .chart-grid, .dashboard-grid { grid-template-columns: 1fr; } }
+"##
+}
+
+fn dashboard_markup() -> &'static str {
+    r##"<div class="dashboard-stack">
+<section class="settings-card" aria-labelledby="dashboard-heading"><div class="section-heading"><div><h2 id="dashboard-heading">Server dashboard</h2><p class="section-description">Live resource use and background work on this server. Samples are collected once a second and retained for two minutes.</p></div></div><p id="dashboard-status" class="status-line" role="status" aria-live="polite"><span class="status-dot"></span><span id="dashboard-status-text">Connecting to the metrics feed…</span></p></section>
+<div class="chart-grid">
+<section class="settings-card" aria-labelledby="cpu-heading"><div class="section-heading"><div><h2 id="cpu-heading">Processor</h2><p class="section-description">Whole host versus the Harbinger process.</p></div><span id="dashboard-cpu-summary" class="metric-value">—</span></div><canvas id="dashboard-cpu-chart" role="img" aria-label="CPU usage over time"></canvas><div class="legend"><span style="--legend-color:#60a5fa">Host CPU</span><span style="--legend-color:#f472b6">Harbinger CPU</span></div></section>
+<section class="settings-card" aria-labelledby="memory-heading"><div class="section-heading"><div><h2 id="memory-heading">Memory</h2><p class="section-description">Host utilization and resident process memory.</p></div><span id="dashboard-memory-summary" class="metric-value">—</span></div><canvas id="dashboard-memory-chart" role="img" aria-label="Memory usage over time"></canvas><div class="legend"><span style="--legend-color:#60a5fa">Host memory</span><span style="--legend-color:#f472b6">Harbinger memory</span></div></section>
+<section class="settings-card" aria-labelledby="network-heading"><div class="section-heading"><div><h2 id="network-heading">Network traffic</h2><p class="section-description">Aggregate non-loopback receive and transmit rates.</p></div><span id="dashboard-network-summary" class="metric-value">—</span></div><canvas id="dashboard-network-chart" role="img" aria-label="Network traffic over time"></canvas><div class="legend"><span style="--legend-color:#4ade80">Received</span><span style="--legend-color:#fbbf24">Transmitted</span></div></section>
+<section class="settings-card" aria-labelledby="disk-heading"><div class="section-heading"><div><h2 id="disk-heading">Disk activity</h2><p class="section-description">Filesystem reads and writes, plus Harbinger's own disk I/O.</p></div><span id="dashboard-disk-summary" class="metric-value">—</span></div><canvas id="dashboard-disk-chart" role="img" aria-label="Disk activity over time"></canvas><div class="legend"><span style="--legend-color:#4ade80">Read</span><span style="--legend-color:#fbbf24">Write</span><span style="--legend-color:#f472b6">Harbinger read</span></div></section>
+</div>
+<div class="dashboard-grid">
+<section class="settings-card" aria-labelledby="activity-heading"><div class="section-heading"><div><h2 id="activity-heading">Active work</h2><p class="section-description">Library scans and intro/credit detection currently running.</p></div></div><table id="dashboard-activities-table"><thead><tr><th>Type</th><th>Item</th><th>Location</th><th>Elapsed</th></tr></thead><tbody id="dashboard-activities-body"></tbody></table><p id="dashboard-activities-empty" class="empty-note">No active scans or detection tasks.</p></section>
+<section class="settings-card" aria-labelledby="library-heading"><div class="section-heading"><div><h2 id="library-heading">Library</h2><p class="section-description">Configured content and stored skip markers.</p></div></div><dl class="stat-list"><div class="stat-row"><dt>Libraries</dt><dd id="dashboard-library-count">—</dd></div><div class="stat-row"><dt>Media items</dt><dd id="dashboard-media-count">—</dd></div><div class="stat-row"><dt>Stored markers</dt><dd id="dashboard-marker-count">—</dd></div><div class="stat-row"><dt>Markers added in 24h</dt><dd id="dashboard-marker-recent">—</dd></div><div class="stat-row"><dt>Last sample</dt><dd id="dashboard-updated">—</dd></div></dl></section>
+</div>
+<section class="settings-card" aria-labelledby="disks-heading"><div class="section-heading"><div><h2 id="disks-heading">Filesystems</h2><p class="section-description">Capacity of mounted disks visible to Harbinger.</p></div></div><table id="dashboard-disks-table"><thead><tr><th>Disk</th><th>Mount</th><th>Used</th><th>Capacity</th></tr></thead><tbody id="dashboard-disks-body"></tbody></table><p id="dashboard-disks-empty" class="empty-note">No filesystem information is available.</p></section>
+</div>
+"##
+}
+
+fn dashboard_script() -> &'static str {
+    r##"<script>
+(() => {
+  const status = document.querySelector("#dashboard-status");
+  const statusText = document.querySelector("#dashboard-status-text");
+  let timer = null;
+  let latest = null;
+
+  const formatBytes = value => {
+    const number = Number(value) || 0;
+    if (number < 1024) return `${Math.round(number)} B`;
+    const units = ["KiB", "MiB", "GiB", "TiB"];
+    let scaled = number / 1024;
+    let unit = 0;
+    while (scaled >= 1024 && unit < units.length - 1) { scaled /= 1024; unit += 1; }
+    return `${scaled.toFixed(scaled >= 10 ? 0 : 1)} ${units[unit]}`;
+  };
+  const formatRate = value => `${formatBytes(value)}/s`;
+  const formatPercent = value => `${(Number(value) || 0).toFixed(1)}%`;
+  const setStatus = (text, live) => {
+    if (!statusText || !status) return;
+    statusText.textContent = text;
+    status.classList.toggle("is-error", !live);
+  };
+
+  const charts = [
+    { id: "dashboard-cpu-chart", max: 100, lines: [{ key: "host_cpu_percent", color: "#60a5fa" }, { key: "process_cpu_percent", color: "#f472b6" }] },
+    { id: "dashboard-memory-chart", max: 100, lines: [{ key: "host_memory_percent", color: "#60a5fa" }, { key: "process_memory_bytes", color: "#f472b6", scale: "memory" }] },
+    { id: "dashboard-network-chart", max: "auto", lines: [{ key: "network_received_bytes_per_sec", color: "#4ade80" }, { key: "network_transmitted_bytes_per_sec", color: "#fbbf24" }] },
+    { id: "dashboard-disk-chart", max: "auto", lines: [{ key: "disk_read_bytes_per_sec", color: "#4ade80" }, { key: "disk_write_bytes_per_sec", color: "#fbbf24" }, { key: "process_disk_read_bytes_per_sec", color: "#f472b6" }] },
+  ];
+
+  const valueFor = (sample, line) => {
+    const value = Number(sample[line.key]) || 0;
+    return line.scale === "memory" && sample.host_memory_total_bytes > 0
+      ? (value / sample.host_memory_total_bytes) * 100
+      : value;
+  };
+
+  function drawCharts() {
+    if (!latest) return;
+    const series = latest.series || [];
+    for (const chart of charts) {
+      const canvas = document.querySelector(`#${chart.id}`);
+      if (!canvas) continue;
+      const context = canvas.getContext("2d");
+      if (!context) continue;
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth || 800;
+      const height = canvas.clientHeight || 170;
+      const pixelWidth = Math.round(width * ratio);
+      const pixelHeight = Math.round(height * ratio);
+      if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+        canvas.width = pixelWidth;
+        canvas.height = pixelHeight;
+      }
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, width, height);
+      context.strokeStyle = "#243248";
+      context.lineWidth = 1;
+      for (let index = 0; index <= 4; index += 1) {
+        const y = Math.round((height - 1) * index / 4) + 0.5;
+        context.beginPath();
+        context.moveTo(0, y);
+        context.lineTo(width, y);
+        context.stroke();
+      }
+      if (series.length < 2) {
+        context.fillStyle = "#8091aa";
+        context.font = "13px system-ui, sans-serif";
+        context.fillText("Waiting for samples…", 12, height / 2);
+        continue;
+      }
+      let max = chart.max;
+      if (max === "auto") {
+        max = 1;
+        for (const sample of series) for (const line of chart.lines) max = Math.max(max, valueFor(sample, line));
+        max *= 1.15;
+      }
+      chart.lines.forEach(line => {
+        context.beginPath();
+        context.strokeStyle = line.color;
+        context.lineWidth = 2;
+        series.forEach((sample, index) => {
+          const x = (index / (series.length - 1)) * (width - 2) + 1;
+          const y = height - 1 - Math.min(valueFor(sample, line) / max, 1) * (height - 2);
+          if (index === 0) context.moveTo(x, y); else context.lineTo(x, y);
+        });
+        context.stroke();
+      });
+    }
+  }
+
+  function fillRows(tableBody, empty, rows) {
+    if (!tableBody || !empty) return;
+    tableBody.replaceChildren();
+    for (const values of rows) {
+      const row = document.createElement("tr");
+      for (const value of values) {
+        const cell = document.createElement("td");
+        cell.textContent = value;
+        row.append(cell);
+      }
+      tableBody.append(row);
+    }
+    empty.hidden = rows.length > 0;
+  }
+
+  function render() {
+    if (!latest) return;
+    const current = latest.current || {};
+    const library = latest.library || {};
+    const setText = (selector, value) => { const element = document.querySelector(selector); if (element) element.textContent = value; };
+    setText("#dashboard-cpu-summary", `Host ${formatPercent(current.host_cpu_percent)} · App ${formatPercent(current.process_cpu_percent)}`);
+    setText("#dashboard-memory-summary", `Host ${formatPercent(current.host_memory_percent)} · ${formatBytes(current.process_memory_bytes)}`);
+    setText("#dashboard-network-summary", `↓ ${formatRate(current.network_received_bytes_per_sec)} · ↑ ${formatRate(current.network_transmitted_bytes_per_sec)}`);
+    setText("#dashboard-disk-summary", `↓ ${formatRate(current.disk_read_bytes_per_sec)} · ↑ ${formatRate(current.disk_write_bytes_per_sec)}`);
+    setText("#dashboard-library-count", String(library.libraries ?? 0));
+    setText("#dashboard-media-count", String(library.media_items ?? 0));
+    setText("#dashboard-marker-count", String(library.markers_total ?? 0));
+    setText("#dashboard-marker-recent", String(library.markers_last_24h ?? 0));
+    setText("#dashboard-updated", latest.generated_at ? new Date(latest.generated_at * 1000).toLocaleTimeString() : "—");
+
+    fillRows(
+      document.querySelector("#dashboard-activities-body"),
+      document.querySelector("#dashboard-activities-empty"),
+      (latest.activities || []).map(activity => [activity.kind, activity.title, activity.detail, `${activity.elapsed_seconds}s`]),
+    );
+    fillRows(
+      document.querySelector("#dashboard-disks-body"),
+      document.querySelector("#dashboard-disks-empty"),
+      (latest.disks || []).map(disk => [
+        disk.name || "Disk",
+        disk.mount_point || "—",
+        `${formatPercent(disk.used_percent)} used · ${formatBytes(disk.available_bytes)} free`,
+        formatBytes(disk.total_bytes),
+      ]),
+    );
+    drawCharts();
+  }
+
+  async function refresh() {
+    try {
+      const response = await fetch("/web/dashboard/stats", { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      latest = await response.json();
+      render();
+      setStatus(`Live · updated ${new Date().toLocaleTimeString()}`, true);
+    } catch (error) {
+      setStatus("Connection lost · retrying", false);
+    }
+  }
+
+  window.__harbingerDashboardCleanup?.();
+  window.__harbingerDashboardCleanup = () => {
+    if (timer !== null) clearInterval(timer);
+    window.removeEventListener("resize", drawCharts);
+  };
+  window.addEventListener("resize", drawCharts);
+  refresh();
+  timer = setInterval(refresh, 2000);
+})();
+</script>"##
 }
 
 pub(crate) async fn web_index_redirect(
