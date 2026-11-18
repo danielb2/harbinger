@@ -509,6 +509,45 @@ async fn web_and_plex_listener_surfaces_are_separated() {
 }
 
 #[tokio::test]
+async fn favicon_is_served_without_web_authentication() {
+    let fixture = fixture();
+    let app = build_web_listener_app(fixture.state.clone());
+    let response = send(&app, Method::GET, "/favicon.ico", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/x-icon");
+    let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    assert_eq!(&body[..4], &[0, 0, 1, 0]);
+}
+
+#[tokio::test]
+async fn web_pages_reference_the_favicon() {
+    let fixture = fixture();
+    let app = build_app(fixture.state.clone());
+    for uri in ["/", "/auth", "/settings", "/settings/browse"] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .header(header::COOKIE, "harbinger_session=unit-test-session")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            html.contains(r#"<link rel="icon" href="/favicon.ico" sizes="any">"#),
+            "{uri} does not reference the favicon"
+        );
+    }
+}
+
+#[tokio::test]
 async fn first_run_creates_admin_and_starts_an_authenticated_session() {
     let fixture = fixture();
     let app = build_app(fixture.state.clone());

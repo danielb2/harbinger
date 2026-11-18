@@ -951,6 +951,7 @@ fn build_plex_listener_app(state: AppState) -> Router {
 
 fn is_web_surface_path(path: &str) -> bool {
     path == "/"
+        || path == "/favicon.ico"
         || path == "/auth"
         || path.starts_with("/auth/")
         || path == "/web"

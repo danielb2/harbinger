@@ -6,6 +6,7 @@ ENV HARBINGER_GIT_COMMIT=$GIT_COMMIT
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY build.rs ./build.rs
+COPY assets ./assets
 COPY src ./src
 RUN set -eux; \
     case "$TARGETARCH" in \
