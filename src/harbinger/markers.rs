@@ -1,6 +1,6 @@
 use std::{
     process::Stdio,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -17,7 +17,9 @@ const MIN_RUN_FRAMES: usize = 24;
 const MAX_RUN_FRAMES: usize = 360;
 const MIN_USEFUL_FRAME_RATIO: f32 = 0.8;
 const DEFAULT_THRESHOLD: f32 = 0.6;
-const DETECTION_NICE: i32 = 10;
+const DETECTION_NICE: i32 = 19;
+const DETECTION_WORK_SLICE: Duration = Duration::from_millis(4);
+const DETECTION_PAUSE: Duration = Duration::from_millis(4);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -343,8 +345,9 @@ impl Drop for LowPriorityGuard {
 
 /// Lower the current thread's scheduling priority for the duration of a
 /// CPU-bound marker-detection step. macOS can mark a single thread as
-/// background work; Linux applies `nice` per thread. The guard restores the
-/// prior priority before a pooled blocking thread is reused.
+/// background work; Linux `nice`s the calling thread by its TID so detection
+/// does not lower the priority of playback or other server threads. The guard
+/// restores the prior priority before a pooled blocking thread is reused.
 fn lower_current_thread_priority() -> LowPriorityGuard {
     #[cfg(target_os = "macos")]
     let restore: Box<dyn Fn()> = {
@@ -355,7 +358,24 @@ fn lower_current_thread_priority() -> LowPriorityGuard {
             libc::setpriority(libc::PRIO_DARWIN_THREAD, 0, 0);
         })
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let restore: Box<dyn Fn()> = {
+        let thread_id = unsafe { libc::syscall(libc::SYS_gettid) };
+        if thread_id < 0 {
+            Box::new(|| {})
+        } else {
+            let thread_id = thread_id as libc::id_t;
+            let previous = unsafe { libc::getpriority(libc::PRIO_PROCESS, thread_id) };
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, thread_id, DETECTION_NICE);
+            }
+            let previous = if previous >= 0 { previous } else { 0 };
+            Box::new(move || unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, thread_id, previous);
+            })
+        }
+    };
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "linux")))]
     let restore: Box<dyn Fn()> = {
         let previous = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
         unsafe {
@@ -369,6 +389,30 @@ fn lower_current_thread_priority() -> LowPriorityGuard {
     #[cfg(not(unix))]
     let restore: Box<dyn Fn()> = Box::new(|| {});
     LowPriorityGuard { restore }
+}
+
+/// Cooperatively gives the scheduler a break during long correlation loops.
+/// Scheduling priority alone still lets an isolated detection task occupy a
+/// whole core, so these pauses bound its duty cycle without changing results.
+#[derive(Debug)]
+struct DetectionBudget {
+    last_pause: Instant,
+}
+
+impl DetectionBudget {
+    fn new() -> Self {
+        Self {
+            last_pause: Instant::now(),
+        }
+    }
+
+    fn check(&mut self) {
+        if self.last_pause.elapsed() < DETECTION_WORK_SLICE {
+            return;
+        }
+        std::thread::sleep(DETECTION_PAUSE);
+        self.last_pause = Instant::now();
+    }
 }
 
 pub(crate) async fn run_low_priority<F, T>(task: F) -> Result<T, String>
@@ -407,6 +451,8 @@ pub(crate) async fn decode_audio_window(
         .arg("-hide_banner")
         .arg("-loglevel")
         .arg("error")
+        .arg("-threads")
+        .arg("1")
         .arg("-ss")
         .arg(start_seconds.to_string())
         .arg("-i")
@@ -477,10 +523,11 @@ pub(crate) fn detect_shared_ranges(
         return best;
     }
 
+    let mut budget = DetectionBudget::new();
     for first in 0..episodes.len() {
         for second in (first + 1)..episodes.len() {
             let (first_range, second_range) =
-                longest_shared_run(&episodes[first], &episodes[second], threshold);
+                longest_shared_run(&episodes[first], &episodes[second], threshold, &mut budget);
             keep_better(&mut best[first], first_range);
             keep_better(&mut best[second], second_range);
         }
@@ -507,6 +554,7 @@ fn longest_shared_run(
     first: &EpisodeAudio,
     second: &EpisodeAudio,
     threshold: f32,
+    budget: &mut DetectionBudget,
 ) -> (Option<DetectedRange>, Option<DetectedRange>) {
     let (first_frames, second_frames) = (&first.frames, &second.frames);
     if first_frames.len() < MIN_RUN_FRAMES || second_frames.len() < MIN_RUN_FRAMES {
@@ -523,6 +571,7 @@ fn longest_shared_run(
             }
         }
     }
+    budget.check();
     if baseline_count == 0 {
         return (None, None);
     }
@@ -536,6 +585,7 @@ fn longest_shared_run(
     let first_len = first_frames.len() as isize;
     let second_len = second_frames.len() as isize;
     for lag in -(second_len - 1)..first_len {
+        budget.check();
         let (first_base, second_base, overlap) = if lag >= 0 {
             let lag = lag as usize;
             (
@@ -914,6 +964,16 @@ mod tests {
     #[tokio::test]
     async fn low_priority_detection_task_returns_its_result() {
         assert_eq!(run_low_priority(|| 6 * 7).await.unwrap(), 42);
+    }
+
+    #[test]
+    fn detection_budget_pauses_after_a_work_slice() {
+        let mut budget = DetectionBudget {
+            last_pause: Instant::now() - DETECTION_WORK_SLICE,
+        };
+        let started = Instant::now();
+        budget.check();
+        assert!(started.elapsed() >= DETECTION_PAUSE.saturating_sub(Duration::from_millis(1)));
     }
 
     #[test]
