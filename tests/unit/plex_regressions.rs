@@ -118,3 +118,57 @@ fn plex_registration_distinguishes_instances_sharing_the_same_listener_port() {
     assert!(!ace_xml.contains(" port=\""));
     assert!(!nico_xml.contains(" port=\""));
 }
+
+fn function_source<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("missing function: {signature}"));
+    let body = &source[start..];
+    let end = body
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("unterminated function: {signature}"))
+        + 3;
+    &body[..end]
+}
+
+#[test]
+fn media_inspection_stays_out_of_render_and_in_detection() {
+    let main = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/harbinger/main.rs"
+    ))
+    .unwrap();
+    let api = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/harbinger/api.rs"))
+        .unwrap();
+
+    assert!(
+        !api.contains("inspect_media("),
+        "hb-web render must not call media inspection directly"
+    );
+    for signature in [
+        "pub(crate) async fn media_info_for",
+        "pub(crate) async fn web_audio_tracks",
+        "async fn subtitle_tracks",
+    ] {
+        let source = function_source(&main, signature);
+        assert!(
+            !source.contains("inspect_media("),
+            "{signature} must not await media inspection"
+        );
+        assert!(
+            !source.contains("ensure_media_info("),
+            "{signature} must not force inspection from a render path"
+        );
+    }
+
+    let scan_start = main
+        .find("pub(crate) async fn scan_library_metadata")
+        .expect("metadata scan is missing");
+    let scan_end = main
+        .find("async fn refresh_matched_metadata")
+        .expect("metadata scan end is missing");
+    assert!(
+        main[scan_start..scan_end].contains("persist_media_technical_info("),
+        "detection must write technical metadata to durable sidecars"
+    );
+}
