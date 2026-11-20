@@ -1,5 +1,8 @@
 use std::{
+    collections::BTreeMap,
+    path::Path,
     process::Stdio,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -78,6 +81,14 @@ impl MarkerSource {
         match self {
             Self::Detected => "detected",
             Self::User => "user",
+        }
+    }
+
+    fn from_str(value: &str) -> Self {
+        if value == "user" {
+            Self::User
+        } else {
+            Self::Detected
         }
     }
 }
@@ -297,6 +308,241 @@ fn insert_marker(
     Ok(connection.last_insert_rowid())
 }
 
+pub(crate) const MARKER_SIDECAR_VERSION: u32 = 1;
+
+static MARKER_SIDECAR_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn marker_sidecar_lock() -> std::sync::MutexGuard<'static, ()> {
+    MARKER_SIDECAR_LOCK
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct PortableMarker {
+    #[serde(rename = "type")]
+    pub(crate) kind: MarkerKind,
+    #[serde(rename = "startTimeOffset")]
+    pub(crate) start_ms: i64,
+    #[serde(rename = "endTimeOffset")]
+    pub(crate) end_ms: i64,
+    #[serde(rename = "final", default, skip_serializing_if = "is_false")]
+    pub(crate) final_marker: bool,
+    #[serde(default = "detected_source")]
+    pub(crate) source: String,
+    #[serde(default, rename = "mediaFingerprint")]
+    pub(crate) media_fingerprint: String,
+    #[serde(default, rename = "groupFingerprint")]
+    pub(crate) group_fingerprint: String,
+}
+
+fn detected_source() -> String {
+    MarkerSource::Detected.as_str().to_owned()
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MarkerFingerprint {
+    #[serde(default, rename = "mediaFingerprint")]
+    pub(crate) media: String,
+    #[serde(default, rename = "groupFingerprint")]
+    pub(crate) group: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct MarkerSidecarEntry {
+    #[serde(default)]
+    pub(crate) markers: Vec<PortableMarker>,
+    #[serde(default)]
+    pub(crate) fingerprints: BTreeMap<String, MarkerFingerprint>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct MarkerSidecar {
+    pub(crate) version: u32,
+    #[serde(default)]
+    pub(crate) items: BTreeMap<String, MarkerSidecarEntry>,
+}
+
+impl Default for MarkerSidecar {
+    fn default() -> Self {
+        Self {
+            version: MARKER_SIDECAR_VERSION,
+            items: BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) fn read_marker_sidecar(path: &Path) -> Option<MarkerSidecar> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let sidecar: MarkerSidecar = serde_json::from_str(&contents).ok()?;
+    (sidecar.version == MARKER_SIDECAR_VERSION).then_some(sidecar)
+}
+
+pub(crate) fn marker_sidecar_entry(path: &Path, key: &str) -> Option<MarkerSidecarEntry> {
+    read_marker_sidecar(path)?.items.get(key).cloned()
+}
+
+pub(crate) fn marker_fingerprint_from_sidecar(
+    path: &Path,
+    key: &str,
+    kind: MarkerKind,
+) -> Option<(String, String)> {
+    let entry = read_marker_sidecar(path)?.items.get(key)?.clone();
+    entry
+        .fingerprints
+        .get(kind.as_str())
+        .map(|fingerprint| (fingerprint.media.clone(), fingerprint.group.clone()))
+}
+
+pub(crate) fn database_markers_for_sidecar(
+    connection: &Connection,
+    media_key: &str,
+) -> Result<Vec<PortableMarker>, rusqlite::Error> {
+    let mut statement = connection.prepare(
+        "SELECT marker_type, start_ms, end_ms, final_marker, source,
+                media_fingerprint, group_fingerprint
+           FROM media_markers
+          WHERE media_key = ?1
+          ORDER BY start_ms, marker_id",
+    )?;
+    let rows = statement.query_map([media_key], |row| {
+        Ok(PortableMarker {
+            kind: parse_marker_kind(&row.get::<_, String>(0)?),
+            start_ms: row.get(1)?,
+            end_ms: row.get(2)?,
+            final_marker: row.get::<_, i64>(3)? != 0,
+            source: row.get(4)?,
+            media_fingerprint: row.get(5)?,
+            group_fingerprint: row.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
+pub(crate) fn marker_fingerprint_map(
+    connection: &Connection,
+    media_key: &str,
+) -> Result<BTreeMap<String, MarkerFingerprint>, rusqlite::Error> {
+    let mut fingerprints = BTreeMap::new();
+    for kind in [MarkerKind::Intro, MarkerKind::Credits] {
+        if let Some((media, group)) = marker_fingerprints(connection, media_key, kind)? {
+            fingerprints.insert(kind.as_str().to_owned(), MarkerFingerprint { media, group });
+        }
+    }
+    Ok(fingerprints)
+}
+
+pub(crate) fn update_detected_marker_fingerprints(
+    connection: &Connection,
+    media_key: &str,
+    kind: MarkerKind,
+    media_fingerprint: &str,
+    group_fingerprint: &str,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "UPDATE media_markers
+            SET media_fingerprint = ?1, group_fingerprint = ?2
+          WHERE media_key = ?3 AND marker_type = ?4 AND source = 'detected'",
+        params![
+            media_fingerprint,
+            group_fingerprint,
+            media_key,
+            kind.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn replace_markers_from_sidecar(
+    connection: &Connection,
+    media_key: &str,
+    markers: &[PortableMarker],
+) -> Result<(), rusqlite::Error> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "DELETE FROM media_markers WHERE media_key = ?1",
+        [media_key],
+    )?;
+    for marker in markers {
+        let created_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        transaction.execute(
+            "INSERT INTO media_markers
+                 (media_key, marker_type, start_ms, end_ms, final_marker, source,
+                  media_fingerprint, group_fingerprint, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                media_key,
+                marker.kind.as_str(),
+                marker.start_ms,
+                marker.end_ms,
+                i64::from(marker.final_marker),
+                MarkerSource::from_str(&marker.source).as_str(),
+                marker.media_fingerprint,
+                marker.group_fingerprint,
+                created_at
+            ],
+        )?;
+    }
+    transaction.commit()
+}
+
+fn write_marker_sidecar(path: &Path, sidecar: &MarkerSidecar) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let contents = serde_json::to_string_pretty(sidecar).map_err(std::io::Error::other)?;
+    let mut temporary = path.as_os_str().to_os_string();
+    temporary.push(".tmp");
+    std::fs::write(Path::new(&temporary), contents)?;
+    std::fs::rename(Path::new(&temporary), path)
+}
+
+pub(crate) fn write_marker_sidecar_entry(
+    path: &Path,
+    key: &str,
+    entry: Option<&MarkerSidecarEntry>,
+) -> Result<(), std::io::Error> {
+    let _guard = marker_sidecar_lock();
+    let mut sidecar = read_marker_sidecar(path).unwrap_or_default();
+    match entry {
+        Some(entry) => {
+            sidecar.items.insert(key.to_owned(), entry.clone());
+        }
+        None => {
+            sidecar.items.remove(key);
+        }
+    }
+    write_marker_sidecar(path, &sidecar)
+}
+
+pub(crate) fn update_marker_sidecar_entry(
+    path: &Path,
+    key: &str,
+    markers: Option<&[PortableMarker]>,
+    fingerprint: Option<(MarkerKind, &str, &str)>,
+) -> Result<(), std::io::Error> {
+    let _guard = marker_sidecar_lock();
+    let mut sidecar = read_marker_sidecar(path).unwrap_or_default();
+    let entry = sidecar.items.entry(key.to_owned()).or_default();
+    if let Some(markers) = markers {
+        entry.markers = markers.to_vec();
+    }
+    if let Some((kind, media, group)) = fingerprint {
+        entry.fingerprints.insert(
+            kind.as_str().to_owned(),
+            MarkerFingerprint {
+                media: media.to_owned(),
+                group: group.to_owned(),
+            },
+        );
+    }
+    write_marker_sidecar(path, &sidecar)
+}
+
 fn is_final(kind: MarkerKind, end_ms: i64, duration_ms: i64) -> bool {
     kind == MarkerKind::Credits && duration_ms > 0 && end_ms >= duration_ms.saturating_sub(1_000)
 }
@@ -433,6 +679,7 @@ pub(crate) async fn decode_audio_window(
     kind: MarkerKind,
     duration_ms: Option<i64>,
 ) -> Result<EpisodeAudio, String> {
+    let started = Instant::now();
     let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
     let window_ms = SEARCH_WINDOW.as_millis() as i64;
     let window_start_ms = match kind {
@@ -444,6 +691,17 @@ pub(crate) async fn decode_audio_window(
     };
     let window_seconds = (window_ms as f64) / 1000.0;
     let start_seconds = (window_start_ms as f64) / 1000.0;
+    tracing::info!(
+        marker_type = kind.as_str(),
+        path = %path.display(),
+        ffmpeg = %ffmpeg,
+        threads = 1,
+        nice = DETECTION_NICE,
+        window_ms,
+        window_start_ms,
+        duration_ms = duration_ms.unwrap_or(-1),
+        "starting ffmpeg audio window decode for marker detection"
+    );
 
     let mut command = Command::new(ffmpeg);
     command
@@ -506,6 +764,13 @@ pub(crate) async fn decode_audio_window(
     if frames.len() < MIN_RUN_FRAMES {
         return Err("audio window is too short for marker detection".to_owned());
     }
+    tracing::info!(
+        marker_type = kind.as_str(),
+        path = %path.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        frames = frames.len(),
+        "ffmpeg audio window decode finished"
+    );
 
     Ok(EpisodeAudio {
         frames,
@@ -518,10 +783,17 @@ pub(crate) fn detect_shared_ranges(
     episodes: &[EpisodeAudio],
     threshold: f32,
 ) -> Vec<Option<DetectedRange>> {
+    let started = Instant::now();
     let mut best = vec![None; episodes.len()];
     if episodes.len() < 2 {
         return best;
     }
+    tracing::info!(
+        episodes = episodes.len(),
+        comparisons = episodes.len() * (episodes.len() - 1) / 2,
+        threshold,
+        "starting shared-audio correlation for marker detection"
+    );
 
     let mut budget = DetectionBudget::new();
     for first in 0..episodes.len() {
@@ -532,6 +804,12 @@ pub(crate) fn detect_shared_ranges(
             keep_better(&mut best[second], second_range);
         }
     }
+    tracing::info!(
+        episodes = episodes.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        ranges_found = best.iter().filter(|range| range.is_some()).count(),
+        "shared-audio correlation finished"
+    );
     best
 }
 
@@ -988,5 +1266,92 @@ mod tests {
         assert_eq!(detection_threshold(None), DEFAULT_THRESHOLD);
         assert_eq!(detection_threshold(Some(-1.0)), DEFAULT_THRESHOLD);
         assert_eq!(detection_threshold(Some(10.0)), 1.0);
+    }
+
+    #[test]
+    fn marker_sidecar_round_trips_portable_markers() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("hbgr-marker-sidecar-{unique}"));
+        let path = directory.join(".hbgr/skip_markers.json");
+        let markers = vec![
+            PortableMarker {
+                kind: MarkerKind::Intro,
+                start_ms: 5_000,
+                end_ms: 45_000,
+                final_marker: false,
+                source: MarkerSource::Detected.as_str().to_owned(),
+                media_fingerprint: "media".to_owned(),
+                group_fingerprint: "group".to_owned(),
+            },
+            PortableMarker {
+                kind: MarkerKind::Credits,
+                start_ms: 300_000,
+                end_ms: 345_000,
+                final_marker: true,
+                source: MarkerSource::User.as_str().to_owned(),
+                media_fingerprint: String::new(),
+                group_fingerprint: String::new(),
+            },
+        ];
+        let mut fingerprints = BTreeMap::new();
+        fingerprints.insert(
+            MarkerKind::Intro.as_str().to_owned(),
+            MarkerFingerprint {
+                media: "media".to_owned(),
+                group: "group".to_owned(),
+            },
+        );
+        let entry = MarkerSidecarEntry {
+            markers: markers.clone(),
+            fingerprints,
+        };
+
+        write_marker_sidecar_entry(&path, "Season 01/ep01.mkv", Some(&entry)).unwrap();
+        update_marker_sidecar_entry(
+            &path,
+            "Season 01/ep02.mkv",
+            Some(&[]),
+            Some((MarkerKind::Credits, "media-2", "group-2")),
+        )
+        .unwrap();
+
+        let sidecar = read_marker_sidecar(&path).unwrap();
+        assert_eq!(sidecar.version, MARKER_SIDECAR_VERSION);
+        assert_eq!(sidecar.items["Season 01/ep01.mkv"], entry);
+        assert!(sidecar.items["Season 01/ep02.mkv"].markers.is_empty());
+        assert_eq!(
+            marker_sidecar_entry(&path, "Season 01/ep01.mkv").unwrap(),
+            entry
+        );
+        assert_eq!(
+            marker_fingerprint_from_sidecar(&path, "Season 01/ep02.mkv", MarkerKind::Credits),
+            Some(("media-2".to_owned(), "group-2".to_owned()))
+        );
+
+        let connection = Connection::open_in_memory().unwrap();
+        ensure_marker_schema(&connection).unwrap();
+        replace_markers_from_sidecar(&connection, "1-1", &markers).unwrap();
+        assert_eq!(
+            database_markers_for_sidecar(&connection, "1-1").unwrap(),
+            markers
+        );
+        assert_eq!(markers_for_media(&connection, "1-1").unwrap().len(), 2);
+        assert_eq!(
+            marker_fingerprint_map(&connection, "1-1")
+                .unwrap()
+                .get(MarkerKind::Intro.as_str())
+                .map(|fingerprint| fingerprint.media.as_str()),
+            Some("media")
+        );
+
+        write_marker_sidecar_entry(&path, "Season 01/ep01.mkv", None).unwrap();
+        let sidecar = read_marker_sidecar(&path).unwrap();
+        assert!(!sidecar.items.contains_key("Season 01/ep01.mkv"));
+        assert!(sidecar.items.contains_key("Season 01/ep02.mkv"));
+
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

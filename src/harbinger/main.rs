@@ -96,7 +96,7 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn, Span};
+use tracing::{debug, info, warn, Span};
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const WEB_UI_PORT: u16 = 4826;
@@ -171,6 +171,8 @@ pub(crate) struct Config {
     pub(crate) skip_intro_mode: SkipMode,
     #[serde(default = "default_skip_mode")]
     pub(crate) skip_credits_mode: SkipMode,
+    #[serde(default = "default_true")]
+    pub(crate) marker_detection_enabled: bool,
     #[serde(default)]
     pub(crate) plex_account_preferences: BTreeMap<String, String>,
 }
@@ -412,9 +414,15 @@ const MAX_LOG_LINES: usize = 1000;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 static LOG_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static LOG_BROADCAST: OnceLock<tokio::sync::broadcast::Sender<(u64, String)>> = OnceLock::new();
+static LOG_BROADCAST: OnceLock<tokio::sync::broadcast::Sender<LogEvent>> = OnceLock::new();
 
-fn log_broadcast() -> &'static tokio::sync::broadcast::Sender<(u64, String)> {
+#[derive(Clone)]
+pub(crate) enum LogEvent {
+    Entry(u64, String),
+    Cleared(u64),
+}
+
+fn log_broadcast() -> &'static tokio::sync::broadcast::Sender<LogEvent> {
     LOG_BROADCAST.get_or_init(|| tokio::sync::broadcast::channel(1024).0)
 }
 
@@ -517,7 +525,17 @@ fn push_log_line(line: String) {
     }
     logs.push_back(line.clone());
     let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
-    let _ = log_broadcast().send((sequence, line));
+    let _ = log_broadcast().send(LogEvent::Entry(sequence, line));
+}
+
+pub(crate) fn clear_log_lines() {
+    if let Some(logs) = LOG_BUFFER.get() {
+        logs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
+    let _ = log_broadcast().send(LogEvent::Cleared(sequence));
 }
 
 fn recent_log_lines() -> Vec<String> {
@@ -682,6 +700,8 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         plex_tls,
     };
     migrate_legacy_database_metadata(&state);
+    let startup_media = media_snapshot(&state);
+    sync_marker_sidecars(&state, &startup_media);
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let metrics_task = tokio::spawn(metrics::run_sampler(state.metrics.clone()));
@@ -1259,6 +1279,8 @@ pub(crate) async fn scan_library_inventory(
     state: &AppState,
     library_id: usize,
     match_unmatched: bool,
+    force: bool,
+    manual: bool,
 ) -> Result<usize, String> {
     let _scan_guard = state.inventory_scan_lock.lock().await;
     let library = state
@@ -1353,6 +1375,7 @@ pub(crate) async fn scan_library_inventory(
         .into_iter()
         .flat_map(|(_, _, media)| media)
         .collect::<Vec<_>>();
+    sync_marker_sidecars(state, &scanned);
     let scanned_count = scanned.len();
     let belongs_to_library = |media: &Media| {
         roots.iter().any(|(configured_root, canonical_root)| {
@@ -1464,7 +1487,7 @@ pub(crate) async fn scan_library_inventory(
             State(state.clone()),
             Path(library_id),
             Query(ScanQuery {
-                force: Some(false),
+                force: Some(force),
                 path: None,
                 refresh: None,
                 assets_only: Some(assets_only),
@@ -1478,15 +1501,17 @@ pub(crate) async fn scan_library_inventory(
     if library.kind == "tv" {
         let detection_state = state.clone();
         tokio::spawn(async move {
+            let mode = if manual { "manual" } else { "automatic" };
             if let Err(error) = detect_markers_for_library(
                 detection_state,
                 library_id + 1,
-                false,
+                force,
                 markers::detection_threshold(None),
+                manual,
             )
             .await
             {
-                warn!(%error, "automatic marker detection failed");
+                warn!(%error, mode, "marker detection failed");
             }
         });
     }
@@ -1514,7 +1539,7 @@ async fn library_scan_scheduler(state: AppState) {
                 continue;
             }
             *last_scan = now;
-            if let Err(error) = scan_library_inventory(&state, index, false).await {
+            if let Err(error) = scan_library_inventory(&state, index, false, false, false).await {
                 warn!(library = %library.name, %error, "automatic library scan failed");
             }
         }
@@ -1533,6 +1558,7 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             bilingual_subtitles_enabled: default_true(),
             skip_intro_mode: default_skip_mode(),
             skip_credits_mode: default_skip_mode(),
+            marker_detection_enabled: default_true(),
             plex_account_preferences: BTreeMap::new(),
         });
     }
@@ -1962,6 +1988,7 @@ pub(crate) struct SettingsQuery {
     pub(crate) server_name_saved: Option<bool>,
     pub(crate) inventory_scan: Option<usize>,
     pub(crate) inventory_error: Option<bool>,
+    pub(crate) force: Option<bool>,
     pub(crate) tab: Option<String>,
     pub(crate) library_renamed: Option<bool>,
     pub(crate) library_saved: Option<bool>,
@@ -2994,6 +3021,8 @@ pub(crate) struct TranslationSettingsForm {
 pub(crate) struct SkipSettingsForm {
     pub(crate) skip_intro_mode: String,
     pub(crate) skip_credits_mode: String,
+    #[serde(default)]
+    pub(crate) marker_detection_disabled: bool,
 }
 
 fn copy_metadata_storage(
@@ -4139,7 +4168,7 @@ fn tv_metadata_for_media(
 
 pub(crate) fn tv_episode_info(root: &PathBuf, media: &std::path::Path) -> Option<TvEpisodeInfo> {
     let stem = media.file_stem()?.to_str()?;
-    let (season_from_name, episode, marker_end) = parse_tv_episode_marker(stem)?;
+    let (season_from_name, episode, marker_end) = tv_episode_marker(stem)?;
     let season = media
         .strip_prefix(root)
         .ok()?
@@ -4225,9 +4254,7 @@ pub(crate) fn tv_show_title(root: &PathBuf, media: &std::path::Path) -> String {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("Episode");
-    if let Some(marker_start) = (0..stem.len()).find(|index| {
-        stem.is_char_boundary(*index) && parse_tv_episode_marker(&stem[*index..]).is_some()
-    }) {
+    if let Some((_, _, marker_start)) = tv_episode_marker(stem) {
         let prefix = stem[..marker_start]
             .trim_end_matches([' ', '.', '_', '-'])
             .replace(['.', '_'], " ");
@@ -4302,6 +4329,41 @@ fn parse_tv_episode_marker(stem: &str) -> Option<(Option<u32>, (u32, Option<u32>
         }
     }
     None
+}
+
+/// Single episode-recognition entry point for every UI, metadata, Plex, and marker surface.
+///
+/// Callers must use this instead of the individual parsers so a filename accepted in one place is
+/// accepted everywhere.
+pub(crate) fn tv_episode_marker(stem: &str) -> Option<(Option<u32>, (u32, Option<u32>), usize)> {
+    parse_tv_episode_marker(stem).or_else(|| trailing_episode_marker(stem))
+}
+
+fn trailing_episode_marker(stem: &str) -> Option<(Option<u32>, (u32, Option<u32>), usize)> {
+    let bytes = stem.as_bytes();
+    let mut end = bytes.len();
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let start = bytes[..end]
+        .iter()
+        .rposition(|byte| !byte.is_ascii_digit())
+        .map_or(0, |index| index + 1);
+    if start == end || end - start > 3 {
+        return None;
+    }
+    if start > 0 {
+        let separator = bytes[start - 1];
+        if separator.is_ascii_alphanumeric() || matches!(separator, b'(' | b')' | b']') {
+            return None;
+        }
+    }
+    let episode = std::str::from_utf8(&bytes[start..end])
+        .ok()?
+        .parse::<u32>()
+        .ok()
+        .filter(|episode| *episode > 0)?;
+    Some((None, (episode, None), start))
 }
 
 fn parse_digits(bytes: &[u8], start: usize) -> Option<(u32, usize)> {
@@ -4412,9 +4474,10 @@ struct SeasonInfo {
 }
 
 pub(crate) async fn inspect_media(path: &std::path::Path) -> Option<serde_json::Value> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        vuio_media_info::inspect(path)
+    let started = Instant::now();
+    let inspect_path = path.to_owned();
+    let result = tokio::task::spawn_blocking(move || {
+        vuio_media_info::inspect(inspect_path)
             .ok()?
             .to_json()
             .ok()
@@ -4422,7 +4485,17 @@ pub(crate) async fn inspect_media(path: &std::path::Path) -> Option<serde_json::
     })
     .await
     .ok()
-    .flatten()
+    .flatten();
+    let elapsed_ms = started.elapsed().as_millis();
+    if elapsed_ms > 250 {
+        info!(
+            path = %path.display(),
+            elapsed_ms,
+            inspected = result.is_some(),
+            "media inspection completed"
+        );
+    }
+    result
 }
 
 pub(crate) fn technical_tracks(info: &serde_json::Value) -> &[serde_json::Value] {
@@ -5071,6 +5144,84 @@ fn tv_metadata_with_episode_details(
     metadata
 }
 
+fn tmdb_season_episode_count(show_metadata: &serde_json::Value, season: u32) -> Option<u32> {
+    let seasons = show_metadata
+        .get("seasons")
+        .or_else(|| {
+            show_metadata
+                .get("metadata_json")
+                .and_then(|metadata| metadata.get("seasons"))
+        })
+        .and_then(serde_json::Value::as_array)?;
+    seasons
+        .iter()
+        .find(|entry| {
+            entry
+                .get("season_number")
+                .and_then(serde_json::Value::as_u64)
+                == Some(season as u64)
+        })
+        .and_then(|entry| entry.get("episode_count"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|count| u32::try_from(count).ok())
+}
+
+fn tmdb_episode_details_not_found(metadata: &serde_json::Value) -> bool {
+    metadata
+        .get("mplex_episode_details_not_found")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
+fn tmdb_episode_request_needed(
+    show_metadata: &serde_json::Value,
+    episode: &TvEpisodeInfo,
+    stored_metadata: Option<&serde_json::Value>,
+    replace_existing: bool,
+) -> bool {
+    if tmdb_season_episode_count(show_metadata, episode.season)
+        .is_some_and(|count| episode.episode > count)
+    {
+        return false;
+    }
+    if !replace_existing
+        && stored_metadata.is_some_and(|metadata| tmdb_episode_details_not_found(metadata))
+    {
+        return false;
+    }
+    true
+}
+
+fn tmdb_episode_not_found_metadata() -> serde_json::Value {
+    serde_json::json!({ "mplex_episode_details_not_found": true })
+}
+
+fn write_tv_episode_sidecar_metadata(
+    root: &std::path::Path,
+    media: &Media,
+    metadata: &serde_json::Value,
+) -> Result<(), String> {
+    let metadata_path = tv_episode_sidecar_metadata_path(root, media).ok_or_else(|| {
+        format!(
+            "Could not build episode metadata path for {}",
+            media.path.display()
+        )
+    })?;
+    let Some(directory) = metadata_path.parent() else {
+        return Err(format!(
+            "Could not build episode metadata directory for {}",
+            media.path.display()
+        ));
+    };
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create episode metadata directory: {error}"))?;
+    std::fs::write(
+        &metadata_path,
+        serde_json::to_vec_pretty(metadata).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("Could not save episode metadata: {error}"))
+}
+
 fn tv_episode_cache_stem(episode: &TvEpisodeInfo) -> String {
     format!("s{:02}e{:02}", episode.season, episode.episode)
 }
@@ -5139,20 +5290,41 @@ async fn download_tmdb_episode_metadata(
             continue;
         };
         let media_key = database_media_key(library_key, &media.id);
-        let cached_episode_metadata = if sidecar_mode {
+        let stored_metadata = if sidecar_mode {
             read_tv_episode_sidecar_metadata(root, media)
         } else {
             read_config_metadata(state, &media_key)
+        };
+        let cached_episode_metadata = if sidecar_mode {
+            stored_metadata.clone()
+        } else {
+            stored_metadata
+                .as_ref()
                 .and_then(|metadata| metadata.get("mplex_episode_metadata").cloned())
         };
         let details_cached = if sidecar_mode {
             cached_episode_metadata.is_some()
         } else {
-            read_config_metadata(state, &media_key)
+            stored_metadata
+                .as_ref()
                 .and_then(|metadata| metadata.get("mplex_episode_details_fetched").cloned())
                 .and_then(|value| value.as_bool())
                 == Some(true)
         };
+        if !tmdb_episode_request_needed(
+            show_metadata,
+            &episode,
+            stored_metadata.as_ref(),
+            replace_existing,
+        ) {
+            debug!(
+                show_id,
+                season = episode.season,
+                episode = episode.episode,
+                "TMDB episode details request skipped"
+            );
+            continue;
+        }
         let artwork_cached = tv_episode_artwork_path(state, library_key, root, media, sidecar_mode)
             .is_some_and(|path| path.is_file());
         let no_episode_still = cached_episode_metadata.as_ref().is_some_and(|metadata| {
@@ -5176,7 +5348,43 @@ async fn download_tmdb_episode_metadata(
         {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                warn!(show_id, season = episode.season, episode = episode.episode, status = %response.status(), "TMDB episode details request returned an error status");
+                let status = response.status();
+                warn!(show_id, season = episode.season, episode = episode.episode, status = %status, "TMDB episode details request returned an error status");
+                if status == reqwest::StatusCode::NOT_FOUND {
+                    let cached = if sidecar_mode {
+                        write_tv_episode_sidecar_metadata(
+                            root,
+                            media,
+                            &tmdb_episode_not_found_metadata(),
+                        )
+                    } else {
+                        let mut metadata = stored_metadata.clone().unwrap_or_else(|| {
+                            tv_metadata_for_media(
+                                show_metadata,
+                                &root.to_path_buf(),
+                                &media.path,
+                                "tv",
+                            )
+                        });
+                        if let Some(object) = metadata.as_object_mut() {
+                            object.insert(
+                                "mplex_episode_details_not_found".to_owned(),
+                                serde_json::Value::Bool(true),
+                            );
+                        }
+                        if write_config_metadata(state, &media_key, &metadata) {
+                            Ok(())
+                        } else {
+                            Err(format!(
+                                "Could not save episode metadata for {}",
+                                media.path.display()
+                            ))
+                        }
+                    };
+                    if let Err(error) = cached {
+                        warn!(show_id, season = episode.season, episode = episode.episode, error = %error, "Could not cache TMDB episode 404");
+                    }
+                }
                 continue;
             }
             Err(error) => {
@@ -5209,24 +5417,7 @@ async fn download_tmdb_episode_metadata(
             continue;
         }
         if sidecar_mode {
-            let metadata_path = tv_episode_sidecar_metadata_path(root, media).ok_or_else(|| {
-                format!(
-                    "Could not build episode metadata path for {}",
-                    media.path.display()
-                )
-            })?;
-            let Some(directory) = metadata_path.parent() else {
-                continue;
-            };
-            tokio::fs::create_dir_all(directory)
-                .await
-                .map_err(|error| format!("Could not create episode metadata directory: {error}"))?;
-            tokio::fs::write(
-                &metadata_path,
-                serde_json::to_vec_pretty(&episode_metadata).map_err(|error| error.to_string())?,
-            )
-            .await
-            .map_err(|error| format!("Could not save episode metadata: {error}"))?;
+            write_tv_episode_sidecar_metadata(root, media, &episode_metadata)?;
         } else {
             let metadata = read_config_metadata(state, &media_key).unwrap_or_else(|| {
                 tv_metadata_for_media(show_metadata, &root.to_path_buf(), &media.path, "tv")
@@ -6291,6 +6482,7 @@ async fn subtitle_tracks(
     library: Option<usize>,
     folder: Option<usize>,
 ) -> Vec<SubtitleTrack> {
+    let started = Instant::now();
     let mut tracks = Vec::new();
     let library_query = format!(
         "{}{}",
@@ -6382,6 +6574,15 @@ async fn subtitle_tracks(
         }
     }
     tracks.sort_by_key(|track| track.label.to_ascii_lowercase());
+    let elapsed_ms = started.elapsed().as_millis();
+    if elapsed_ms > 250 {
+        info!(
+            path = %media.path.display(),
+            elapsed_ms,
+            tracks = tracks.len(),
+            "subtitle tracks built"
+        );
+    }
     tracks
 }
 
@@ -6486,7 +6687,7 @@ pub(crate) fn tv_episode_display_name(name: &str) -> String {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or(name);
-    let Some((_, (episode, episode_end), marker_end)) = parse_tv_episode_marker(stem) else {
+    let Some((_, (episode, episode_end), marker_end)) = tv_episode_marker(stem) else {
         return name.to_owned();
     };
     let title = clean_episode_title(&stem[marker_end..]);
@@ -7098,17 +7299,29 @@ pub(crate) async fn media_duration_ms(media: &Media) -> Option<i64> {
         .and_then(|info| technical_duration_ms(&info))
 }
 
-fn media_fingerprint(media: &Media) -> String {
+fn portable_relative_path(path: &std::path::Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn media_fingerprint(root: &std::path::Path, media: &Media) -> String {
+    let relative = media.path.strip_prefix(root).unwrap_or(&media.path);
     let mut hasher = Sha256::new();
-    hasher.update(media.id.as_bytes());
-    hasher.update(media.path.to_string_lossy().as_bytes());
+    hasher.update(portable_relative_path(relative).as_bytes());
     hasher.update(media.size.to_le_bytes());
-    hasher.update(media.metadata_revision.to_le_bytes());
     format!("{:x}", hasher.finalize())
 }
 
-fn group_fingerprint(episodes: &[Media]) -> String {
-    let mut fingerprints = episodes.iter().map(media_fingerprint).collect::<Vec<_>>();
+fn group_fingerprint(root: &std::path::Path, episodes: &[Media]) -> String {
+    let mut fingerprints = episodes
+        .iter()
+        .map(|episode| media_fingerprint(root, episode))
+        .collect::<Vec<_>>();
     fingerprints.sort();
     let mut hasher = Sha256::new();
     for fingerprint in fingerprints {
@@ -7116,6 +7329,299 @@ fn group_fingerprint(episodes: &[Media]) -> String {
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+fn marker_sidecar_target(
+    library: &ConfigLibrary,
+    root: &std::path::Path,
+    media: &Media,
+) -> Option<(PathBuf, String)> {
+    if !media.path.starts_with(root) {
+        return None;
+    }
+    let group_path = metadata_group_path(&root.to_path_buf(), &media.path, &library.kind);
+    let directory = if group_path.is_file() {
+        group_path.parent().unwrap_or(group_path.as_path())
+    } else {
+        group_path.as_path()
+    };
+    let key = portable_relative_path(media.path.strip_prefix(directory).ok()?);
+    (!key.is_empty()).then(|| (directory.join(".hbgr").join("skip_markers.json"), key))
+}
+
+fn config_hbgr_dir(state: &AppState) -> PathBuf {
+    state
+        .subtitle_checkpoints_dir
+        .parent()
+        .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+        .join(".hbgr")
+}
+
+fn config_marker_sidecar_path(state: &AppState) -> PathBuf {
+    config_hbgr_dir(state).join("skip_markers.json")
+}
+
+fn config_marker_sidecar_key(
+    library_key: usize,
+    root: &std::path::Path,
+    media: &Media,
+) -> Option<String> {
+    let relative = portable_relative_path(media.path.strip_prefix(root).ok()?);
+    (!relative.is_empty()).then(|| format!("{library_key}/{relative}"))
+}
+
+struct MarkerSidecarLocations {
+    path: PathBuf,
+    key: String,
+    fallback: Option<(PathBuf, String)>,
+}
+
+fn marker_sidecar_locations(
+    state: &AppState,
+    library_key: usize,
+    library: &ConfigLibrary,
+    root: &std::path::Path,
+    media: &Media,
+) -> Option<MarkerSidecarLocations> {
+    let media_target = marker_sidecar_target(library, root, media);
+    let config_target = || {
+        Some((
+            config_marker_sidecar_path(state),
+            config_marker_sidecar_key(library_key, root, media)?,
+        ))
+    };
+    if state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config")
+    {
+        let (path, key) = config_target()?;
+        Some(MarkerSidecarLocations {
+            path,
+            key,
+            fallback: media_target,
+        })
+    } else {
+        let (path, key) = media_target?;
+        Some(MarkerSidecarLocations {
+            path,
+            key,
+            fallback: config_target(),
+        })
+    }
+}
+
+fn stable_marker_fingerprints(
+    state: &AppState,
+    library: &ConfigLibrary,
+    root: &std::path::Path,
+    media: &Media,
+) -> Option<(String, String)> {
+    if library.kind != "tv" {
+        return None;
+    }
+    let root = root.to_path_buf();
+    let info = tv_episode_info(&root, &media.path)?;
+    let show_title = tv_show_title(&root, &media.path);
+    let groups =
+        season_episode_candidates_by_number(state, library, &root, &show_title, info.season);
+    if groups.len() < 2 {
+        return None;
+    }
+    let episodes = groups
+        .values()
+        .filter_map(|files| files.first().cloned())
+        .collect::<Vec<_>>();
+    Some((
+        media_fingerprint(&root, media),
+        group_fingerprint(&root, &episodes),
+    ))
+}
+
+pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
+    let Ok(db) = state.db.lock() else {
+        return;
+    };
+    for media in items {
+        let Some((library_key, library)) = media_library(state, media) else {
+            continue;
+        };
+        let Some(root) = library
+            .folders
+            .iter()
+            .find(|folder| media.path.starts_with(folder))
+        else {
+            continue;
+        };
+        let Some(locations) = marker_sidecar_locations(state, library_key, &library, root, media)
+        else {
+            continue;
+        };
+        let path = locations.path.as_path();
+        let key = locations.key.as_str();
+        let stable = stable_marker_fingerprints(state, &library, root, media);
+        let imported = markers::marker_sidecar_entry(path, key).or_else(|| {
+            locations
+                .fallback
+                .as_ref()
+                .and_then(|(fallback_path, fallback_key)| {
+                    markers::marker_sidecar_entry(fallback_path, fallback_key)
+                })
+        });
+        match imported {
+            Some(imported) => {
+                info!(
+                    path = %path.display(),
+                    key,
+                    markers = imported.markers.len(),
+                    "importing skip markers from sidecar"
+                );
+                if let Err(error) =
+                    markers::replace_markers_from_sidecar(&db, &media.id, &imported.markers)
+                {
+                    warn!(
+                        path = %path.display(),
+                        %error,
+                        "could not import markers from sidecar"
+                    );
+                    continue;
+                }
+                let mut updated = imported.clone();
+                let mut changed = false;
+                if let Some((media_fingerprint, group_fingerprint)) = &stable {
+                    for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
+                        let detected = updated.fingerprints.contains_key(kind.as_str())
+                            || markers::marker_fingerprints(&db, &media.id, kind)
+                                .ok()
+                                .flatten()
+                                .is_some();
+                        if !detected {
+                            continue;
+                        }
+                        let fingerprint = markers::MarkerFingerprint {
+                            media: media_fingerprint.clone(),
+                            group: group_fingerprint.clone(),
+                        };
+                        if updated.fingerprints.get(kind.as_str()) != Some(&fingerprint) {
+                            updated
+                                .fingerprints
+                                .insert(kind.as_str().to_owned(), fingerprint);
+                            changed = true;
+                        }
+                        if let Err(error) = markers::update_detected_marker_fingerprints(
+                            &db,
+                            &media.id,
+                            kind,
+                            media_fingerprint,
+                            group_fingerprint,
+                        ) {
+                            warn!(
+                                path = %path.display(),
+                                %error,
+                                "could not update detected marker fingerprints"
+                            );
+                        }
+                    }
+                }
+                if changed {
+                    if let Err(error) =
+                        markers::write_marker_sidecar_entry(path, key, Some(&updated))
+                    {
+                        warn!(
+                            path = %path.display(),
+                            %error,
+                            "could not save stable marker fingerprints to sidecar"
+                        );
+                    }
+                }
+            }
+            None => {
+                let Ok(database_markers) = markers::database_markers_for_sidecar(&db, &media.id)
+                else {
+                    continue;
+                };
+                if database_markers.is_empty() {
+                    continue;
+                }
+                info!(
+                    path = %path.display(),
+                    key,
+                    markers = database_markers.len(),
+                    "exporting database skip markers to sidecar"
+                );
+                let mut fingerprints =
+                    markers::marker_fingerprint_map(&db, &media.id).unwrap_or_default();
+                if let Some((media_fingerprint, group_fingerprint)) = &stable {
+                    for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
+                        if markers::marker_fingerprints(&db, &media.id, kind)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
+                            continue;
+                        }
+                        fingerprints.insert(
+                            kind.as_str().to_owned(),
+                            markers::MarkerFingerprint {
+                                media: media_fingerprint.clone(),
+                                group: group_fingerprint.clone(),
+                            },
+                        );
+                        if let Err(error) = markers::update_detected_marker_fingerprints(
+                            &db,
+                            &media.id,
+                            kind,
+                            media_fingerprint,
+                            group_fingerprint,
+                        ) {
+                            warn!(
+                                path = %path.display(),
+                                %error,
+                                "could not update detected marker fingerprints"
+                            );
+                        }
+                    }
+                }
+                let entry = markers::MarkerSidecarEntry {
+                    markers: database_markers,
+                    fingerprints,
+                };
+                if let Err(error) = markers::write_marker_sidecar_entry(path, key, Some(&entry)) {
+                    warn!(
+                        path = %path.display(),
+                        %error,
+                        "could not export markers to sidecar"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn export_marker_sidecar(
+    state: &AppState,
+    media: &Media,
+    db: &Connection,
+    fingerprint: Option<(markers::MarkerKind, &str, &str)>,
+) -> Result<(), String> {
+    let (library_key, library) = media_library(state, media)
+        .ok_or_else(|| "media item is not in a configured library".to_owned())?;
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))
+        .ok_or_else(|| "media library folder was not found".to_owned())?;
+    let locations = marker_sidecar_locations(state, library_key, &library, root, media)
+        .ok_or_else(|| "marker sidecar location was not found".to_owned())?;
+    let database_markers = markers::database_markers_for_sidecar(db, &media.id)
+        .map_err(|error| format!("could not read markers from database: {error}"))?;
+    markers::update_marker_sidecar_entry(
+        &locations.path,
+        &locations.key,
+        Some(&database_markers),
+        fingerprint,
+    )
+    .map_err(|error| format!("could not write marker sidecar: {error}"))
 }
 
 fn season_episode_candidates_by_number(
@@ -7164,6 +7670,7 @@ pub(crate) async fn detect_markers_for_episode(
     force: bool,
     threshold: f32,
 ) -> Result<usize, String> {
+    let detection_started = Instant::now();
     let (_, library) = media_library(&state, &media)
         .ok_or_else(|| "media item is not in a configured library".to_owned())?;
     if library.kind != "tv" {
@@ -7194,29 +7701,66 @@ pub(crate) async fn detect_markers_for_episode(
         .collect::<Vec<_>>();
     let all_episode_files = episode_groups.values().flatten().collect::<Vec<_>>();
 
-    let group_fingerprint = group_fingerprint(&episodes);
+    let group_fingerprint = group_fingerprint(&root, &episodes);
+    info!(
+        marker_type = kind.as_str(),
+        show = %show_title,
+        season = episode_info.season,
+        force,
+        threshold,
+        episodes = episodes.len(),
+        all_files = all_episode_files.len(),
+        "marker detection started"
+    );
     if !force {
-        let fresh = state
-            .db
-            .lock()
-            .ok()
-            .and_then(|db| {
-                all_episode_files
-                    .iter()
-                    .all(|episode| {
-                        matches!(
-                            markers::marker_fingerprints(&db, &episode.id, kind),
-                            Ok(Some((media, group)))
-                                if media == media_fingerprint(episode)
-                                    && group == group_fingerprint
-                        )
-                    })
-                    .then_some(())
-            })
-            .is_some();
+        let Ok(db) = state.db.lock() else {
+            return Err("marker database is unavailable".to_owned());
+        };
+        let mut files_checked = 0usize;
+        let mut sidecar_fingerprints = 0usize;
+        let mut database_fingerprints = 0usize;
+        let fresh = all_episode_files.iter().all(|episode| {
+            files_checked += 1;
+            let expected_media = media_fingerprint(&root, episode);
+            let sidecar = marker_sidecar_target(&library, &root, episode);
+            let from_sidecar = sidecar
+                .as_ref()
+                .and_then(|(path, key)| markers::marker_fingerprint_from_sidecar(path, key, kind));
+            let from_database = markers::marker_fingerprints(&db, &episode.id, kind)
+                .ok()
+                .flatten();
+            if from_sidecar.is_some() {
+                sidecar_fingerprints += 1;
+            }
+            if from_database.is_some() {
+                database_fingerprints += 1;
+            }
+            [from_sidecar, from_database]
+                .into_iter()
+                .flatten()
+                .any(|(media, group)| media == expected_media && group == group_fingerprint)
+        });
         if fresh {
+            info!(
+                marker_type = kind.as_str(),
+                show = %show_title,
+                season = episode_info.season,
+                files_checked,
+                sidecar_fingerprints,
+                database_fingerprints,
+                "marker detection skipped because every episode has a current fingerprint"
+            );
             return Ok(0);
         }
+        info!(
+            marker_type = kind.as_str(),
+            show = %show_title,
+            season = episode_info.season,
+            files_checked,
+            sidecar_fingerprints,
+            database_fingerprints,
+            "marker detection fingerprint check found stale or missing markers"
+        );
     }
 
     let mut decoded = Vec::new();
@@ -7245,6 +7789,12 @@ pub(crate) async fn detect_markers_for_episode(
             ),
         }
     }
+    info!(
+        marker_type = kind.as_str(),
+        episodes = episodes.len(),
+        decoded = decoded.len(),
+        "marker detection audio decoding finished"
+    );
     if decoded.len() < 2 {
         return Err("fewer than two episodes had decodable audio".to_owned());
     }
@@ -7253,10 +7803,9 @@ pub(crate) async fn detect_markers_for_episode(
         .iter()
         .map(|(_, _, _, audio)| audio.clone())
         .collect::<Vec<_>>();
-    let ranges = markers::run_low_priority(move || {
-        markers::detect_shared_ranges(&episode_audio, threshold)
-    })
-    .await?;
+    let ranges =
+        markers::run_low_priority(move || markers::detect_shared_ranges(&episode_audio, threshold))
+            .await?;
     let mut updated = 0usize;
     let Ok(db) = state.db.lock() else {
         return Err("marker database is unavailable".to_owned());
@@ -7267,16 +7816,27 @@ pub(crate) async fn detect_markers_for_episode(
             .map(Vec::as_slice)
             .unwrap_or(std::slice::from_ref(episode));
         for file in files {
+            let file_fingerprint = media_fingerprint(&root, file);
             match markers::replace_detected_markers(
                 &db,
                 &file.id,
                 kind,
                 ranges[index].as_ref(),
-                &media_fingerprint(file),
+                &file_fingerprint,
                 &group_fingerprint,
                 *duration,
             ) {
-                Ok(()) => updated += 1,
+                Ok(()) => {
+                    updated += 1;
+                    if let Err(error) = export_marker_sidecar(
+                        &state,
+                        file,
+                        &db,
+                        Some((kind, &file_fingerprint, &group_fingerprint)),
+                    ) {
+                        return Err(error);
+                    }
+                }
                 Err(error) => warn!(
                     path = %file.path.display(),
                     %error,
@@ -7285,21 +7845,46 @@ pub(crate) async fn detect_markers_for_episode(
             }
         }
     }
+    info!(
+        marker_type = kind.as_str(),
+        show = %show_title,
+        season = episode_info.season,
+        rows_updated = updated,
+        elapsed_ms = detection_started.elapsed().as_millis(),
+        "marker detection finished"
+    );
     Ok(updated)
 }
 
-async fn detect_markers_for_library(
+pub(crate) fn marker_detection_allowed(enabled: bool, manual: bool) -> bool {
+    enabled || manual
+}
+
+pub(crate) async fn detect_markers_for_library(
     state: AppState,
     library_id: usize,
     force: bool,
     threshold: f32,
+    manual: bool,
 ) -> Result<usize, String> {
-    let library = state
-        .config
-        .lock()
-        .ok()
-        .and_then(|config| config.libraries.get(library_id - 1).cloned())
-        .ok_or_else(|| "library was not found".to_owned())?;
+    let (marker_detection_enabled, library) = {
+        let config = state
+            .config
+            .lock()
+            .map_err(|_| "server configuration is unavailable".to_owned())?;
+        (
+            config.marker_detection_enabled,
+            config.libraries.get(library_id - 1).cloned(),
+        )
+    };
+    let library = library.ok_or_else(|| "library was not found".to_owned())?;
+    if !marker_detection_allowed(marker_detection_enabled, manual) {
+        info!(
+            library_id,
+            "automatic marker detection is disabled in settings"
+        );
+        return Ok(0);
+    }
     if library.kind != "tv" {
         return Ok(0);
     }

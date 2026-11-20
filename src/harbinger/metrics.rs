@@ -122,12 +122,7 @@ impl Metrics {
         }
         inner.activities.insert(
             key,
-            (
-                kind.into(),
-                title.into(),
-                detail.into(),
-                unix_seconds(),
-            ),
+            (kind.into(), title.into(), detail.into(), unix_seconds()),
         );
         true
     }
@@ -201,8 +196,7 @@ impl Drop for ActivityGuard {
 }
 
 fn collect_disks() -> (Vec<DiskInfo>, (u64, u64)) {
-    let Ok(mut disks) =
-        Disks::new_with_refreshed_list_specifics(DiskRefreshKind::everything())
+    let Ok(mut disks) = Disks::new_with_refreshed_list_specifics(DiskRefreshKind::everything())
     else {
         return (Vec::new(), (0, 0));
     };
@@ -286,16 +280,18 @@ pub(crate) async fn run_sampler(metrics: Metrics) {
         let (disks, disk_io) = collect_disks();
         metrics.set_disks(disks);
 
-        let network_total = networks.iter().fold((0_u64, 0_u64), |totals, (name, data)| {
-            if is_loopback(name.to_string_lossy().as_ref()) {
-                totals
-            } else {
-                (
-                    totals.0.saturating_add(data.total_received()),
-                    totals.1.saturating_add(data.total_transmitted()),
-                )
-            }
-        });
+        let network_total = networks
+            .iter()
+            .fold((0_u64, 0_u64), |totals, (name, data)| {
+                if is_loopback(name.to_string_lossy().as_ref()) {
+                    totals
+                } else {
+                    (
+                        totals.0.saturating_add(data.total_received()),
+                        totals.1.saturating_add(data.total_transmitted()),
+                    )
+                }
+            });
         let process_io = system
             .process(pid)
             .map(|process| process.disk_usage())
@@ -322,12 +318,28 @@ pub(crate) async fn run_sampler(metrics: Metrics) {
                 .process(pid)
                 .map(|process| process.memory())
                 .unwrap_or_default(),
-            network_received_bytes_per_sec: safe_rate(network_total.0, previous_network.map(|v| v.0), elapsed),
-            network_transmitted_bytes_per_sec: safe_rate(network_total.1, previous_network.map(|v| v.1), elapsed),
+            network_received_bytes_per_sec: safe_rate(
+                network_total.0,
+                previous_network.map(|v| v.0),
+                elapsed,
+            ),
+            network_transmitted_bytes_per_sec: safe_rate(
+                network_total.1,
+                previous_network.map(|v| v.1),
+                elapsed,
+            ),
             disk_read_bytes_per_sec: safe_rate(disk_io.0, previous_disk_io.map(|v| v.0), elapsed),
             disk_write_bytes_per_sec: safe_rate(disk_io.1, previous_disk_io.map(|v| v.1), elapsed),
-            process_disk_read_bytes_per_sec: safe_rate(process_io.0, previous_process_io.map(|v| v.0), elapsed),
-            process_disk_write_bytes_per_sec: safe_rate(process_io.1, previous_process_io.map(|v| v.1), elapsed),
+            process_disk_read_bytes_per_sec: safe_rate(
+                process_io.0,
+                previous_process_io.map(|v| v.0),
+                elapsed,
+            ),
+            process_disk_write_bytes_per_sec: safe_rate(
+                process_io.1,
+                previous_process_io.map(|v| v.1),
+                elapsed,
+            ),
         };
         previous_network = Some(network_total);
         previous_disk_io = Some(disk_io);

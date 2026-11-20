@@ -46,6 +46,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         )
         .route("/settings/skipping", post(save_skip_settings))
         .route("/settings/logs/socket", get(settings_logs_socket))
+        .route("/settings/logs/clear", post(clear_logs))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
         .route("/settings/libraries/:id/save", post(save_library_settings))
@@ -84,6 +85,13 @@ pub(crate) async fn favicon_handler() -> Response {
         .into_response()
 }
 
+pub(crate) async fn clear_logs() -> Response {
+    clear_log_lines();
+    let mut response = Redirect::to("/settings?tab=logs").into_response();
+    response.extensions_mut().insert(SuppressHttpResponseLog);
+    response
+}
+
 pub(crate) async fn settings_logs_socket(upgrade: WebSocketUpgrade) -> Response {
     let mut response = upgrade
         .on_upgrade(|mut socket| async move {
@@ -109,11 +117,21 @@ pub(crate) async fn settings_logs_socket(upgrade: WebSocketUpgrade) -> Response 
                         Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {}
                     },
                     update = updates.recv() => match update {
-                        Ok((sequence, line)) if sequence > last_sequence => {
+                        Ok(LogEvent::Entry(sequence, line)) if sequence > last_sequence => {
                             let event = serde_json::json!({
                                 "type": "entry",
                                 "sequence": sequence,
                                 "line": line,
+                            });
+                            if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                                break;
+                            }
+                            last_sequence = sequence;
+                        }
+                        Ok(LogEvent::Cleared(sequence)) => {
+                            let event = serde_json::json!({
+                                "type": "cleared",
+                                "sequence": sequence,
                             });
                             if socket.send(Message::Text(event.to_string().into())).await.is_err() {
                                 break;
@@ -933,6 +951,7 @@ pub(crate) async fn save_skip_settings(
     };
     config.skip_intro_mode = skip_intro_mode;
     config.skip_credits_mode = skip_credits_mode;
+    config.marker_detection_enabled = !form.marker_detection_disabled;
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -951,6 +970,7 @@ pub(crate) async fn settings_page(
         subtitle_language_secondary,
         skip_intro_mode,
         skip_credits_mode,
+        marker_detection_enabled,
     ) = {
         let Ok(config) = state.config.lock() else {
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -989,6 +1009,7 @@ pub(crate) async fn settings_page(
             config.subtitle_language_secondary.clone(),
             config.skip_intro_mode,
             config.skip_credits_mode,
+            config.marker_detection_enabled,
         )
     };
     let list = libraries
@@ -1022,7 +1043,7 @@ pub(crate) async fn settings_page(
                     concat!(
                         "<form class=\"library-settings\" id=\"library-settings-{0}\" method=\"post\" action=\"/settings/libraries/{0}/save\" aria-label=\"Library settings\"></form><div class=\"library-rename\" style=\"display:flex;flex-wrap:nowrap;align-items:center;gap:.55rem\"><label for=\"library-name-{0}\" style=\"flex:0 0 auto\">Library name</label><input id=\"library-name-{0}\" name=\"name\" type=\"text\" form=\"library-settings-{0}\" value=\"{1}\" maxlength=\"64\" required style=\"flex:1 1 auto;width:auto;min-width:0\"></div>",
                         "<div class=\"library-scan-settings\"><strong>Automatic scan</strong><label><input type=\"checkbox\" name=\"scan_enabled\" value=\"true\" form=\"library-settings-{0}\" {2}> Enabled</label><label>Every <input type=\"number\" name=\"scan_interval_value\" min=\"1\" value=\"{3}\" required form=\"library-settings-{0}\"><select name=\"scan_interval_unit\" form=\"library-settings-{0}\">{4}</select></label>",
-                        "<div class=\"library-scan-actions\" style=\"display:flex;flex:0 0 auto;align-items:center;gap:.4rem;white-space:nowrap\"><button type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan\" formnovalidate>Scan metadata</button><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan?force=true\" formnovalidate>Force rescan</button></div></div>",
+                        "<div class=\"library-scan-actions\" style=\"display:flex;flex:0 0 auto;align-items:center;gap:.4rem;white-space:nowrap\"><button type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan\" formnovalidate>Scan metadata</button><button type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan-files\" formnovalidate>Scan files</button><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan-files?force=true\" formnovalidate>Force scan &amp; detect</button><button class=\"button-secondary\" type=\"submit\" form=\"library-settings-{0}\" formmethod=\"post\" formaction=\"/settings/libraries/{0}/scan?force=true\" formnovalidate>Force metadata</button></div></div>",
                         "<div class=\"library-display\" style=\"margin-top:.8rem\"><fieldset><legend>Show on Home</legend><label><input type=\"checkbox\" name=\"show_recently_added\" value=\"true\" form=\"library-settings-{0}\" {5}> Recently Added</label><label><input type=\"checkbox\" name=\"show_continue_watching\" value=\"true\" form=\"library-settings-{0}\" {6}> Continue Watching</label></fieldset></div>"
                     ),
 
@@ -1063,7 +1084,7 @@ pub(crate) async fn settings_page(
     let mut list = list;
     list.insert_str(
         0,
-        r#"<form class="library-card" method="post" action="/settings/scan"><button type="submit">Scan all libraries</button></form>"#,
+        r#"<form class="library-card" method="post" action="/settings/scan"><div style="display:flex;flex-wrap:wrap;gap:.4rem"><button type="submit">Scan all libraries</button><button class="button-secondary" type="submit" formaction="/settings/scan?force=true">Force scan all &amp; detect</button></div></form>"#,
     );
     let subtitle_settings = format!(
         r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbinger generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Generate bilingual subtitles with Google Translate. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
@@ -1072,9 +1093,14 @@ pub(crate) async fn settings_page(
         translation_language_options(&subtitle_language_secondary),
     );
     let skip_settings = format!(
-        r#"<details class="settings-card settings-section" id="skip-settings"><summary class="settings-section-summary"><span><strong>Intro and credits skipping</strong><small>Choose how Harbinger's player reacts to detected markers.</small></span></summary><form method="post" action="/settings/skipping" class="settings-form settings-section-content"><p class="note">Automatic seeks to two seconds before a marker ends. Manual shows a Skip Intro or Skip Credits button while playback is inside the marker. Off hides skip controls and disables automatic skipping.</p><div class="form-grid"><label class="field"><span>Intro skipping</span><select name="skip_intro_mode">{}</select></label><label class="field"><span>Credits skipping</span><select name="skip_credits_mode">{}</select></label></div><div><button type="submit">Save skipping settings</button></div></form></details>"#,
+        r#"<details class="settings-card settings-section" id="skip-settings"><summary class="settings-section-summary"><span><strong>Intro and credits skipping</strong><small>Choose how Harbinger's player reacts to detected markers.</small></span></summary><form method="post" action="/settings/skipping" class="settings-form settings-section-content"><p class="note">Automatic seeks to two seconds before a marker ends. Manual shows a Skip Intro or Skip Credits button while playback is inside the marker. Off hides skip controls and disables automatic skipping.</p><div class="form-grid"><label class="field"><span>Intro skipping</span><select name="skip_intro_mode">{}</select></label><label class="field"><span>Credits skipping</span><select name="skip_credits_mode">{}</select></label></div><label class="settings-toggle"><input type="checkbox" name="marker_detection_disabled" value="true"{}> Disable automatic intro/credit detection</label><p class="note">Automatic detection decodes episode audio after library scans. Turning it off keeps existing markers and manual detection available.</p><div><button type="submit">Save skipping settings</button></div></form></details>"#,
         skip_mode_options(skip_intro_mode),
         skip_mode_options(skip_credits_mode),
+        if marker_detection_enabled {
+            ""
+        } else {
+            " checked"
+        },
     );
     let error = query
         .error
@@ -1114,8 +1140,13 @@ pub(crate) async fn settings_page(
         })
         .or_else(|| {
             query.inventory_scan.map(|count| {
+                let mode = if query.force.unwrap_or(false) {
+                    "Forced scan"
+                } else {
+                    "Scanned"
+                };
                 format!(
-                    "<div class=\"flash-notice\" role=\"status\">Scanned all libraries; found {count} media files.</div>"
+                    "<div class=\"flash-notice\" role=\"status\">{mode} all libraries; found {count} media files.</div>"
                 )
             })
         })
@@ -1154,7 +1185,7 @@ pub(crate) async fn settings_page(
             "<p id=\"settings-logs-empty\" class=\"note\" hidden>No log entries yet.</p>"
         };
         format!(
-            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><form method=\"post\" action=\"/settings/logs/clear\" style=\"margin:0\"><button class=\"button-secondary\" id=\"settings-logs-clear\" type=\"submit\" title=\"Clear the in-memory log buffer\">Clear log</button></form><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
         )
     } else {
         String::new()
@@ -1319,8 +1350,16 @@ if (!window.__mplexSettingsDeleteBound) {
                 .ok()
         })
         .unwrap_or((false, false, None));
-    let dashboard_styles_html = if dashboard_active { dashboard_styles() } else { "" };
-    let dashboard_script_html = if dashboard_active { dashboard_script() } else { "" };
+    let dashboard_styles_html = if dashboard_active {
+        dashboard_styles()
+    } else {
+        ""
+    };
+    let dashboard_script_html = if dashboard_active {
+        dashboard_script()
+    } else {
+        ""
+    };
     let plex_auth = if plex_status.1 {
         if let Some(error) = plex_status.2.as_deref() {
             format!(
@@ -1373,7 +1412,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <main><header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbinger to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbinger.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
-<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata and artwork are written only to the selected location.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
+<section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata, artwork, and skip markers are written only to the selected location. Config mode never writes to media folders.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
 {}{}
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
@@ -1505,6 +1544,9 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
       try {{ update = JSON.parse(event.data); }} catch {{ return; }}
       if (update.type === 'snapshot' && Array.isArray(update.lines)) {{
         logLines = update.lines;
+        lastSequence = update.sequence;
+      }} else if (update.type === 'cleared') {{
+        logLines = [];
         lastSequence = update.sequence;
       }} else if (update.type === 'entry' && update.sequence > lastSequence) {{
         logLines.push(update.line);
@@ -2444,7 +2486,11 @@ pub(crate) async fn update_library_scan_settings(
     Redirect::to("/settings").into_response()
 }
 
-pub(crate) async fn scan_all_libraries(State(state): State<AppState>) -> Response {
+pub(crate) async fn scan_all_libraries(
+    State(state): State<AppState>,
+    Query(query): Query<BTreeMap<String, String>>,
+) -> Response {
+    let force = query_bool(&query, "force");
     let library_count = match state.config.lock() {
         Ok(config) => config.libraries.len(),
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -2452,7 +2498,7 @@ pub(crate) async fn scan_all_libraries(State(state): State<AppState>) -> Respons
     let mut media_count = 0;
     let mut failed = false;
     for library_id in 0..library_count {
-        match scan_library_inventory(&state, library_id, true).await {
+        match scan_library_inventory(&state, library_id, true, force, true).await {
             Ok(count) => media_count += count,
             Err(error) => {
                 failed = true;
@@ -2461,7 +2507,7 @@ pub(crate) async fn scan_all_libraries(State(state): State<AppState>) -> Respons
         }
     }
     Redirect::to(&format!(
-        "/settings?inventory_scan={media_count}&inventory_error={failed}"
+        "/settings?inventory_scan={media_count}&inventory_error={failed}&force={force}"
     ))
     .into_response()
 }
@@ -2469,8 +2515,10 @@ pub(crate) async fn scan_all_libraries(State(state): State<AppState>) -> Respons
 pub(crate) async fn scan_library_inventory_handler(
     State(state): State<AppState>,
     Path(library_id): Path<usize>,
+    Query(query): Query<BTreeMap<String, String>>,
 ) -> Response {
-    match scan_library_inventory(&state, library_id, true).await {
+    let force = query_bool(&query, "force");
+    match scan_library_inventory(&state, library_id, true, force, true).await {
         Ok(count) => Redirect::to(&format!("/settings?inventory_scan={count}")).into_response(),
         Err(error) => {
             warn!(library_id, %error, "manual library scan failed");
@@ -4732,24 +4780,8 @@ pub(crate) async fn episode_info_panel(
     relative: &std::path::Path,
 ) -> String {
     let path = root.join(relative);
-    let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+    let Some(episode_info) = tv_episode_info(&root.to_path_buf(), &path) else {
         return String::new();
-    };
-    let Some((season_from_name, (episode_number, episode_end), marker_end)) =
-        parse_tv_episode_marker(stem)
-    else {
-        return String::new();
-    };
-    let episode_info = TvEpisodeInfo {
-        season: path
-            .components()
-            .filter_map(|component| component.as_os_str().to_str())
-            .find_map(parse_tv_season_directory)
-            .or(season_from_name)
-            .unwrap_or(1),
-        episode: episode_number,
-        episode_end,
-        episode_title: clean_episode_title(&stem[marker_end..]),
     };
     let media_index = media_snapshot(state);
     let show_directory = relative
@@ -4806,7 +4838,7 @@ pub(crate) async fn episode_info_panel(
                         episodes.iter().find(|item| {
                             item.get("episode_number")
                                 .and_then(serde_json::Value::as_u64)
-                                == Some(episode_number as u64)
+                                == Some(episode_info.episode as u64)
                         })
                     })
                     .cloned()
@@ -5293,11 +5325,7 @@ pub(crate) fn sidebar_nav_with_library_links(
     sidebar_nav_markup(home_active, settings_active, library_links)
 }
 
-fn sidebar_nav_markup(
-    home_active: bool,
-    settings_active: bool,
-    library_links: &str,
-) -> String {
+fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &str) -> String {
     format!(
         r#"<aside class="sidebar">
   <div class="sidebar-top">
@@ -5370,7 +5398,7 @@ pub(crate) fn breadcrumb_nav(
                     selected
                         .file_stem()
                         .and_then(|stem| stem.to_str())
-                        .and_then(|stem| parse_tv_episode_marker(stem))
+                        .and_then(|stem| tv_episode_marker(stem))
                         .and_then(|(season, _, _)| season)
                 })
         });
@@ -6188,7 +6216,9 @@ pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
         .ok()
         .and_then(|db| {
             let total = db
-                .query_row("SELECT COUNT(*) FROM media_markers", [], |row| row.get::<_, i64>(0))
+                .query_row("SELECT COUNT(*) FROM media_markers", [], |row| {
+                    row.get::<_, i64>(0)
+                })
                 .ok()?;
             let recent = db
                 .query_row(
@@ -6437,6 +6467,16 @@ pub(crate) async fn web_index_redirect(
     Redirect::temporary(&format!("http://{host}:{WEB_UI_PORT}/")).into_response()
 }
 
+async fn timed_web_client(state: AppState, query: WebPath, request_path: String) -> Response {
+    let started = Instant::now();
+    let response = web_client(State(state), Query(query)).await;
+    let elapsed_ms = started.elapsed().as_millis();
+    if elapsed_ms > 250 {
+        info!(path = %request_path, elapsed_ms, "web client request completed");
+    }
+    response
+}
+
 pub(crate) async fn root_handler(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -6454,7 +6494,7 @@ pub(crate) async fn root_handler(
             || query.episode.is_some()
             || query.view.is_some()
         {
-            web_client(State(s), Query(query)).await
+            timed_web_client(s, query, uri.to_string()).await
         } else {
             home_client(State(s)).await
         };
@@ -6473,7 +6513,7 @@ pub(crate) async fn root_handler(
         || query.episode.is_some()
         || query.view.is_some()
     {
-        web_client(State(s), Query(query)).await
+        timed_web_client(s, query, uri.to_string()).await
     } else {
         home_client(State(s)).await
     }

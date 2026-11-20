@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::Path, time::Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::task::JoinSet;
 use tracing::{debug, info};
@@ -132,8 +132,17 @@ async fn translate_bilingual_resumable_at(
     cancellation: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<String, String> {
+    let started = Instant::now();
     let cues = parse_subtitles(contents)?;
     let staged_cues = read_staged_vtt(output_part_path, &cues).await?;
+    info!(
+        cue_count = cues.len(),
+        staged_cue_count = staged_cues.len(),
+        source_language,
+        first_language,
+        second_language,
+        "bilingual subtitle translation started (sequential per-cue requests)"
+    );
     for cue in &staged_cues {
         if let Some(progress) = progress.as_ref() {
             if progress
@@ -214,9 +223,16 @@ async fn translate_bilingual_resumable_at(
             }
         }
     }
-    tokio::fs::read_to_string(output_part_path)
+    let contents = tokio::fs::read_to_string(output_part_path)
         .await
-        .map_err(|_| "Could not read completed subtitle checkpoint".to_owned())
+        .map_err(|_| "Could not read completed subtitle checkpoint".to_owned())?;
+    info!(
+        cue_count = cues.len(),
+        staged_cue_count = staged_cues.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "bilingual subtitle translation finished"
+    );
+    Ok(contents)
 }
 
 async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<Cue>, String> {
@@ -423,6 +439,7 @@ async fn translate_batch(
     }
     let mut output = Vec::with_capacity(texts.len());
     for (batch_index, batch) in texts.chunks(8).enumerate() {
+        let batch_started = Instant::now();
         let batch_first_cue = first_cue_number + batch_index * 8;
         let batch_last_cue = batch_first_cue + batch.len() - 1;
         info!(
@@ -543,6 +560,8 @@ async fn translate_batch(
             target_language = target,
             first_cue = batch_first_cue,
             last_cue = batch_last_cue,
+            requests_in_flight = batch.len(),
+            elapsed_ms = batch_started.elapsed().as_millis(),
             "Google Translate batch completed"
         );
     }

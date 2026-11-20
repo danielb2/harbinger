@@ -1278,7 +1278,7 @@ pub(crate) async fn plex_section_refresh(
     if !library_exists {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(error) = scan_library_inventory(&state, library_id, false).await {
+    if let Err(error) = scan_library_inventory(&state, library_id, false, false, false).await {
         warn!(section, %error, "Plex library scan failed");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -4475,13 +4475,19 @@ pub(crate) async fn plex_create_marker(
     let Ok(db) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    match markers::create_user_marker(&db, &media.id, kind, start_ms, end_ms, duration_ms) {
-        Ok(marker) => marker_response(vec![marker]),
-        Err(error) => {
-            warn!(%error, "could not create marker");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+    let marker =
+        match markers::create_user_marker(&db, &media.id, kind, start_ms, end_ms, duration_ms) {
+            Ok(marker) => marker,
+            Err(error) => {
+                warn!(%error, "could not create marker");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    if let Err(error) = export_marker_sidecar(&state, &media, &db, None) {
+        warn!(%error, "could not export marker sidecar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    marker_response(vec![marker])
 }
 
 pub(crate) async fn plex_edit_marker(
@@ -4518,14 +4524,19 @@ pub(crate) async fn plex_edit_marker(
     if start_ms < 0 || end_ms <= start_ms {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    match markers::update_marker(&db, marker_id, kind, start_ms, end_ms, duration_ms) {
-        Ok(Some(marker)) => marker_response(vec![marker]),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+    let marker = match markers::update_marker(&db, marker_id, kind, start_ms, end_ms, duration_ms) {
+        Ok(Some(marker)) => marker,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             warn!(%error, "could not edit marker");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+    if let Err(error) = export_marker_sidecar(&state, &media, &db, None) {
+        warn!(%error, "could not export marker sidecar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    marker_response(vec![marker])
 }
 
 pub(crate) async fn plex_delete_marker(
@@ -4542,13 +4553,18 @@ pub(crate) async fn plex_delete_marker(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     match markers::delete_marker(&db, &media.id, marker_id) {
-        Ok(true) => StatusCode::OK.into_response(),
-        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Ok(true) => {}
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => {
             warn!(%error, "could not delete marker");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
+    };
+    if let Err(error) = export_marker_sidecar(&state, &media, &db, None) {
+        warn!(%error, "could not export marker sidecar");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    StatusCode::OK.into_response()
 }
 
 pub(crate) async fn plex_delete_section_markers(
@@ -4558,15 +4574,24 @@ pub(crate) async fn plex_delete_section_markers(
     let Ok(section) = section.parse::<u64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    match state
-        .db
-        .lock()
-        .map_err(|_| ())
-        .and_then(|db| markers::delete_section_markers(&db, section).map_err(|_| ()))
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    let Ok(db) = state.db.lock() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if markers::delete_section_markers(&db, section).is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    let prefix = format!("{section}-");
+    let media = media_snapshot(&state);
+    for item in media.iter().filter(|item| item.id.starts_with(&prefix)) {
+        if let Err(error) = export_marker_sidecar(&state, item, &db, None) {
+            warn!(
+                path = %item.path.display(),
+                %error,
+                "could not export marker sidecar after section deletion"
+            );
+        }
+    }
+    StatusCode::OK.into_response()
 }
 
 pub(crate) fn plex_library_for_metadata(
@@ -6949,7 +6974,10 @@ pub(crate) async fn plex_item(
             });
         if known_stale_key {
             if let Some(section) = section {
-                if scan_library_inventory(&s, section - 1, false).await.is_ok() {
+                if scan_library_inventory(&s, section - 1, false, false, false)
+                    .await
+                    .is_ok()
+                {
                     if let Ok(config) = s.config.lock().map(|config| config.clone()) {
                         if let Some(library) = config.libraries.get(section - 1) {
                             let mut container = plex_library_media_container(

@@ -1,8 +1,8 @@
 use super::{
-    build_app, build_plex_listener_app, build_web_listener_app, migrate_library_model,
+    build_app, build_plex_listener_app, build_web_listener_app, markers, migrate_library_model,
     open_database, plex_external_subtitle_id, plex_part_id, plex_remux_audio_mode,
-    sidebar_nav_with_settings, sync_config_libraries, AppState, Config, ConfigLibrary, Media,
-    PlexTls, SkipMode,
+    sidebar_nav_with_settings, sync_config_libraries, sync_marker_sidecars, AppState, Config,
+    ConfigLibrary, Media, PlexTls, SkipMode,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -75,6 +75,7 @@ fn inventory_request_path(path: &str, fixture: &Fixture) -> String {
 }
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+static LOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 struct Fixture {
     app: Router,
@@ -142,6 +143,7 @@ fn fixture() -> Fixture {
         bilingual_subtitles_enabled: true,
         skip_intro_mode: SkipMode::Manual,
         skip_credits_mode: SkipMode::Manual,
+        marker_detection_enabled: true,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -255,6 +257,7 @@ fn tv_fixture() -> Fixture {
         bilingual_subtitles_enabled: true,
         skip_intro_mode: SkipMode::Manual,
         skip_credits_mode: SkipMode::Manual,
+        marker_detection_enabled: true,
         plex_account_preferences: BTreeMap::new(),
     };
     sync_config_libraries(&db, &config).unwrap();
@@ -450,14 +453,24 @@ async fn web_and_plex_listener_surfaces_are_separated() {
     assert_eq!(plex_web_request.status(), StatusCode::NOT_FOUND);
 
     let web_dashboard = build_web_listener_app(fixture.state.clone())
-        .oneshot(Request::builder().uri("/settings?tab=dashboard").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/settings?tab=dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(web_dashboard.status(), StatusCode::SEE_OTHER);
     assert_eq!(web_dashboard.headers()[header::LOCATION], "/auth");
 
     let plex_dashboard = build_plex_listener_app(fixture.state.clone())
-        .oneshot(Request::builder().uri("/settings?tab=dashboard").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/settings?tab=dashboard")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(plex_dashboard.status(), StatusCode::NOT_FOUND);
@@ -889,13 +902,16 @@ async fn settings_indicates_saved_tmdb_token_without_disclosing_it() {
 
 #[tokio::test]
 async fn settings_logs_tab_displays_recent_events() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
     let mut log_updates = super::log_broadcast().subscribe();
     let fixture = fixture();
     super::push_log_line("event=http_request method=GET path=/settings".to_owned());
     super::push_log_line("event=tmdb \x1b[31msearch\x1b[0m finished".to_owned());
     let mut streamed_lines = Vec::new();
-    while let Ok((_, line)) = log_updates.try_recv() {
-        streamed_lines.push(line);
+    while let Ok(event) = log_updates.try_recv() {
+        if let super::LogEvent::Entry(_, line) = event {
+            streamed_lines.push(line);
+        }
     }
     assert!(streamed_lines.contains(&"event=http_request method=GET path=/settings".to_owned()));
     assert!(streamed_lines.contains(&"event=tmdb search finished".to_owned()));
@@ -913,6 +929,8 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
     assert!(body.contains("id=\"settings-logs-copy\" type=\"button\""));
     assert!(body.contains("id=\"settings-logs-copy-status\""));
+    assert!(body.contains("id=\"settings-logs-clear\""));
+    assert!(body.contains("action=\"/settings/logs/clear\""));
     assert!(body.contains("visibleLogLines.slice()"));
     assert!(body.contains("navigator.clipboard?.writeText"));
     assert!(body.contains(".log-timestamp"));
@@ -922,6 +940,7 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains(".log-key"));
     assert!(body.contains(".log-value"));
     assert!(body.contains("renderLogLines(visibleLogLines)"));
+    assert!(body.contains("update.type === 'cleared'"));
     assert!(body.contains("span.textContent = text;"));
     assert!(body.contains("id=\"settings-logs-output\""));
     assert!(body.contains("Reverse filter (show non-matching)"));
@@ -937,6 +956,40 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(log_snapshot.contains(&"event=http_request method=GET path=/settings".to_owned()));
     assert!(log_snapshot.contains(&"event=tmdb search finished".to_owned()));
     assert!(body.contains("class=\"active\" href=\"/settings?tab=logs\""));
+}
+
+#[tokio::test]
+async fn settings_logs_can_clear_the_in_memory_buffer() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let mut log_updates = super::log_broadcast().subscribe();
+    let token = format!(
+        "event=clear_log_test_{}",
+        NEXT_FIXTURE.load(Ordering::Relaxed)
+    );
+    super::push_log_line(token.clone());
+
+    let response = send(
+        &fixture.app,
+        Method::POST,
+        "/settings/logs/clear",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION].to_str().unwrap(),
+        "/settings?tab=logs"
+    );
+
+    let mut cleared = false;
+    while let Ok(event) = log_updates.try_recv() {
+        if matches!(event, super::LogEvent::Cleared(_)) {
+            cleared = true;
+        }
+    }
+    assert!(cleared);
+    assert!(!super::recent_log_snapshot().1.contains(&token));
 }
 
 #[tokio::test]
@@ -1358,7 +1411,11 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
         .find("<summary style=\"min-height:2.65rem;padding:.65rem .95rem;font-size:.87rem\">Add folder</summary>")
         .unwrap();
     let scan = library_markup.find(">Scan metadata</button>").unwrap();
-    let force_scan = library_markup.find(">Force rescan</button>").unwrap();
+    let scan_files = library_markup.find(">Scan files</button>").unwrap();
+    let force_scan = library_markup
+        .find(">Force scan &amp; detect</button>")
+        .unwrap();
+    let force_metadata = library_markup.find(">Force metadata</button>").unwrap();
     let folders_section = library_markup
         .find("<section class=\"library-folders\"")
         .unwrap();
@@ -1371,8 +1428,14 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
         .find("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>")
         .unwrap();
     assert!(settings_form_start < scan_settings);
-    assert!(scan_settings < scan_actions && scan_actions < scan && scan < force_scan);
-    assert!(force_scan < folders_section);
+    assert!(
+        scan_settings < scan_actions
+            && scan_actions < scan
+            && scan < scan_files
+            && scan_files < force_scan
+            && force_scan < force_metadata
+    );
+    assert!(force_metadata < folders_section);
     assert!(library_markup.contains("class=\"library-scan-actions\" style=\"display:flex;flex:0 0 auto;align-items:center;gap:.4rem;white-space:nowrap\""));
     assert!(
         folders_section < folders_heading
@@ -1386,6 +1449,10 @@ async fn settings_saves_and_validates_per_library_scan_schedule() {
     assert!(library_markup.contains("justify-content:space-between"));
     assert!(library_markup.contains("justify-content:flex-start"));
     assert!(library_markup.contains("form=\"library-settings-0\" formmethod=\"post\" formaction=\"/settings/libraries/0/scan\" formnovalidate"));
+    assert!(library_markup.contains("formaction=\"/settings/libraries/0/scan-files\""));
+    assert!(library_markup.contains("formaction=\"/settings/libraries/0/scan-files?force=true\""));
+    assert!(library_markup.contains("formaction=\"/settings/libraries/0/scan?force=true\""));
+    assert!(page.contains("formaction=\"/settings/scan?force=true\""));
     assert!(page.contains(".library-add-folder[open] > summary::before { content: \"+\"; }"));
     assert!(library_markup.contains("action=\"/settings/folders/remove\""));
     assert!(library_markup.contains("name=\"folder_index\""));
@@ -1601,6 +1668,27 @@ async fn library_settings_save_updates_name_schedule_and_home_sections_together(
             |row| { row.get::<_, i64>(0) }
         )
         .is_ok());
+}
+
+#[tokio::test]
+async fn forced_scan_all_libraries_reports_forced_mode() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::POST,
+        "/settings/scan?force=true",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.contains("force=true"));
+
+    let response = send(&fixture.app, Method::GET, location, Body::empty()).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Forced scan all libraries; found"));
+    assert!(!body.contains("Scanned all libraries; found"));
 }
 
 #[tokio::test]
@@ -2129,6 +2217,123 @@ async fn other_libraries_skip_tmdb_metadata_matching() {
         .contains("TMDB"));
 }
 
+#[test]
+fn tv_episode_info_accepts_trailing_episode_number_without_filename_marker() {
+    let root = PathBuf::from("/media/tv/Rurouni Kenshin");
+    let media = root.join("Rurouni_Kenshin_16.mp4");
+    let info = super::tv_episode_info(&root, &media).unwrap();
+    assert_eq!(info.season, 1);
+    assert_eq!(info.episode, 16);
+    assert_eq!(super::tv_show_title(&root, &media), "Rurouni Kenshin");
+    assert!(super::tv_episode_marker("Rurouni_Kenshin_16").is_some());
+    assert!(super::tv_episode_display_name("Rurouni_Kenshin_16.mp4").contains("Episode 16"));
+
+    assert!(super::tv_episode_info(&root, &root.join("Movie (2020).mkv")).is_none());
+    assert!(super::tv_episode_info(&root, &root.join("Show.1080p.mkv")).is_none());
+}
+
+#[test]
+fn tmdb_episode_requests_skip_numbers_outside_known_season_range() {
+    let show = serde_json::json!({
+        "seasons": [{ "season_number": 1, "episode_count": 47 }]
+    });
+    let nested_show = serde_json::json!({
+        "metadata_json": {
+            "seasons": [{ "season_number": 1, "episode_count": 47 }]
+        }
+    });
+    let episode = |number| super::TvEpisodeInfo {
+        season: 1,
+        episode: number,
+        episode_end: None,
+        episode_title: None,
+    };
+
+    assert!(!super::tmdb_episode_request_needed(
+        &show,
+        &episode(96),
+        None,
+        true
+    ));
+    assert!(!super::tmdb_episode_request_needed(
+        &nested_show,
+        &episode(100),
+        None,
+        false
+    ));
+    assert!(super::tmdb_episode_request_needed(
+        &show,
+        &episode(16),
+        None,
+        false
+    ));
+}
+
+#[test]
+fn tmdb_404_cache_prevents_repeated_requests_until_forced() {
+    let show = serde_json::json!({});
+    let episode = super::TvEpisodeInfo {
+        season: 1,
+        episode: 96,
+        episode_end: None,
+        episode_title: None,
+    };
+    let cached = super::tmdb_episode_not_found_metadata();
+
+    assert!(super::tmdb_episode_details_not_found(&cached));
+    assert!(!super::tmdb_episode_request_needed(
+        &show,
+        &episode,
+        Some(&cached),
+        false
+    ));
+    assert!(super::tmdb_episode_request_needed(
+        &show,
+        &episode,
+        Some(&cached),
+        true
+    ));
+}
+
+#[tokio::test]
+async fn marker_grouping_uses_the_same_episode_resolver_as_the_library() {
+    let fixture = tv_fixture();
+    let root = fixture.root.join("media");
+    let show_directory = root.join("Example Show");
+    let files = [
+        (show_directory.join("Example.Show_1.mkv"), "tv-1", 1),
+        (show_directory.join("Example.Show_2.mkv"), "tv-2", 2),
+    ];
+    for (path, _, _) in &files {
+        std::fs::write(path, b"0123456789abcdef").unwrap();
+    }
+    {
+        let inventory = files
+            .iter()
+            .map(|(path, id, episode)| Media {
+                id: (*id).to_owned(),
+                title: format!("Episode {episode}"),
+                path: path.clone(),
+                size: 16,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
+            })
+            .collect::<Vec<_>>();
+        *fixture.state.media.write().unwrap() = Arc::new(inventory);
+    }
+    let library = fixture.config.lock().unwrap().libraries[0].clone();
+
+    let groups = super::season_episode_candidates_by_number(
+        &fixture.state,
+        &library,
+        &root,
+        "Example Show",
+        1,
+    );
+    assert_eq!(groups.keys().copied().collect::<Vec<_>>(), vec![1, 2]);
+}
+
 #[tokio::test]
 async fn new_tv_episode_inherits_config_sidecar_show_match_automatically() {
     let fixture = tv_fixture();
@@ -2141,7 +2346,7 @@ async fn new_tv_episode_inherits_config_sidecar_show_match_automatically() {
         }
         *inventory = Arc::new(media);
     }
-    super::scan_library_inventory(&fixture.state, 0, true)
+    super::scan_library_inventory(&fixture.state, 0, true, false, false)
         .await
         .unwrap();
 
@@ -2166,7 +2371,7 @@ async fn new_tv_episode_inherits_config_sidecar_show_match_automatically() {
         .root
         .join("media/Example Show/Season 01/Example.Show.S01E03.Added.mkv");
     std::fs::write(&new_path, b"new episode").unwrap();
-    super::scan_library_inventory(&fixture.state, 0, true)
+    super::scan_library_inventory(&fixture.state, 0, true, false, false)
         .await
         .unwrap();
 
@@ -4539,7 +4744,7 @@ async fn movie_fix_match_accepts_movie_paths_without_calling_tmdb() {
 #[tokio::test]
 async fn refresh_metadata_requires_and_preserves_existing_match() {
     let fixture = fixture();
-    super::scan_library_inventory(&fixture.state, 0, true)
+    super::scan_library_inventory(&fixture.state, 0, true, false, false)
         .await
         .unwrap();
     let media = super::media_snapshot(&fixture.state)
@@ -5307,7 +5512,7 @@ async fn library_creation_keeps_settings_open_and_publishes_stable_scan_metadata
     let updated_at_before_scan = providers["MediaContainer"]["updatedAt"].as_u64().unwrap();
 
     assert_eq!(
-        crate::scan_library_inventory(&fixture.state, 1, true)
+        crate::scan_library_inventory(&fixture.state, 1, true, false, false)
             .await
             .unwrap(),
         1
@@ -7485,7 +7690,13 @@ async fn plex_route_errors_are_explicit_for_unknown_resources_and_bad_requests()
 #[tokio::test]
 async fn dashboard_settings_tab_shows_live_charts_without_entering_browse_navigation() {
     let fixture = fixture();
-    let response = send(&fixture.app, Method::GET, "/settings?tab=dashboard", Body::empty()).await;
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?tab=dashboard",
+        Body::empty(),
+    )
+    .await;
     assert_eq!(response.status(), StatusCode::OK);
     let page = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let page = String::from_utf8(page.to_vec()).unwrap();
@@ -7514,24 +7725,21 @@ async fn dashboard_settings_tab_shows_live_charts_without_entering_browse_naviga
 #[tokio::test]
 async fn dashboard_stats_reports_samples_and_active_tasks() {
     let fixture = fixture();
-    fixture
-        .state
-        .metrics
-        .record(super::metrics::MetricSample {
-            at: 1_700_000_000,
-            host_cpu_percent: 42.5,
-            process_cpu_percent: 12.25,
-            host_memory_used_bytes: 4_000,
-            host_memory_total_bytes: 16_000,
-            host_memory_percent: 25.0,
-            process_memory_bytes: 2_000,
-            network_received_bytes_per_sec: 1_024.0,
-            network_transmitted_bytes_per_sec: 512.0,
-            disk_read_bytes_per_sec: 2_048.0,
-            disk_write_bytes_per_sec: 256.0,
-            process_disk_read_bytes_per_sec: 128.0,
-            process_disk_write_bytes_per_sec: 64.0,
-        });
+    fixture.state.metrics.record(super::metrics::MetricSample {
+        at: 1_700_000_000,
+        host_cpu_percent: 42.5,
+        process_cpu_percent: 12.25,
+        host_memory_used_bytes: 4_000,
+        host_memory_total_bytes: 16_000,
+        host_memory_percent: 25.0,
+        process_memory_bytes: 2_000,
+        network_received_bytes_per_sec: 1_024.0,
+        network_transmitted_bytes_per_sec: 512.0,
+        disk_read_bytes_per_sec: 2_048.0,
+        disk_write_bytes_per_sec: 256.0,
+        process_disk_read_bytes_per_sec: 128.0,
+        process_disk_write_bytes_per_sec: 64.0,
+    });
     assert!(fixture.state.metrics.begin_activity(
         "test:marker:1",
         "intro detection",
@@ -7695,6 +7903,167 @@ async fn marker_routes_create_edit_delete_and_project_markers() {
 }
 
 #[tokio::test]
+async fn marker_routes_write_sidecars_and_sync_restores_markers() {
+    let fixture = fixture();
+    let create = send(
+        &fixture.app,
+        Method::POST,
+        "/library/metadata/1-1/marker?type=1&startTimeOffset=5000&endTimeOffset=45000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let sidecar_path = fixture.root.join("media/.hbgr/skip_markers.json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert_eq!(sidecar["version"], 1);
+    let entry = &sidecar["items"]["Demo.mkv"];
+    assert_eq!(entry["markers"][0]["type"], "intro");
+    assert_eq!(entry["markers"][0]["startTimeOffset"], 5_000);
+    assert_eq!(entry["markers"][0]["endTimeOffset"], 45_000);
+
+    {
+        let db = fixture.db.lock().unwrap();
+        db.execute("DELETE FROM media_markers", []).unwrap();
+    }
+    let media = fixture.state.media.read().unwrap().clone();
+    sync_marker_sidecars(&fixture.state, &media);
+
+    let db = fixture.db.lock().unwrap();
+    let restored = markers::markers_for_media(&db, "1-1").unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].kind, markers::MarkerKind::Intro);
+    assert_eq!(restored[0].start_ms, 5_000);
+    assert_eq!(restored[0].end_ms, 45_000);
+}
+
+#[test]
+fn config_storage_writes_marker_sidecar_only_to_config() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    {
+        let db = fixture.db.lock().unwrap();
+        markers::create_user_marker(
+            &db,
+            "1-1",
+            markers::MarkerKind::Intro,
+            5_000,
+            45_000,
+            60_000,
+        )
+        .unwrap();
+    }
+    let media = fixture.state.media.read().unwrap().as_ref().clone();
+    sync_marker_sidecars(&fixture.state, &media);
+
+    let config_sidecar = fixture.root.join("config/.hbgr/skip_markers.json");
+    assert!(config_sidecar.is_file());
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_sidecar).unwrap()).unwrap();
+    assert_eq!(
+        sidecar["items"]["1/Demo.mkv"]["markers"][0]["type"],
+        "intro"
+    );
+
+    let media_sidecar = fixture.root.join("media/.hbgr/skip_markers.json");
+    assert!(!media_sidecar.exists());
+}
+
+#[test]
+fn config_storage_detection_export_writes_only_to_config() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    {
+        let db = fixture.db.lock().unwrap();
+        markers::create_user_marker(
+            &db,
+            "1-1",
+            markers::MarkerKind::Credits,
+            50_000,
+            60_000,
+            60_000,
+        )
+        .unwrap();
+    }
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    {
+        let db = fixture.db.lock().unwrap();
+        super::export_marker_sidecar(&fixture.state, &media, &db, None).unwrap();
+    }
+
+    assert!(fixture
+        .root
+        .join("config/.hbgr/skip_markers.json")
+        .is_file());
+    assert!(!fixture.root.join("media/.hbgr/skip_markers.json").exists());
+}
+
+#[test]
+fn config_storage_reads_existing_media_markers_without_writing_to_media() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media_sidecar = fixture.root.join("media/.hbgr/skip_markers.json");
+    let entry: markers::MarkerSidecarEntry = serde_json::from_value(serde_json::json!({
+        "markers": [{ "type": "intro", "startTimeOffset": 5_000, "endTimeOffset": 45_000 }]
+    }))
+    .unwrap();
+    markers::write_marker_sidecar_entry(&media_sidecar, "Demo.mkv", Some(&entry)).unwrap();
+    let before = std::fs::read(&media_sidecar).unwrap();
+
+    let media = fixture.state.media.read().unwrap().as_ref().clone();
+    sync_marker_sidecars(&fixture.state, &media);
+
+    assert_eq!(std::fs::read(&media_sidecar).unwrap(), before);
+    let db = fixture.db.lock().unwrap();
+    let restored = markers::markers_for_media(&db, "1-1").unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].start_ms, 5_000);
+}
+
+#[test]
+fn marker_sync_rewrites_legacy_fingerprints_to_stable_values() {
+    let fixture = tv_fixture();
+    let media_dir = fixture.root.join("media");
+    let media = fixture.state.media.read().unwrap().as_ref().clone();
+    {
+        let db = fixture.db.lock().unwrap();
+        markers::replace_detected_markers(
+            &db,
+            &media[0].id,
+            markers::MarkerKind::Intro,
+            Some(&markers::DetectedRange {
+                start_ms: 5_000,
+                end_ms: 45_000,
+            }),
+            "legacy-media",
+            "legacy-group",
+            60_000,
+        )
+        .unwrap();
+    }
+
+    sync_marker_sidecars(&fixture.state, &media);
+
+    let expected_media = super::media_fingerprint(&media_dir, &media[0]);
+    let expected_group = super::group_fingerprint(&media_dir, &media);
+    {
+        let db = fixture.db.lock().unwrap();
+        assert_eq!(
+            markers::marker_fingerprints(&db, &media[0].id, markers::MarkerKind::Intro).unwrap(),
+            Some((expected_media.clone(), expected_group.clone()))
+        );
+    }
+    let sidecar_path = media_dir.join("Example Show/.hbgr/skip_markers.json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(sidecar_path).unwrap()).unwrap();
+    let key = "Season 01/Example.Show.S01E01.Pilot.mkv";
+    let fingerprint = &sidecar["items"][key]["fingerprints"]["intro"];
+    assert_eq!(fingerprint["mediaFingerprint"], expected_media);
+    assert_eq!(fingerprint["groupFingerprint"], expected_group);
+}
+
+#[tokio::test]
 async fn marker_detection_and_section_delete_routes_are_wired() {
     let fixture = fixture();
     let create = send(
@@ -7746,6 +8115,14 @@ async fn marker_detection_and_section_delete_routes_are_wired() {
     assert!(metadata["MediaContainer"]["Metadata"][0]
         .get("Marker")
         .is_none());
+
+    let sidecar_path = fixture.root.join("media/.hbgr/skip_markers.json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar_path).unwrap()).unwrap();
+    assert!(sidecar["items"]["Demo.mkv"]["markers"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -7759,6 +8136,55 @@ fn season_directory_media_is_recognized_for_marker_groups() {
         &root,
         Path::new("/tv/Bones/Bones - S09E04.mkv")
     ));
+}
+
+#[test]
+fn marker_fingerprints_ignore_local_identity_and_scan_revisions() {
+    let root = PathBuf::from("/tv");
+    let relative = PathBuf::from("Example Show/Season 01/ep01.mkv");
+    let library = ConfigLibrary {
+        name: "Shows".to_owned(),
+        kind: "tv".to_owned(),
+        folders: vec![root.clone()],
+        show_recently_added: true,
+        show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
+    };
+    let episode = |id: &str, metadata_revision: u64, size: u64| Media {
+        id: id.to_owned(),
+        title: "Episode".to_owned(),
+        path: root.join(&relative),
+        size,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision,
+    };
+
+    let original = episode("1-1", 100, 512);
+    let copied = episode("9-4", 999, 512);
+    assert_eq!(
+        super::media_fingerprint(&root, &original),
+        super::media_fingerprint(&root, &copied)
+    );
+    assert_ne!(
+        super::media_fingerprint(&root, &original),
+        super::media_fingerprint(&root, &episode("1-1", 100, 513))
+    );
+
+    let (sidecar_path, key) =
+        super::marker_sidecar_target(&library, &root, &original).expect("sidecar target");
+    assert_eq!(key, "Season 01/ep01.mkv");
+    assert_eq!(
+        sidecar_path,
+        root.join("Example Show/.hbgr/skip_markers.json")
+    );
 }
 
 #[test]
@@ -7863,6 +8289,78 @@ async fn skipping_settings_render_validate_and_persist_both_modes() {
         assert_eq!(config.skip_intro_mode, super::SkipMode::Automatic);
         assert_eq!(config.skip_credits_mode, super::SkipMode::Off);
     }
+}
+
+#[tokio::test]
+async fn automatic_marker_detection_can_be_disabled_in_settings() {
+    let fixture = tv_fixture();
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page
+        .contains("<input type=\"checkbox\" name=\"marker_detection_disabled\" value=\"true\">"));
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/skipping",
+        "skip_intro_mode=manual&skip_credits_mode=manual&marker_detection_disabled=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        !fixture
+            .state
+            .config
+            .lock()
+            .unwrap()
+            .marker_detection_enabled
+    );
+
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("name=\"marker_detection_disabled\" value=\"true\" checked"));
+
+    assert!(!super::marker_detection_allowed(false, false));
+    assert!(super::marker_detection_allowed(false, true));
+    assert!(super::marker_detection_allowed(true, false));
+
+    let detected =
+        super::detect_markers_for_library(fixture.state.clone(), 1, false, 0.6, false).await;
+    assert_eq!(detected, Ok(0));
+
+    let manual =
+        super::detect_markers_for_library(fixture.state.clone(), 1, false, 0.6, true).await;
+    assert!(manual.is_ok());
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/skipping",
+        "skip_intro_mode=manual&skip_credits_mode=manual",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        fixture
+            .state
+            .config
+            .lock()
+            .unwrap()
+            .marker_detection_enabled
+    );
 }
 
 #[tokio::test]

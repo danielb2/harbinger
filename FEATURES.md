@@ -40,13 +40,27 @@ Acceptance: complete the hosted sign-in; receive and persist the account token; 
 
 The user prefers JavaScript and does not want TypeScript added. Keep the current UI implementation unless the user asks for a framework change. A framework proposal does not replace the requirement that every action work and report errors clearly.
 
+## Portable media sidecars
+
+**Status: Implemented / pending fresh-host validation.** With `metadata_storage = "media"`, skip markers are mirrored into media-folder sidecars and imported back into SQLite on startup and scans, so copied media directories no longer lose markers merely because the local database is empty.
+
+When `metadata_storage = "media"`, media-folder sidecars are the portable metadata record for the media beside them, not a disposable cache. Their purpose is to let the operator copy a media directory from one host to another and have Harbinger restore the same match, posters, covers, and per-episode skip markers without downloading artwork again or repeating expensive work such as intro/credit audio analysis.
+
+Skip markers are metadata per episode. Detected and user-edited marker ranges must round-trip through the episode's sidecar in media mode. SQLite may be used as a local index or cache, but losing or replacing the database must not lose marker data when the sidecars are present.
+
+`metadata_storage = "config"` is an explicit opt-out: Harbinger must not write any file into a media folder, including marker sidecars, artwork, or metadata. Sidecar-format files are written under the config directory instead. Existing media-folder sidecars may be read as a fallback, but must never be created or updated in config mode.
+
+Acceptance (media mode): copy a populated media directory to a fresh Harbinger host; verify artwork and match metadata appear without external fetches, intro/credit markers appear on the correct episodes, and no marker detection runs solely because the local database is empty.
+
+Acceptance (config mode): scans, detection, and metadata refresh leave the media directory byte-for-byte unchanged; markers and metadata persist under the config directory.
+
 ## Intro and credits skipping
 
 **Status: Broken / in progress.**
 
-Harbinger must detect intro and credits ranges from episode audio per season, using bundled FFmpeg-backed decoding in supported distributions, persist those ranges, expose them through Plex-compatible marker APIs and metadata, and honor separate intro/credits settings in Harbinger's web player. Each setting must offer Automatic, Manual, and Off: Automatic seeks to two seconds before the marker ends; Manual shows an accessible Skip Intro or Skip Credits button while playback is inside the marker; Off suppresses both detection-driven playback behavior and skip buttons. Plex clients must receive the same marker ranges through the documented marker/metadata surface; client-visible parity requires checking an official client, not endpoint tests alone.
+Harbinger must detect intro and credits ranges from episode audio per season, using bundled FFmpeg-backed decoding in supported distributions, persist those ranges in the selected sidecar location (media folder for `media` mode, config folder for `config` mode), expose them through Plex-compatible marker APIs and metadata, and honor separate intro/credits settings in Harbinger's web player. Each setting must offer Automatic, Manual, and Off: Automatic seeks to two seconds before the marker ends; Manual shows an accessible Skip Intro or Skip Credits button while playback is inside the marker; Off suppresses both detection-driven playback behavior and skip buttons. Plex clients must receive the same marker ranges through the documented marker/metadata surface; client-visible parity requires checking an official client, not endpoint tests alone. Automatic detection can be disabled in settings to stop background audio analysis after library scans; that opt-out must not remove existing sidecar markers, player skip controls, or the manual detection routes.
 
-Acceptance: with at least two episodes in a season, common intro and credits segments are detected using bundled FFmpeg-backed decoding in supported distributions; markers survive restarts and can be created, edited, and deleted through the documented PMS routes; Harbinger's player follows all three modes independently for intros and credits; official Plex clients show the skip affordance when given the markers. Detection must fail closed on unsupported audio rather than inventing ranges.
+Acceptance: with at least two episodes in a season, common intro and credits segments are detected using bundled FFmpeg-backed decoding in supported distributions; markers survive restarts and can be created, edited, and deleted through the documented PMS routes; detected and edited markers are written to the selected sidecar location and, in `media` mode, survive copying the media directory to a fresh host without re-detection; in `config` mode the media directory remains unmodified; Harbinger's player follows all three modes independently for intros and credits; official Plex clients show the skip affordance when given the markers. Detection must fail closed on unsupported audio rather than inventing ranges.
 
 ## Working with these contracts
 
