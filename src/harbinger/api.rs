@@ -19,6 +19,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/translation-stop", post(stop_web_translation))
         .route("/web/watch-action", post(web_watch_action))
+        .route("/web/audio-selection", post(update_web_audio_selection))
         .route(
             "/web/subtitle-selection",
             get(web_subtitle_selection).post(update_web_subtitle_selection),
@@ -588,8 +589,9 @@ pub(crate) async fn web_subtitle_selection(
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    Json(serde_json::json!({ "streamId": current_web_subtitle_stream_id(&state, &media) }))
-        .into_response()
+    let subtitles = subtitle_tracks(&state, &media, &relative, query.library, query.folder).await;
+    let stream_id = selected_web_subtitle_stream_id(&state, &media, &subtitles);
+    Json(serde_json::json!({ "streamId": stream_id })).into_response()
 }
 
 pub(crate) async fn web_subtitle_selection_socket(
@@ -609,7 +611,8 @@ pub(crate) async fn web_subtitle_selection_socket(
     };
     let part_id = plex_part_id(&media);
     let mut updates = web_subtitle_selection_broadcast().subscribe();
-    let stream_id = current_web_subtitle_stream_id(&state, &media);
+    let subtitles = subtitle_tracks(&state, &media, &relative, query.library, query.folder).await;
+    let stream_id = selected_web_subtitle_stream_id(&state, &media, &subtitles);
     upgrade
         .on_upgrade(move |mut socket| async move {
             let snapshot = serde_json::json!({ "streamId": stream_id });
@@ -644,7 +647,8 @@ pub(crate) async fn web_subtitle_selection_socket(
                         }
                         Ok(_) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let stream_id = current_web_subtitle_stream_id(&state, &media);
+                            let stream_id =
+                                selected_web_subtitle_stream_id(&state, &media, &subtitles);
                             let snapshot = serde_json::json!({ "streamId": stream_id });
                             if socket.send(Message::Text(snapshot.to_string().into())).await.is_err() {
                                 break;
@@ -663,6 +667,39 @@ pub(crate) async fn web_subtitle_selection_socket(
         .into_response()
 }
 
+pub(crate) async fn update_web_audio_selection(
+    State(state): State<AppState>,
+    Json(update): Json<WebAudioSelectionUpdate>,
+) -> Response {
+    let Some(relative) = clean_relative_path(&update.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let root = selected_library_folder_root(&state, update.library, update.folder);
+    let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if update.stream_id != 0
+        && !web_audio_tracks(&state, &media)
+            .await
+            .iter()
+            .any(|track| track.stream_id == update.stream_id)
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    if let Ok(mut selections) = state.plex_stream_selections.lock() {
+        selections
+            .entry(plex_part_id(&media))
+            .or_default()
+            .audio_stream_id = (update.stream_id != 0).then_some(update.stream_id);
+    } else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 pub(crate) async fn update_web_subtitle_selection(
     State(state): State<AppState>,
     Json(update): Json<WebSubtitleSelectionUpdate>,
@@ -677,8 +714,11 @@ pub(crate) async fn update_web_subtitle_selection(
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    let external = external_subtitle_files(&media.path).await;
+    let info = ensure_media_info(&state, &media)
+        .await
+        .unwrap_or_else(|| serde_json::json!({"media": {"track": []}}));
     if update.stream_id != 0 {
-        let external = external_subtitle_files(&media.path).await;
         let is_external = external
             .iter()
             .any(|path| plex_external_subtitle_id(&media, path) == update.stream_id);
@@ -690,40 +730,27 @@ pub(crate) async fn update_web_subtitle_selection(
                     &config.subtitle_language_secondary,
                 )
         });
-        let is_embedded = state
-            .media_info
-            .lock()
-            .ok()
-            .and_then(|cache| cache.get(&media.id).cloned());
-        let info = match is_embedded {
-            Some(info) => Some(info),
-            None => match inspect_media(&media.path).await {
-                Some(info) => {
-                    if let Ok(mut cache) = state.media_info.lock() {
-                        cache.insert(media.id.clone(), info.clone());
-                    }
-                    Some(info)
-                }
-                None => None,
-            },
-        };
-        let is_embedded = info.is_some_and(|info| {
-            technical_tracks(&info).iter().any(|track| {
-                technical_text(track, "@type") == Some("Text")
-                    && technical_track_id(track).saturating_add(1) == update.stream_id
-            })
+        let is_embedded = technical_tracks(&info).iter().any(|track| {
+            technical_text(track, "@type") == Some("Text")
+                && technical_track_id(track).saturating_add(1) == update.stream_id
         });
         if !is_external && !is_embedded && !is_translated {
             return StatusCode::BAD_REQUEST.into_response();
         }
     }
-    if let Ok(mut selections) = state.plex_stream_selections.lock() {
-        selections
-            .entry(plex_part_id(&media))
-            .or_default()
-            .subtitle_stream_id = Some(update.stream_id);
-    } else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    let selection = stored_plex_stream_selection(&state, &media).unwrap_or_default();
+    save_plex_stream_selection(
+        &state,
+        &media,
+        PlexStreamSelection {
+            subtitle_stream_id: Some(update.stream_id),
+            ..selection
+        },
+    );
+    if let Some(language) =
+        subtitle_language_for_plex_stream_id(&state, &media, &info, &external, update.stream_id)
+    {
+        remember_last_subtitle_language(&state, &language);
     }
     let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), update.stream_id));
     StatusCode::NO_CONTENT.into_response()
@@ -900,36 +927,66 @@ pub(crate) async fn disconnect_plex(State(state): State<AppState>) -> Response {
 }
 
 pub(crate) async fn translation_settings_page() -> Response {
-    Redirect::to("/settings#subtitle-settings").into_response()
+    Redirect::to("/settings#language-settings").into_response()
 }
 
 pub(crate) async fn save_translation_settings(
     State(state): State<AppState>,
     Form(form): Form<TranslationSettingsForm>,
 ) -> Response {
-    if isolang::Language::from_639_1(&form.language_primary).is_none()
-        || isolang::Language::from_639_1(&form.language_secondary).is_none()
-        || form.language_primary == form.language_secondary
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Choose two distinct supported languages",
-        )
-            .into_response();
-    }
     let Ok(mut config) = state.config.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    config.subtitle_language_primary = form.language_primary;
-    config.subtitle_language_secondary = form.language_secondary;
+    let audio_language_primary = form
+        .audio_language_primary
+        .unwrap_or_else(|| config.audio_language_primary.clone())
+        .trim()
+        .to_ascii_lowercase();
+    let audio_language_secondary = form
+        .audio_language_secondary
+        .unwrap_or_else(|| config.audio_language_secondary.clone().unwrap_or_default())
+        .trim()
+        .to_ascii_lowercase();
+    let audio_language_secondary = (!audio_language_secondary.is_empty()
+        && audio_language_secondary != "none")
+        .then_some(audio_language_secondary);
+    let subtitle_primary = form.language_primary.trim().to_ascii_lowercase();
+    let subtitle_secondary = form.language_secondary.trim().to_ascii_lowercase();
+    let supported = |language: &str| isolang::Language::from_639_1(language).is_some();
+    if !supported(&audio_language_primary)
+        || audio_language_secondary
+            .as_deref()
+            .is_some_and(|language| !supported(language))
+        || audio_language_secondary.as_deref() == Some(audio_language_primary.as_str())
+        || !supported(&subtitle_primary)
+        || !supported(&subtitle_secondary)
+        || subtitle_primary == subtitle_secondary
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Choose distinct supported languages for voice and subtitles",
+        )
+            .into_response();
+    }
+    config.audio_language_primary = audio_language_primary.clone();
+    config.audio_language_secondary = audio_language_secondary;
+    config.subtitle_language_primary = subtitle_primary.clone();
+    config.subtitle_language_secondary = subtitle_secondary;
     config.bilingual_subtitles_enabled = form.bilingual_enabled;
+    config
+        .plex_account_preferences
+        .insert("defaultAudioLanguage".to_owned(), audio_language_primary);
+    config
+        .plex_account_preferences
+        .insert("defaultSubtitleLanguage".to_owned(), subtitle_primary);
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    clear_last_subtitle_language(&state);
     if !config.bilingual_subtitles_enabled {
         cancel_all_translation_jobs();
     }
-    Redirect::to("/settings#subtitle-settings").into_response()
+    Redirect::to("/settings#language-settings").into_response()
 }
 
 pub(crate) async fn save_skip_settings(
@@ -966,6 +1023,8 @@ pub(crate) async fn settings_page(
         libraries,
         tmdb_token_saved,
         bilingual_enabled,
+        audio_language_primary,
+        audio_language_secondary,
         subtitle_language_primary,
         subtitle_language_secondary,
         skip_intro_mode,
@@ -1005,6 +1064,8 @@ pub(crate) async fn settings_page(
             libraries,
             token_saved,
             config.bilingual_subtitles_enabled,
+            config.audio_language_primary.clone(),
+            config.audio_language_secondary.clone(),
             config.subtitle_language_primary.clone(),
             config.subtitle_language_secondary.clone(),
             config.skip_intro_mode,
@@ -1087,10 +1148,12 @@ pub(crate) async fn settings_page(
         r#"<form class="library-card" method="post" action="/settings/scan"><div style="display:flex;flex-wrap:wrap;gap:.4rem"><button type="submit">Scan all libraries</button><button class="button-secondary" type="submit" formaction="/settings/scan?force=true">Force scan all &amp; detect</button></div></form>"#,
     );
     let subtitle_settings = format!(
-        r#"<details class="settings-card settings-section" id="subtitle-settings"><summary class="settings-section-summary"><span><strong>Subtitle translation</strong><small>Choose the bilingual subtitle languages and whether Harbinger generates them.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Generate bilingual subtitles with Google Translate. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div class="form-grid"><label class="field"><span>First subtitle language</span><select name="language_primary">{}</select></label><label class="field"><span>Second subtitle language</span><select name="language_secondary">{}</select></label></div><div><button type="submit">Save subtitle settings</button></div></form></details>"#,
-        if bilingual_enabled { " checked" } else { "" },
+        r#"<details class="settings-card settings-section" id="language-settings"><summary class="settings-section-summary"><span><strong>Playback languages</strong><small>Choose preferred voice and subtitle languages, including the bilingual subtitle pair.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Primary and secondary voice languages set the preferred audio tracks shown to Plex clients and the built-in player. Bilingual subtitles combine the selected subtitle languages. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><div class="form-grid"><label class="field"><span>Primary voice</span><select name="audio_language_primary">{}</select></label><label class="field"><span>Secondary voice</span><select name="audio_language_secondary">{}</select></label><label class="field"><span>Primary subtitles</span><select name="language_primary">{}</select></label><label class="field"><span>Secondary subtitles</span><select name="language_secondary">{}</select></label></div><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div><button type="submit">Save language settings</button></div></form></details>"#,
+        translation_language_options(&audio_language_primary),
+        voice_language_options(audio_language_secondary.as_deref()),
         translation_language_options(&subtitle_language_primary),
         translation_language_options(&subtitle_language_secondary),
+        if bilingual_enabled { " checked" } else { "" },
     );
     let skip_settings = format!(
         r#"<details class="settings-card settings-section" id="skip-settings"><summary class="settings-section-summary"><span><strong>Intro and credits skipping</strong><small>Choose how Harbinger's player reacts to detected markers.</small></span></summary><form method="post" action="/settings/skipping" class="settings-form settings-section-content"><p class="note">Automatic seeks to two seconds before a marker ends. Manual shows a Skip Intro or Skip Credits button while playback is inside the marker. Off hides skip controls and disables automatic skipping.</p><div class="form-grid"><label class="field"><span>Intro skipping</span><select name="skip_intro_mode">{}</select></label><label class="field"><span>Credits skipping</span><select name="skip_credits_mode">{}</select></label></div><label class="settings-toggle"><input type="checkbox" name="marker_detection_disabled" value="true"{}> Disable automatic intro/credit detection</label><p class="note">Automatic detection decodes episode audio after library scans. Turning it off keeps existing markers and manual detection available.</p><div><button type="submit">Save skipping settings</button></div></form></details>"#,
@@ -2887,6 +2950,8 @@ pub(crate) async fn web_client(
 ) -> Response {
     let (
         bilingual_enabled,
+        audio_language_primary,
+        audio_language_secondary,
         language_primary,
         language_secondary,
         skip_intro_mode,
@@ -2898,6 +2963,8 @@ pub(crate) async fn web_client(
         .map(|config| {
             (
                 config.bilingual_subtitles_enabled,
+                config.audio_language_primary.clone(),
+                config.audio_language_secondary.clone(),
                 config.subtitle_language_primary.clone(),
                 config.subtitle_language_secondary.clone(),
                 config.skip_intro_mode.as_str().to_owned(),
@@ -2906,6 +2973,8 @@ pub(crate) async fn web_client(
         })
         .unwrap_or((
             false,
+            PLEX_DEFAULT_AUDIO_LANGUAGE.to_owned(),
+            None,
             "en".to_owned(),
             "vi".to_owned(),
             default_skip_mode().as_str().to_owned(),
@@ -3689,15 +3758,21 @@ pub(crate) async fn web_client(
             } else {
                 Vec::new()
             };
+            let audio_tracks = if let Some(media) = matched_media.as_ref() {
+                web_audio_tracks(&s, media).await
+            } else {
+                Vec::new()
+            };
+            let stream_selection = matched_media.as_ref().and_then(|media| {
+                s.plex_stream_selections
+                    .lock()
+                    .ok()
+                    .and_then(|selections| selections.get(&plex_part_id(media)).copied())
+            });
+            let selected_audio = stream_selection.and_then(|selection| selection.audio_stream_id);
             let selected_subtitle = matched_media
                 .as_ref()
-                .and_then(|media| {
-                    s.plex_stream_selections
-                        .lock()
-                        .ok()
-                        .and_then(|selections| selections.get(&plex_part_id(media)).copied())
-                })
-                .and_then(|selection| selection.subtitle_stream_id);
+                .map(|media| selected_web_subtitle_stream_id(&s, media, &subtitles));
             let player_title = matched_media
                 .as_ref()
                 .and_then(|media| section_metadata.get(&media.id))
@@ -3721,9 +3796,13 @@ pub(crate) async fn web_client(
                 query.library,
                 query.folder,
                 &subtitles,
+                &audio_tracks,
                 artwork,
+                selected_audio,
                 selected_subtitle,
                 bilingual_enabled,
+                &audio_language_primary,
+                audio_language_secondary.as_deref(),
                 &language_primary,
                 &language_secondary,
                 &marker_json,
@@ -3815,7 +3894,7 @@ pub(crate) async fn web_client(
     .details {{ padding: .9rem 1rem 1rem; }}
     h2 {{ font-size: 1rem; margin: 0 0 .4rem; overflow-wrap: anywhere; }}
     .play-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; margin: .7rem 0; }}
-    .play-actions button, .subtitle-picker select {{ padding: .45rem .65rem; }}
+    .play-actions button, .subtitle-picker select, .audio-picker select {{ padding: .45rem .65rem; }}
     .match-form {{ display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }} .match-form input {{ min-width: 0; flex: 1 1 12rem; padding: .45rem .6rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }} .match-form button {{ padding: .45rem .65rem; }}
     .info-button {{ background: #374151; }}
     dialog {{ position: relative; max-width: min(760px, calc(100vw - 2rem)); width: 100%; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }} dialog::backdrop {{ background: rgba(0,0,0,.7); }} dialog form {{ position: absolute; top: .75rem; right: .75rem; margin: 0; }} dialog form button {{ padding: .35rem .6rem; }} .info-grid {{ display: grid; gap: .45rem; max-height: 65vh; overflow: auto; }} .info-row {{ display: grid; grid-template-columns: minmax(140px, .4fr) 1fr; gap: .8rem; padding: .45rem 0; border-bottom: 1px solid #263244; }} .info-key {{ color: #9ca3af; }} .info-value {{ overflow-wrap: anywhere; }}
@@ -3825,9 +3904,9 @@ pub(crate) async fn web_client(
     body.theatre-mode article:not(.theatre-card), body.theatre-mode .breadcrumb, body.theatre-mode .folder-card {{ display: none; }}
     body.theatre-mode .theatre-card {{ width: 100%; min-height: 100vh; border: 0; border-radius: 0; }}
     body.theatre-mode .theatre-card video {{ width: 100%; max-height: calc(100vh - 8rem); aspect-ratio: 16 / 9; object-fit: contain; }}
-    .subtitle-picker {{ display: inline-flex; align-items: center; gap: .35rem; color: #cbd5e1; font-size: .9rem; }}
-    .subtitle-picker select {{ border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
-    .subtitle-note {{ color: #9ca3af; font-size: .8rem; }}
+    .subtitle-picker, .audio-picker {{ display: inline-flex; align-items: center; gap: .35rem; color: #cbd5e1; font-size: .9rem; }}
+    .subtitle-picker select, .audio-picker select {{ border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
+    .subtitle-note, .audio-note {{ color: #9ca3af; font-size: .8rem; }}
     .subtitle-translation {{ display: flex; flex-wrap: wrap; align-items: end; gap: .45rem; margin-top: .55rem; }}
     .subtitle-translation label {{ display: grid; gap: .2rem; color: #cbd5e1; font-size: .75rem; }}
     .subtitle-translation select, .subtitle-translation button {{ padding: .4rem .55rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
@@ -4037,6 +4116,42 @@ pub(crate) async fn web_client(
       }}));
       video.addEventListener("loadedmetadata", () => syncSkipMarkers(false));
       video.addEventListener("play", () => syncSkipMarkers(true));
+      const audioSelect = video.closest("article")?.querySelector(".audio-select");
+      const audioNote = video.closest("article")?.querySelector(".audio-note");
+      const applyAudioTrack = trackIndex => {{
+        if (!video.audioTracks) {{
+          if (audioNote) audioNote.textContent = "This browser cannot switch embedded voice tracks.";
+          return;
+        }}
+        [...video.audioTracks].forEach((track, index) => {{
+          track.enabled = index === trackIndex;
+        }});
+        if (audioNote) audioNote.textContent = "";
+      }};
+      if (audioSelect) {{
+        const applyServerAudio = streamId => {{
+          const option = [...audioSelect.options].find(candidate => Number(candidate.dataset.streamId || 0) === streamId);
+          if (!option) return;
+          audioSelect.value = option.value;
+          audioSelect.dataset.selectedStreamId = String(streamId);
+          applyAudioTrack(Number(option.dataset.trackIndex ?? -1));
+        }};
+        applyServerAudio(Number(audioSelect.dataset.selectedStreamId || 0));
+        audioSelect.addEventListener("change", event => {{
+          const select = event.currentTarget;
+          const option = select.selectedOptions[0];
+          const streamId = Number(option?.dataset.streamId || 0);
+          select.dataset.selectedStreamId = String(streamId);
+          applyAudioTrack(Number(option?.dataset.trackIndex ?? -1));
+          fetch("/web/audio-selection", {{
+            method: "POST", headers: {{ "content-type": "application/json" }},
+            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: streamId }})
+          }}).catch(() => {{
+            if (audioNote) audioNote.textContent = "Could not save the voice selection.";
+          }});
+        }});
+        video.addEventListener("loadedmetadata", () => applyAudioTrack(Number(audioSelect.selectedOptions[0]?.dataset.trackIndex ?? -1)), {{ once: true }});
+      }}
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
       let activeStreamingSourceKey = null;
       let activeStreamingSourceName = null;
@@ -4489,6 +4604,45 @@ pub(crate) async fn web_subtitle(
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
+    if query.bilingual.unwrap_or(false) {
+        let Some(media) = web_media_for_relative(&s, &root, &relative).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let languages = s.config.lock().ok().and_then(|config| {
+            config.bilingual_subtitles_enabled.then(|| {
+                (
+                    config.subtitle_language_primary.clone(),
+                    config.subtitle_language_secondary.clone(),
+                )
+            })
+        });
+        let Some((first, second)) = languages else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let saved = ["srt", "vtt", "ass"]
+            .into_iter()
+            .map(|extension| {
+                configured_bilingual_subtitle_path(&s, &media, &first, &second, extension)
+            })
+            .find(|candidate| candidate.is_file());
+        let Some(saved) = saved else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Ok(contents) = tokio::fs::read_to_string(&saved).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let extension = saved
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let Some((content_type, contents)) =
+            external_subtitle_content(&contents, &extension, "vtt")
+        else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        return ([(header::CONTENT_TYPE, content_type)], contents).into_response();
+    }
     if let Some(stream) = query.stream {
         let stream_id = stream as u64;
         let Some(media) = media_snapshot(&s)
@@ -5096,9 +5250,13 @@ pub(crate) fn web_client_item(
     library: Option<usize>,
     folder: Option<usize>,
     subtitles: &[SubtitleTrack],
+    audio_tracks: &[AudioTrack],
     artwork: Option<String>,
+    selected_audio_stream_id: Option<u64>,
     selected_subtitle_stream_id: Option<u64>,
     bilingual_enabled: bool,
+    audio_language_primary: &str,
+    audio_language_secondary: Option<&str>,
     language_primary: &str,
     language_secondary: &str,
     marker_json: &str,
@@ -5125,7 +5283,58 @@ pub(crate) fn web_client_item(
             )
         })
         .collect::<String>();
+    let selected_audio_stream_id = selected_audio_stream_id.unwrap_or_default();
     let selected_subtitle_stream_id = selected_subtitle_stream_id.unwrap_or_default();
+    let preferred_audio_stream_id = [Some(audio_language_primary), audio_language_secondary]
+        .into_iter()
+        .flatten()
+        .find_map(|language| {
+            audio_tracks
+                .iter()
+                .find(|track| track.language == language)
+                .map(|track| track.stream_id)
+        });
+    let effective_audio_stream_id = if selected_audio_stream_id != 0 {
+        selected_audio_stream_id
+    } else {
+        preferred_audio_stream_id
+            .or_else(|| audio_tracks.first().map(|track| track.stream_id))
+            .unwrap_or_default()
+    };
+    let audio_options = audio_tracks
+        .iter()
+        .map(|track| {
+            format!(
+                r#"<option value="{}" data-stream-id="{}" data-track-index="{}" data-language="{}"{}>{}</option>"#,
+                track.index,
+                track.stream_id,
+                track.index,
+                html(&track.language),
+                if track.stream_id == effective_audio_stream_id {
+                    " selected"
+                } else {
+                    ""
+                },
+                html(&track.label)
+            )
+        })
+        .collect::<String>();
+    let audio_selector = if audio_tracks.is_empty() {
+        r#"<span class="audio-note">No embedded audio tracks detected.</span>"#.to_owned()
+    } else {
+        format!(
+            r#"<label class="audio-picker">Voice <select class="audio-select" data-progress-path="{}" data-library="{}" data-selected-stream-id="{}" aria-label="Voice track"><option value="-1" data-stream-id="0" data-track-index="-1"{}>Default</option>{}</select></label><span class="audio-note" role="status" aria-live="polite"></span>"#,
+            html(relative),
+            library.map(|index| index.to_string()).unwrap_or_default(),
+            effective_audio_stream_id,
+            if effective_audio_stream_id == 0 {
+                " selected"
+            } else {
+                ""
+            },
+            audio_options
+        )
+    };
     let subtitle_options = subtitles
         .iter()
         .enumerate()
@@ -5144,7 +5353,7 @@ pub(crate) fn web_client_item(
             )
         })
         .collect::<String>();
-    let subtitle_selector = if subtitles.is_empty() {
+    let subtitle_picker = if subtitles.is_empty() {
         r#"<span class="subtitle-note">No external or embedded subtitles detected.</span>"#
             .to_owned()
     } else {
@@ -5161,6 +5370,7 @@ pub(crate) fn web_client_item(
             subtitle_options
         )
     };
+    let track_selectors = format!("{}{}", audio_selector, subtitle_picker);
     let translation_controls = if bilingual_enabled {
         format!(
             r#"<div class="subtitle-translation"><label>First language <select class="translation-first">{}</select></label><label>Second language <select class="translation-second">{}</select></label><button type="button" class="translate-prepare">Generate bilingual subtitle</button><span class="translation-source-label" role="status" aria-live="polite"></span><progress class="translation-progress" max="100" value="0" hidden aria-label="Bilingual subtitle generation progress"></progress><span class="translation-progress-label" role="status" aria-live="polite"></span><span class="translation-status" role="status" aria-live="polite"></span></div>"#,
@@ -5212,7 +5422,7 @@ pub(crate) fn web_client_item(
         html(name),
         html(&info_url),
         html(&marker_json),
-        subtitle_selector,
+        track_selectors,
         translation_controls,
         html(relative),
         library.map(|index| index.to_string()).unwrap_or_default(),
@@ -5261,6 +5471,15 @@ pub(crate) fn translation_language_options(selected: &str) -> String {
         )
     })
     .collect()
+}
+
+fn voice_language_options(selected: Option<&str>) -> String {
+    let mut options = format!(
+        "<option value=\"none\"{}>None</option>",
+        if selected.is_none() { " selected" } else { "" }
+    );
+    options.push_str(&translation_language_options(selected.unwrap_or("")));
+    options
 }
 
 pub(crate) fn sidebar_nav_for(

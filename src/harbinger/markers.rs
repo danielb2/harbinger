@@ -379,6 +379,7 @@ pub(crate) fn read_marker_sidecar(path: &Path) -> Option<MarkerSidecar> {
     (sidecar.version == MARKER_SIDECAR_VERSION).then_some(sidecar)
 }
 
+#[cfg(test)]
 pub(crate) fn marker_sidecar_entry(path: &Path, key: &str) -> Option<MarkerSidecarEntry> {
     read_marker_sidecar(path)?.items.get(key).cloned()
 }
@@ -490,6 +491,14 @@ pub(crate) fn replace_markers_from_sidecar(
     transaction.commit()
 }
 
+pub(crate) fn write_marker_sidecar_snapshot(
+    path: &Path,
+    sidecar: &MarkerSidecar,
+) -> Result<(), std::io::Error> {
+    let _guard = marker_sidecar_lock();
+    write_marker_sidecar(path, sidecar)
+}
+
 fn write_marker_sidecar(path: &Path, sidecar: &MarkerSidecar) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -501,6 +510,7 @@ fn write_marker_sidecar(path: &Path, sidecar: &MarkerSidecar) -> Result<(), std:
     std::fs::rename(Path::new(&temporary), path)
 }
 
+#[cfg(test)]
 pub(crate) fn write_marker_sidecar_entry(
     path: &Path,
     key: &str,

@@ -8547,23 +8547,9 @@ pub(crate) async fn plex_set_streams(
     if selection.audio_stream_id.is_none() && selection.subtitle_stream_id.is_none() {
         return plex_json(serde_json::json!({"MediaContainer": {"size": 0}}));
     }
-    let info = state
-        .media_info
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&media.id).cloned());
-    let info = match info {
-        Some(info) => info,
-        None => match inspect_media(&media.path).await {
-            Some(info) => {
-                if let Ok(mut cache) = state.media_info.lock() {
-                    cache.insert(media.id.clone(), info.clone());
-                }
-                info
-            }
-            None => serde_json::json!({"media": {"track": []}}),
-        },
-    };
+    let info = ensure_media_info(&state, &media)
+        .await
+        .unwrap_or_else(|| serde_json::json!({"media": {"track": []}}));
     let subtitle_paths = external_subtitle_files(&media.path).await;
     let audio_valid = selection.audio_stream_id.is_none_or(|selected| {
         technical_tracks(&info).iter().any(|track| {
@@ -8592,15 +8578,22 @@ pub(crate) async fn plex_set_streams(
     if !audio_valid || !subtitle_valid {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Ok(mut selections) = state.plex_stream_selections.lock() {
-        let current = selections.entry(plex_part_id(&media)).or_default();
-        if selection.audio_stream_id.is_some() {
-            current.audio_stream_id = selection.audio_stream_id;
+    let current = stored_plex_stream_selection(&state, &media).unwrap_or_default();
+    save_plex_stream_selection(
+        &state,
+        &media,
+        PlexStreamSelection {
+            audio_stream_id: selection.audio_stream_id.or(current.audio_stream_id),
+            subtitle_stream_id: selection.subtitle_stream_id.or(current.subtitle_stream_id),
+        },
+    );
+    if let Some(stream_id) = selection.subtitle_stream_id {
+        if let Some(language) =
+            subtitle_language_for_plex_stream_id(&state, &media, &info, &subtitle_paths, stream_id)
+        {
+            remember_last_subtitle_language(&state, &language);
         }
-        if let Some(stream_id) = selection.subtitle_stream_id {
-            current.subtitle_stream_id = Some(stream_id);
-            let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), stream_id));
-        }
+        let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), stream_id));
     }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))
 }

@@ -75,7 +75,7 @@ use clap::Parser;
 use matroska_demuxer::{Frame as MatroskaFrame, MatroskaFile, TrackType};
 use plex_tls::PlexTls;
 use rand_core::{OsRng, RngCore};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -161,6 +161,10 @@ pub(crate) struct Config {
     pub(crate) metadata_storage: String,
     #[serde(default)]
     pub(crate) tmdb_bearer_token: Option<String>,
+    #[serde(default = "default_audio_language_primary")]
+    pub(crate) audio_language_primary: String,
+    #[serde(default)]
+    pub(crate) audio_language_secondary: Option<String>,
     #[serde(default = "default_subtitle_language_primary")]
     pub(crate) subtitle_language_primary: String,
     #[serde(default = "default_subtitle_language_secondary")]
@@ -216,6 +220,10 @@ fn skip_mode_options(selected: SkipMode) -> String {
 
 fn default_skip_mode() -> SkipMode {
     SkipMode::Manual
+}
+
+fn default_audio_language_primary() -> String {
+    PLEX_DEFAULT_AUDIO_LANGUAGE.to_owned()
 }
 
 fn default_subtitle_language_primary() -> String {
@@ -284,6 +292,8 @@ pub(crate) struct AppState {
     pub(crate) inventory_scan_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) plex_notifications: tokio::sync::broadcast::Sender<String>,
     pub(crate) media_info: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    pub(crate) media_info_pending: Arc<Mutex<HashSet<String>>>,
+    pub(crate) media_info_inspection_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) plex_stream_selections: Arc<Mutex<HashMap<u64, PlexStreamSelection>>>,
     pub(crate) plex_play_queues: Arc<Mutex<HashMap<u64, serde_json::Value>>>,
     pub(crate) next_plex_play_queue_id: Arc<AtomicU64>,
@@ -393,6 +403,70 @@ pub(crate) fn media_snapshot(state: &AppState) -> Arc<Vec<Media>> {
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone()
+}
+
+pub(crate) fn load_cached_media(
+    db: &Connection,
+    config: &Config,
+) -> Result<Vec<Media>, rusqlite::Error> {
+    let metadata_revision = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let mut result = Vec::new();
+    for (library_index, library) in config.libraries.iter().enumerate() {
+        let folders = library
+            .folders
+            .iter()
+            .filter_map(|configured| {
+                std::fs::canonicalize(configured)
+                    .ok()
+                    .map(|canonical| (configured.clone(), canonical))
+            })
+            .collect::<Vec<_>>();
+        let mut statement = db.prepare(
+            "SELECT i.media_key, i.canonical_path, m.title
+               FROM media_identity i
+               JOIN media m ON m.media_key = i.media_key
+              WHERE i.library_section = ?1
+              ORDER BY i.canonical_path",
+        )?;
+        let rows = statement.query_map([library_index as i64 + 1], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (media_key, canonical_path, title) = row?;
+            let canonical_path = PathBuf::from(canonical_path);
+            let path = folders
+                .iter()
+                .find_map(|(configured, canonical)| {
+                    canonical_path
+                        .strip_prefix(canonical)
+                        .ok()
+                        .map(|relative| configured.join(relative))
+                })
+                .unwrap_or(canonical_path);
+            let Some((container, mime)) = media_type(&path) else {
+                continue;
+            };
+            result.push(Media {
+                id: media_key,
+                title,
+                size: std::fs::metadata(&path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default(),
+                path,
+                container: container.to_owned(),
+                mime: mime.to_owned(),
+                metadata_revision,
+            });
+        }
+    }
+    Ok(result)
 }
 
 struct LocalSecondTimer;
@@ -636,33 +710,8 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
                 .unwrap_or(std::path::Path::new("."))
                 .to_path_buf()
         });
-    let mut media = Vec::new();
-    for (library_index, library) in config.libraries.iter().enumerate() {
-        for folder in &library.folders {
-            let configured_folder = folder.clone();
-            let Ok(canonical_folder) = tokio::fs::canonicalize(folder).await else {
-                continue;
-            };
-            let mut library_media = scan_media(&canonical_folder).await?;
-            assign_media_ids(
-                &db,
-                library_index + 1,
-                &canonical_folder,
-                &configured_folder,
-                &mut library_media,
-            )?;
-            for item in &mut library_media {
-                if let Ok(relative) = item.path.strip_prefix(&canonical_folder) {
-                    item.path = configured_folder.join(relative);
-                }
-            }
-            persist_media_records(&db, &configured_folder, &library_media)?;
-            media.extend(library_media);
-        }
-    }
-    for item in &media {
-        info!(id = %item.id, file = %item.path.display(), size = item.size, "serving media");
-    }
+    let media = load_cached_media(&db, &config)?;
+    info!(items = media.len(), "loaded cached media inventory");
 
     let gdm_machine_identifier = machine_identifier.clone();
     let cert_dir = config_path
@@ -688,6 +737,8 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
+        media_info_pending: Arc::new(Mutex::new(HashSet::new())),
+        media_info_inspection_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(AtomicU64::new(1)),
@@ -700,8 +751,6 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
         plex_tls,
     };
     migrate_legacy_database_metadata(&state);
-    let startup_media = media_snapshot(&state);
-    sync_marker_sidecars(&state, &startup_media);
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let metrics_task = tokio::spawn(metrics::run_sampler(state.metrics.clone()));
@@ -1443,6 +1492,11 @@ pub(crate) async fn scan_library_inventory(
         updated.extend(scanned);
         updated.extend(retained_media);
     }
+    let warm_media = updated
+        .iter()
+        .filter(|media| belongs_to_library(media) && media_type(&media.path).is_some())
+        .cloned()
+        .collect::<Vec<_>>();
     {
         let mut media = state
             .media
@@ -1478,6 +1532,22 @@ pub(crate) async fn scan_library_inventory(
         });
         let _ = state.plex_notifications.send(notification.to_string());
     }
+    let warm_state = state.clone();
+    let warm_library_name = library.name.clone();
+    tokio::spawn(async move {
+        let mut inspected = 0usize;
+        for media in &warm_media {
+            if ensure_media_info(&warm_state, media).await.is_some() {
+                inspected += 1;
+            }
+        }
+        debug!(
+            library = %warm_library_name,
+            items = warm_media.len(),
+            inspected,
+            "background media inspection warm-up completed"
+        );
+    });
     if library.kind != "other" {
         let assets_only = metadata_scan_assets_only(newly_found.len(), match_unmatched);
         if !assets_only {
@@ -1520,7 +1590,9 @@ pub(crate) async fn scan_library_inventory(
 
 async fn library_scan_scheduler(state: AppState) {
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_scans = HashMap::<usize, tokio::time::Instant>::new();
+    let mut initial_scan = true;
     loop {
         ticker.tick().await;
         let libraries = match state.config.lock() {
@@ -1535,7 +1607,7 @@ async fn library_scan_scheduler(state: AppState) {
                 continue;
             }
             let last_scan = last_scans.entry(index).or_insert(now);
-            if now.duration_since(*last_scan) < library_scan_interval(library) {
+            if !initial_scan && now.duration_since(*last_scan) < library_scan_interval(library) {
                 continue;
             }
             *last_scan = now;
@@ -1543,6 +1615,7 @@ async fn library_scan_scheduler(state: AppState) {
                 warn!(library = %library.name, %error, "automatic library scan failed");
             }
         }
+        initial_scan = false;
     }
 }
 
@@ -1553,6 +1626,8 @@ fn load_config(path: &std::path::Path) -> Result<Config, Box<dyn std::error::Err
             libraries: Vec::new(),
             metadata_storage: default_metadata_storage(),
             tmdb_bearer_token: None,
+            audio_language_primary: default_audio_language_primary(),
+            audio_language_secondary: None,
             subtitle_language_primary: default_subtitle_language_primary(),
             subtitle_language_secondary: default_subtitle_language_secondary(),
             bilingual_subtitles_enabled: default_true(),
@@ -1775,6 +1850,23 @@ fn open_database(
              hidden_from_continue INTEGER NOT NULL DEFAULT 0,
              updated_at INTEGER NOT NULL,
              PRIMARY KEY (user_id, media_key)
+         );
+         CREATE TABLE IF NOT EXISTS stream_selections (
+             media_path TEXT PRIMARY KEY,
+             audio_stream_id INTEGER,
+             subtitle_stream_id INTEGER,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS playback_preferences (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS marker_sidecar_state (
+             path TEXT PRIMARY KEY,
+             modified_ns INTEGER NOT NULL,
+             len INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
          );
          CREATE TABLE IF NOT EXISTS libraries (
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2056,6 +2148,14 @@ pub(crate) struct WebTranslationStopRequest {
 
 #[derive(Deserialize)]
 pub(crate) struct WebSubtitleSelectionUpdate {
+    pub(crate) path: String,
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) stream_id: u64,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct WebAudioSelectionUpdate {
     pub(crate) path: String,
     pub(crate) library: Option<usize>,
     pub(crate) folder: Option<usize>,
@@ -2643,13 +2743,178 @@ pub(crate) struct WebWatchActionUpdate {
     pub(crate) scope: Option<String>,
 }
 
-fn current_web_subtitle_stream_id(state: &AppState, media: &Media) -> u64 {
-    state
+const LAST_SUBTITLE_LANGUAGE_KEY: &str = "last_subtitle_language";
+const SUBTITLE_OFF_LANGUAGE: &str = "off";
+
+fn now_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+fn stream_selection_media_key(media: &Media) -> String {
+    media.path.to_string_lossy().to_string()
+}
+
+pub(crate) fn stored_plex_stream_selection(
+    state: &AppState,
+    media: &Media,
+) -> Option<PlexStreamSelection> {
+    if let Some(selection) = state
         .plex_stream_selections
         .lock()
         .ok()
         .and_then(|selections| selections.get(&plex_part_id(media)).copied())
+    {
+        return Some(selection);
+    }
+    let connection = state.db.lock().ok()?;
+    let mut statement = connection
+        .prepare(
+            "SELECT audio_stream_id, subtitle_stream_id FROM stream_selections WHERE media_path = ?1",
+        )
+        .ok()?;
+    let mut rows = statement
+        .query_map([stream_selection_media_key(media)], |row| {
+            Ok(PlexStreamSelection {
+                audio_stream_id: row.get(0)?,
+                subtitle_stream_id: row.get(1)?,
+            })
+        })
+        .ok()?;
+    rows.next().and_then(Result::ok)
+}
+
+pub(crate) fn save_plex_stream_selection(
+    state: &AppState,
+    media: &Media,
+    selection: PlexStreamSelection,
+) {
+    if let Ok(mut selections) = state.plex_stream_selections.lock() {
+        selections.insert(plex_part_id(media), selection);
+    }
+    if let Ok(connection) = state.db.lock() {
+        let _ = connection.execute(
+            "INSERT INTO stream_selections (media_path, audio_stream_id, subtitle_stream_id, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(media_path) DO UPDATE SET
+                 audio_stream_id = excluded.audio_stream_id,
+                 subtitle_stream_id = excluded.subtitle_stream_id,
+                 updated_at = excluded.updated_at",
+            params![
+                stream_selection_media_key(media),
+                selection.audio_stream_id,
+                selection.subtitle_stream_id,
+                now_timestamp()
+            ],
+        );
+    }
+}
+
+fn playback_preference(state: &AppState, key: &str) -> Option<String> {
+    let connection = state.db.lock().ok()?;
+    let mut statement = connection
+        .prepare("SELECT value FROM playback_preferences WHERE key = ?1")
+        .ok()?;
+    let mut rows = statement
+        .query_map([key], |row| row.get::<_, String>(0))
+        .ok()?;
+    rows.next().and_then(Result::ok)
+}
+
+fn set_playback_preference(state: &AppState, key: &str, value: Option<&str>) {
+    let Ok(connection) = state.db.lock() else {
+        return;
+    };
+    let result = match value {
+        Some(value) => connection.execute(
+            "INSERT INTO playback_preferences (key, value, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![key, value, now_timestamp()],
+        ),
+        None => connection.execute(
+            "DELETE FROM playback_preferences WHERE key = ?1",
+            params![key],
+        ),
+    };
+    if result.is_err() {
+        warn!(key, "Could not persist playback preference");
+    }
+}
+
+pub(crate) fn remember_last_subtitle_language(state: &AppState, language: &str) {
+    set_playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY, Some(language));
+}
+
+pub(crate) fn clear_last_subtitle_language(state: &AppState) {
+    set_playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY, None);
+}
+
+pub(crate) fn subtitle_language_for_plex_stream_id(
+    state: &AppState,
+    media: &Media,
+    info: &serde_json::Value,
+    subtitle_paths: &[std::path::PathBuf],
+    stream_id: u64,
+) -> Option<String> {
+    if stream_id == 0 {
+        return Some(SUBTITLE_OFF_LANGUAGE.to_owned());
+    }
+    if let Some(track) = technical_tracks(info).iter().find(|track| {
+        technical_text(track, "@type") == Some("Text")
+            && technical_track_id(track).saturating_add(1) == stream_id
+    }) {
+        return Some(plex_track_language(track).0.to_owned());
+    }
+    if let Some(path) = subtitle_paths
+        .iter()
+        .find(|path| plex_external_subtitle_id(media, path) == stream_id)
+    {
+        return Some(external_subtitle_language(&media.path, path).0.to_owned());
+    }
+    state.config.lock().ok().and_then(|config| {
+        (stream_id
+            == plex_translated_subtitle_id(
+                media,
+                &config.subtitle_language_primary,
+                &config.subtitle_language_secondary,
+            ))
+        .then(|| config.subtitle_language_primary.clone())
+    })
+}
+
+pub(crate) fn selected_web_subtitle_stream_id(
+    state: &AppState,
+    media: &Media,
+    subtitles: &[SubtitleTrack],
+) -> u64 {
+    if let Some(stream_id) = stored_plex_stream_selection(state, media)
         .and_then(|selection| selection.subtitle_stream_id)
+    {
+        return stream_id;
+    }
+    if let Some(last_language) = playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY) {
+        if last_language == SUBTITLE_OFF_LANGUAGE {
+            return 0;
+        }
+        if let Some(track) = subtitles
+            .iter()
+            .find(|track| track.language.as_deref() == Some(last_language.as_str()))
+        {
+            return track.stream_id;
+        }
+    }
+    let primary = state
+        .config
+        .lock()
+        .ok()
+        .map(|config| config.subtitle_language_primary.clone())
+        .unwrap_or_default();
+    subtitles
+        .iter()
+        .find(|track| track.language.as_deref() == Some(primary.as_str()))
+        .map(|track| track.stream_id)
         .unwrap_or_default()
 }
 
@@ -3011,6 +3276,10 @@ fn extract_xml_token(body: &str) -> Option<String> {
 
 #[derive(Deserialize)]
 pub(crate) struct TranslationSettingsForm {
+    #[serde(default)]
+    pub(crate) audio_language_primary: Option<String>,
+    #[serde(default)]
+    pub(crate) audio_language_secondary: Option<String>,
     pub(crate) language_primary: String,
     pub(crate) language_secondary: String,
     #[serde(default)]
@@ -3192,6 +3461,18 @@ pub(crate) async fn scan_library_metadata(
             }
 
             let group_title = metadata_group_title(&group_path, folder);
+            for media in &group {
+                if let Err(error) =
+                    persist_media_technical_info(&state, library_id + 1, folder, kind, media).await
+                {
+                    warn!(
+                        library = %library.name,
+                        path = %media.path.display(),
+                        %error,
+                        "technical metadata detection failed"
+                    );
+                }
+            }
             if refreshing {
                 if let Err(error) = refresh_matched_metadata(
                     &state,
@@ -3817,6 +4098,48 @@ pub(crate) fn read_metadata_sidecar(
     }
 }
 
+fn read_info_file(path: &std::path::Path) -> Option<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_sidecar_info(&contents))
+}
+
+fn read_config_info(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
+    read_info_file(&config_metadata_sidecar_path(state, media_key))
+}
+
+fn sidecar_media_info(state: &AppState, media: &Media) -> Option<serde_json::Value> {
+    let (section, library) = media_library(state, media)?;
+    let media_key = database_media_key(section, &media.id);
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))?;
+    let group_path = metadata_group_path(root, &media.path, &library.kind);
+    let config_info = read_config_info(state, &media_key);
+    let group_info = read_info_file(&metadata_sidecar_info_path(&group_path));
+    let episode_info =
+        tv_episode_sidecar_metadata_path(root, media).and_then(|path| read_info_file(&path));
+    let media_info = media
+        .path
+        .parent()
+        .and_then(|directory| read_info_file(&directory.join(".hbgr/data.json")));
+    let config_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    let candidates = if config_mode {
+        vec![config_info, episode_info, group_info, media_info]
+    } else {
+        vec![episode_info, media_info, group_info, config_info]
+    };
+    candidates
+        .into_iter()
+        .flatten()
+        .find_map(|info| info.get("technical").cloned())
+        .filter(|technical| !technical.is_null())
+}
+
 fn write_config_metadata(state: &AppState, media_key: &str, metadata: &serde_json::Value) -> bool {
     let path = config_metadata_sidecar_path(state, media_key);
     let Some(directory) = path.parent() else {
@@ -3831,6 +4154,9 @@ fn write_config_metadata(state: &AppState, media_key: &str, metadata: &serde_jso
     } else {
         title
     };
+    let technical = read_info_file(&path)
+        .and_then(|info| info.get("technical").cloned())
+        .filter(|technical| !technical.is_null());
     let info = MediaInfo {
         title,
         media_path: None,
@@ -3844,12 +4170,65 @@ fn write_config_metadata(state: &AppState, media_key: &str, metadata: &serde_jso
         episode_end: None,
         episode_title: None,
         metadata_json: metadata.clone(),
-        technical: None,
+        technical,
         show_id: metadata.get("id").map(|id| id.to_string()),
     };
     serde_json::to_vec_pretty(&info)
         .ok()
         .is_some_and(|contents| std::fs::write(path, contents).is_ok())
+}
+
+async fn persist_media_technical_info(
+    state: &AppState,
+    section: usize,
+    root: &PathBuf,
+    kind: &str,
+    media: &Media,
+) -> Result<bool, String> {
+    if cached_media_info(state, media).await.is_some() {
+        return Ok(false);
+    }
+    let technical = inspect_media(&media.path)
+        .await
+        .ok_or_else(|| format!("Could not inspect {}", media.path.display()))?;
+    let config_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    let path = if config_mode {
+        config_metadata_sidecar_path(state, &database_media_key(section, &media.id))
+    } else if kind == "tv" {
+        tv_episode_sidecar_metadata_path(root, media).ok_or_else(|| {
+            format!(
+                "Could not build episode technical path for {}",
+                media.path.display()
+            )
+        })?
+    } else {
+        metadata_sidecar_info_path(&metadata_group_path(root, &media.path, kind))
+    };
+    let Some(directory) = path.parent() else {
+        return Err(format!(
+            "Could not build technical metadata directory for {}",
+            media.path.display()
+        ));
+    };
+    std::fs::create_dir_all(directory)
+        .map_err(|error| format!("Could not create technical metadata directory: {error}"))?;
+    let mut info = read_info_file(&path).unwrap_or_else(|| serde_json::json!({}));
+    if !info.is_object() {
+        info = serde_json::json!({});
+    }
+    info.as_object_mut()
+        .expect("technical metadata is an object")
+        .insert("technical".to_owned(), technical.clone());
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&info).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("Could not save technical metadata: {error}"))?;
+    store_media_info(state, media, technical);
+    Ok(true)
 }
 
 fn migrate_legacy_database_metadata(state: &AppState) {
@@ -4416,6 +4795,16 @@ async fn store_metadata_sidecar(
     let show_id = read_sidecar_info(media_directory)
         .await
         .and_then(|value| value.get("show_id")?.as_str().map(str::to_owned));
+    let technical = if tv_show {
+        None
+    } else {
+        match read_info_file(&directory.join("data.json"))
+            .and_then(|info| info.get("technical").cloned())
+        {
+            Some(technical) => Some(technical),
+            None => inspect_media(&media.path).await,
+        }
+    };
     let info = MediaInfo {
         title: title.to_owned(),
         media_path: (!tv_show).then(|| path.into_owned()),
@@ -4429,11 +4818,7 @@ async fn store_metadata_sidecar(
         episode_end: episode.as_ref().and_then(|value| value.episode_end),
         episode_title: episode.and_then(|value| value.episode_title),
         metadata_json: metadata.clone(),
-        technical: if tv_show {
-            None
-        } else {
-            inspect_media(&media.path).await
-        },
+        technical,
         show_id,
     };
     let contents = serde_json::to_string_pretty(&info).map_err(std::io::Error::other)?;
@@ -4582,31 +4967,24 @@ pub(crate) async fn add_plex_technical_metadata(
     item: &mut serde_json::Value,
     media: &Media,
 ) {
-    let cached = state
-        .media_info
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&media.id).cloned());
-    let info = if let Some(info) = cached {
-        info
-    } else {
-        match inspect_media(&media.path).await {
-            Some(info) => {
-                if let Ok(mut cache) = state.media_info.lock() {
-                    cache.insert(media.id.clone(), info.clone());
-                }
-                info
-            }
-            None => serde_json::json!({"media": {"track": []}}),
-        }
-    };
-    let (enabled, language_primary, language_secondary) = state
+    let info = media_info_for(state, media)
+        .await
+        .unwrap_or_else(|| serde_json::json!({"media": {"track": []}}));
+    let (
+        enabled,
+        audio_language_primary,
+        audio_language_secondary,
+        language_primary,
+        language_secondary,
+    ) = state
         .config
         .lock()
         .ok()
         .map(|config| {
             (
                 config.bilingual_subtitles_enabled,
+                config.audio_language_primary.clone(),
+                config.audio_language_secondary.clone(),
                 config.subtitle_language_primary.clone(),
                 config.subtitle_language_secondary.clone(),
             )
@@ -4614,6 +4992,8 @@ pub(crate) async fn add_plex_technical_metadata(
         .unwrap_or_else(|| {
             (
                 false,
+                default_audio_language_primary(),
+                None,
                 default_subtitle_language_primary(),
                 default_subtitle_language_secondary(),
             )
@@ -4651,17 +5031,15 @@ pub(crate) async fn add_plex_technical_metadata(
         .is_file()
     });
     let translation_available = enabled && has_saved_translation && !has_requested_bilingual_file;
-    let selection = state
-        .plex_stream_selections
-        .lock()
-        .ok()
-        .and_then(|selections| selections.get(&plex_part_id(media)).copied());
+    let selection = stored_plex_stream_selection(state, media);
     apply_plex_technical_metadata(
         item,
         media,
         &info,
         &external_subtitles,
         selection,
+        &audio_language_primary,
+        audio_language_secondary.as_deref(),
         &language_primary,
         &language_secondary,
         translation_available,
@@ -4674,6 +5052,8 @@ fn apply_plex_technical_metadata(
     info: &serde_json::Value,
     external_subtitles: &[PathBuf],
     selection: Option<PlexStreamSelection>,
+    audio_language_primary: &str,
+    audio_language_secondary: Option<&str>,
     language_primary: &str,
     language_secondary: &str,
     translation_available: bool,
@@ -4695,7 +5075,19 @@ fn apply_plex_technical_metadata(
             .map(|track| technical_track_id(track))
     };
     let selected_video = selected_stream_id("Video");
-    let selected_audio = selected_stream_id("Audio");
+    let preferred_audio = [Some(audio_language_primary), audio_language_secondary]
+        .into_iter()
+        .flatten()
+        .find_map(|language| {
+            tracks
+                .iter()
+                .find(|track| {
+                    technical_text(track, "@type") == Some("Audio")
+                        && plex_track_language(track).0 == language
+                })
+                .map(technical_track_id)
+        });
+    let selected_audio = preferred_audio.or_else(|| selected_stream_id("Audio"));
     let audio_track_count = tracks
         .iter()
         .filter(|track| technical_text(track, "@type") == Some("Audio"))
@@ -5215,9 +5607,16 @@ fn write_tv_episode_sidecar_metadata(
     };
     std::fs::create_dir_all(directory)
         .map_err(|error| format!("Could not create episode metadata directory: {error}"))?;
+    let technical = read_info_file(&metadata_path)
+        .and_then(|info| info.get("technical").cloned())
+        .filter(|technical| !technical.is_null());
+    let mut value = metadata.clone();
+    if let (Some(object), Some(technical)) = (value.as_object_mut(), technical) {
+        object.insert("technical".to_owned(), technical);
+    }
     std::fs::write(
         &metadata_path,
-        serde_json::to_vec_pretty(metadata).map_err(|error| error.to_string())?,
+        serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
     )
     .map_err(|error| format!("Could not save episode metadata: {error}"))
 }
@@ -5595,6 +5994,7 @@ pub(crate) struct WebPath {
     pub(crate) episode: Option<String>,
     pub(crate) view: Option<String>,
     pub(crate) season: Option<u32>,
+    pub(crate) bilingual: Option<bool>,
 }
 
 pub(crate) fn next_tv_episode_paths(
@@ -5655,11 +6055,99 @@ pub(crate) fn next_tv_episode_paths(
     next_paths
 }
 
+pub(crate) struct AudioTrack {
+    pub(crate) label: String,
+    pub(crate) language: String,
+    pub(crate) stream_id: u64,
+    pub(crate) index: usize,
+}
+
 pub(crate) struct SubtitleTrack {
     pub(crate) label: String,
     pub(crate) url: String,
     pub(crate) stream_id: u64,
+    pub(crate) language: Option<String>,
     pub(crate) bilingual: bool,
+}
+
+fn store_media_info(state: &AppState, media: &Media, info: serde_json::Value) {
+    if let Ok(mut cache) = state.media_info.lock() {
+        cache.insert(media.id.clone(), info);
+    }
+    if let Ok(mut pending) = state.media_info_pending.lock() {
+        pending.remove(&media.id);
+    }
+}
+
+pub(crate) async fn cached_media_info(
+    state: &AppState,
+    media: &Media,
+) -> Option<serde_json::Value> {
+    if let Some(info) = state
+        .media_info
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&media.id).cloned())
+    {
+        return Some(info);
+    }
+    let info = sidecar_media_info(state, media)?;
+    store_media_info(state, media, info.clone());
+    Some(info)
+}
+
+async fn inspect_and_store_media_info(
+    state: &AppState,
+    media: &Media,
+) -> Option<serde_json::Value> {
+    let info = inspect_media(&media.path).await?;
+    store_media_info(state, media, info.clone());
+    Some(info)
+}
+
+pub(crate) fn schedule_media_info_inspection(state: &AppState, media: &Media) {
+    {
+        let Ok(mut pending) = state.media_info_pending.lock() else {
+            return;
+        };
+        if !pending.insert(media.id.clone()) {
+            return;
+        }
+    }
+    let state = state.clone();
+    let media = media.clone();
+    tokio::spawn(async move {
+        let _inspection = state.media_info_inspection_lock.lock().await;
+        if cached_media_info(&state, &media).await.is_some() {
+            if let Ok(mut pending) = state.media_info_pending.lock() {
+                pending.remove(&media.id);
+            }
+            return;
+        }
+        inspect_and_store_media_info(&state, &media).await;
+    });
+}
+
+pub(crate) async fn ensure_media_info(
+    state: &AppState,
+    media: &Media,
+) -> Option<serde_json::Value> {
+    if let Some(info) = cached_media_info(state, media).await {
+        return Some(info);
+    }
+    let _inspection = state.media_info_inspection_lock.lock().await;
+    if let Some(info) = cached_media_info(state, media).await {
+        return Some(info);
+    }
+    inspect_and_store_media_info(state, media).await
+}
+
+pub(crate) async fn media_info_for(state: &AppState, media: &Media) -> Option<serde_json::Value> {
+    if let Some(info) = cached_media_info(state, media).await {
+        return Some(info);
+    }
+    schedule_media_info_inspection(state, media);
+    None
 }
 
 pub(crate) async fn external_subtitle_files(video: &std::path::Path) -> Vec<PathBuf> {
@@ -5707,23 +6195,9 @@ async fn embedded_subtitle_source(
                 .to_owned(),
         );
     }
-    let cached = state
-        .media_info
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&media.id).cloned());
-    let info = match cached {
-        Some(info) => info,
-        None => {
-            let info = inspect_media(&media.path)
-                .await
-                .ok_or_else(|| "Embedded subtitle metadata is unavailable".to_owned())?;
-            if let Ok(mut cache) = state.media_info.lock() {
-                cache.insert(media.id.clone(), info.clone());
-            }
-            info
-        }
-    };
+    let info = ensure_media_info(state, media)
+        .await
+        .ok_or_else(|| "Embedded subtitle metadata is unavailable".to_owned())?;
     let track = technical_tracks(&info)
         .into_iter()
         .find(|track| {
@@ -6182,7 +6656,7 @@ fn bilingual_subtitle_path(media: &Media, first: &str, second: &str, extension: 
         ))
 }
 
-fn configured_bilingual_subtitle_path(
+pub(crate) fn configured_bilingual_subtitle_path(
     state: &AppState,
     media: &Media,
     first: &str,
@@ -6475,6 +6949,26 @@ fn supports_embedded_subtitle_extraction(media: &Media) -> bool {
     )
 }
 
+pub(crate) async fn web_audio_tracks(state: &AppState, media: &Media) -> Vec<AudioTrack> {
+    let Some(info) = media_info_for(state, media).await else {
+        return Vec::new();
+    };
+    technical_tracks(&info)
+        .iter()
+        .filter(|track| technical_text(track, "@type") == Some("Audio"))
+        .enumerate()
+        .filter_map(|(index, track)| {
+            let stream_id = technical_track_id(track).saturating_add(1);
+            (stream_id <= (1_u64 << 53) - 1).then(|| AudioTrack {
+                label: plex_track_label(track, 2),
+                language: plex_track_language(track).0.to_owned(),
+                stream_id,
+                index,
+            })
+        })
+        .collect()
+}
+
 async fn subtitle_tracks(
     state: &AppState,
     media: &Media,
@@ -6502,13 +6996,13 @@ async fn subtitle_tracks(
         })
     });
     let bilingual_enabled = languages.is_some();
-    if let Some((first, second)) = languages {
+    if let Some((first, second)) = languages.as_ref() {
         if state
             .config
             .lock()
             .is_ok_and(|config| config.metadata_storage == "media")
         {
-            let _ = ensure_merged_bilingual_sidecar(media, &first, &second).await;
+            let _ = ensure_merged_bilingual_sidecar(media, first, second).await;
         }
     }
     for path in external_subtitle_files(&media.path).await {
@@ -6529,26 +7023,36 @@ async fn subtitle_tracks(
                 )
             ),
             stream_id: plex_external_subtitle_id(media, &path),
+            language: Some(external_subtitle_language(&media.path, &path).0.to_owned()),
             bilingual: external_subtitle_pair(&media.path, &path).is_some(),
         });
     }
-    let info = state
-        .media_info
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&media.id).cloned());
-    let info = match info {
-        Some(info) => Some(info),
-        None => match inspect_media(&media.path).await {
-            Some(info) => {
-                if let Ok(mut cache) = state.media_info.lock() {
-                    cache.insert(media.id.clone(), info.clone());
-                }
-                Some(info)
+    if let Some((first, second)) = languages.as_ref() {
+        let stream_id = plex_translated_subtitle_id(media, first, second);
+        if !tracks.iter().any(|track| track.stream_id == stream_id) {
+            let saved = ["srt", "vtt", "ass"].into_iter().any(|extension| {
+                configured_bilingual_subtitle_path(state, media, first, second, extension).is_file()
+            });
+            if saved {
+                tracks.push(SubtitleTrack {
+                    label: format!(
+                        "Bilingual: {} + {}",
+                        plex_language(first).1,
+                        plex_language(second).1
+                    ),
+                    url: format!(
+                        "/web/subtitle?{}path={}&bilingual=1",
+                        library_query,
+                        url_encode(&relative.to_string_lossy())
+                    ),
+                    stream_id,
+                    language: Some(first.clone()),
+                    bilingual: true,
+                });
             }
-            None => None,
-        },
-    };
+        }
+    }
+    let info = media_info_for(state, media).await;
     if supports_embedded_subtitle_extraction(media) {
         if let Some(info) = info {
             for track in technical_tracks(&info)
@@ -6568,6 +7072,7 @@ async fn subtitle_tracks(
                         url_encode(&relative.to_string_lossy())
                     ),
                     stream_id,
+                    language: Some(plex_track_language(track).0.to_owned()),
                     bilingual: false,
                 });
             }
@@ -7411,8 +7916,54 @@ fn marker_sidecar_locations(
     }
 }
 
+#[derive(Hash, Eq, PartialEq)]
+struct SeasonFingerprintKey {
+    library: usize,
+    root: PathBuf,
+    show_title: String,
+    season: u32,
+}
+
+type SeasonFingerprintCache = HashMap<SeasonFingerprintKey, HashMap<String, (String, String)>>;
+
+fn season_fingerprints(
+    state: &AppState,
+    library: &ConfigLibrary,
+    root: &std::path::Path,
+    show_title: &str,
+    season: u32,
+) -> HashMap<String, (String, String)> {
+    let groups = season_episode_candidates_by_number(
+        state,
+        library,
+        &root.to_path_buf(),
+        show_title,
+        season,
+    );
+    if groups.len() < 2 {
+        return HashMap::new();
+    }
+    let episodes = groups
+        .values()
+        .filter_map(|files| files.first().cloned())
+        .collect::<Vec<_>>();
+    let group_fingerprint = group_fingerprint(root, &episodes);
+    groups
+        .values()
+        .flatten()
+        .map(|episode| {
+            (
+                episode.id.clone(),
+                (media_fingerprint(root, episode), group_fingerprint.clone()),
+            )
+        })
+        .collect()
+}
+
 fn stable_marker_fingerprints(
     state: &AppState,
+    cache: &mut SeasonFingerprintCache,
+    library_key: usize,
     library: &ConfigLibrary,
     root: &std::path::Path,
     media: &Media,
@@ -7420,28 +7971,137 @@ fn stable_marker_fingerprints(
     if library.kind != "tv" {
         return None;
     }
-    let root = root.to_path_buf();
-    let info = tv_episode_info(&root, &media.path)?;
-    let show_title = tv_show_title(&root, &media.path);
-    let groups =
-        season_episode_candidates_by_number(state, library, &root, &show_title, info.season);
-    if groups.len() < 2 {
-        return None;
+    let info = tv_episode_info(&root.to_path_buf(), &media.path)?;
+    let key = SeasonFingerprintKey {
+        library: library_key,
+        root: root.to_path_buf(),
+        show_title: tv_show_title(&root.to_path_buf(), &media.path),
+        season: info.season,
+    };
+    let fingerprints = if let Some(cached) = cache.get(&key) {
+        cached
+    } else {
+        let computed = season_fingerprints(state, library, root, &key.show_title, key.season);
+        cache.entry(key).or_insert(computed)
+    };
+    fingerprints.get(&media.id).cloned()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarStamp {
+    Missing,
+    Present { modified_ns: i64, len: i64 },
+}
+
+fn sidecar_stamp_unchanged(
+    current: SidecarStamp,
+    stored: SidecarStamp,
+    missing_unchanged: bool,
+) -> bool {
+    match (current, stored) {
+        (SidecarStamp::Present { .. }, SidecarStamp::Present { .. }) => current == stored,
+        (SidecarStamp::Missing, SidecarStamp::Missing) => missing_unchanged,
+        _ => false,
     }
-    let episodes = groups
-        .values()
-        .filter_map(|files| files.first().cloned())
-        .collect::<Vec<_>>();
-    Some((
-        media_fingerprint(&root, media),
-        group_fingerprint(&root, &episodes),
-    ))
+}
+
+fn current_sidecar_stamp(path: &std::path::Path) -> SidecarStamp {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return SidecarStamp::Missing;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return SidecarStamp::Missing;
+    };
+    let modified_ns = modified
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().min(i64::MAX as u128) as i64)
+        .unwrap_or_default();
+    SidecarStamp::Present {
+        modified_ns,
+        len: metadata.len() as i64,
+    }
+}
+
+fn stored_sidecar_stamp(db: &Connection, path: &std::path::Path) -> SidecarStamp {
+    let Ok((modified_ns, len)) = db.query_row(
+        "SELECT modified_ns, len FROM marker_sidecar_state WHERE path = ?1",
+        [path.to_string_lossy().as_ref()],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    ) else {
+        return SidecarStamp::Missing;
+    };
+    SidecarStamp::Present { modified_ns, len }
+}
+
+fn set_stored_sidecar_stamp(db: &Connection, path: &std::path::Path, stamp: SidecarStamp) {
+    let path = path.to_string_lossy();
+    let result = match stamp {
+        SidecarStamp::Present { modified_ns, len } => db.execute(
+            "INSERT INTO marker_sidecar_state (path, modified_ns, len, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(path) DO UPDATE SET
+                 modified_ns = excluded.modified_ns,
+                 len = excluded.len,
+                 updated_at = excluded.updated_at",
+            params![path.as_ref(), modified_ns, len, now_timestamp()],
+        ),
+        SidecarStamp::Missing => db.execute(
+            "DELETE FROM marker_sidecar_state WHERE path = ?1",
+            [path.as_ref()],
+        ),
+    };
+    if result.is_err() {
+        warn!(path = %path, "could not record marker sidecar state");
+    }
+}
+
+fn cached_current_stamp(
+    cache: &mut HashMap<PathBuf, SidecarStamp>,
+    path: &std::path::Path,
+) -> SidecarStamp {
+    *cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| current_sidecar_stamp(path))
+}
+
+fn cached_stored_stamp(
+    db: &Connection,
+    cache: &mut HashMap<PathBuf, SidecarStamp>,
+    path: &std::path::Path,
+) -> SidecarStamp {
+    *cache
+        .entry(path.to_path_buf())
+        .or_insert_with(|| stored_sidecar_stamp(db, path))
+}
+
+fn ensure_marker_sidecar<'a>(
+    cache: &'a mut HashMap<PathBuf, markers::MarkerSidecar>,
+    loaded: &mut HashSet<PathBuf>,
+    path: &std::path::Path,
+) -> &'a mut markers::MarkerSidecar {
+    let cache_key = path.to_path_buf();
+    if !loaded.contains(&cache_key) {
+        let sidecar = markers::read_marker_sidecar(path).unwrap_or_default();
+        cache.insert(cache_key.clone(), sidecar);
+        loaded.insert(cache_key.clone());
+    }
+    cache.get_mut(&cache_key).expect("sidecar was just loaded")
 }
 
 pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
     let Ok(db) = state.db.lock() else {
         return;
     };
+    let mut sidecars: HashMap<PathBuf, markers::MarkerSidecar> = HashMap::new();
+    let mut loaded = HashSet::new();
+    let mut season_fingerprints = SeasonFingerprintCache::new();
+    let mut dirty = HashSet::new();
+    let mut current_stamps = HashMap::<PathBuf, SidecarStamp>::new();
+    let mut stored_stamps = HashMap::<PathBuf, SidecarStamp>::new();
+    let mut prepared = Vec::new();
+    let mut imported_count = 0usize;
+    let mut exported_count = 0usize;
+
     for media in items {
         let Some((library_key, library)) = media_library(state, media) else {
             continue;
@@ -7457,20 +8117,46 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
         else {
             continue;
         };
-        let path = locations.path.as_path();
-        let key = locations.key.as_str();
-        let stable = stable_marker_fingerprints(state, &library, root, media);
-        let imported = markers::marker_sidecar_entry(path, key).or_else(|| {
-            locations
-                .fallback
-                .as_ref()
-                .and_then(|(fallback_path, fallback_key)| {
-                    markers::marker_sidecar_entry(fallback_path, fallback_key)
-                })
+        let path = locations.path.clone();
+        let key = locations.key.clone();
+        let fallback = locations.fallback.clone();
+        let primary_changed = !sidecar_stamp_unchanged(
+            cached_current_stamp(&mut current_stamps, &path),
+            cached_stored_stamp(&db, &mut stored_stamps, &path),
+            false,
+        );
+        let fallback_changed = fallback.as_ref().is_some_and(|(fallback_path, _)| {
+            !sidecar_stamp_unchanged(
+                cached_current_stamp(&mut current_stamps, fallback_path),
+                cached_stored_stamp(&db, &mut stored_stamps, fallback_path),
+                true,
+            )
         });
+        if !primary_changed && !fallback_changed {
+            continue;
+        }
+        ensure_marker_sidecar(&mut sidecars, &mut loaded, &path);
+        if let Some((fallback_path, _)) = &fallback {
+            ensure_marker_sidecar(&mut sidecars, &mut loaded, fallback_path);
+        }
+        let root_path = root.clone();
+        prepared.push((media, library_key, library, root_path, path, key, fallback));
+    }
+
+    for (media, library_key, library, root, path, key, fallback) in &prepared {
+        let imported = sidecars
+            .get(path)
+            .and_then(|sidecar| sidecar.items.get(key).cloned())
+            .or_else(|| {
+                fallback.as_ref().and_then(|(fallback_path, fallback_key)| {
+                    sidecars
+                        .get(fallback_path)
+                        .and_then(|sidecar| sidecar.items.get(fallback_key).cloned())
+                })
+            });
         match imported {
             Some(imported) => {
-                info!(
+                debug!(
                     path = %path.display(),
                     key,
                     markers = imported.markers.len(),
@@ -7486,7 +8172,16 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
                     );
                     continue;
                 }
-                let mut updated = imported.clone();
+                imported_count += 1;
+                let stable = stable_marker_fingerprints(
+                    state,
+                    &mut season_fingerprints,
+                    *library_key,
+                    library,
+                    root,
+                    media,
+                );
+                let mut updated = imported;
                 let mut changed = false;
                 if let Some((media_fingerprint, group_fingerprint)) = &stable {
                     for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
@@ -7524,15 +8219,10 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
                     }
                 }
                 if changed {
-                    if let Err(error) =
-                        markers::write_marker_sidecar_entry(path, key, Some(&updated))
-                    {
-                        warn!(
-                            path = %path.display(),
-                            %error,
-                            "could not save stable marker fingerprints to sidecar"
-                        );
-                    }
+                    ensure_marker_sidecar(&mut sidecars, &mut loaded, path)
+                        .items
+                        .insert(key.clone(), updated);
+                    dirty.insert(path.clone());
                 }
             }
             None => {
@@ -7543,11 +8233,20 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
                 if database_markers.is_empty() {
                     continue;
                 }
-                info!(
+                debug!(
                     path = %path.display(),
                     key,
                     markers = database_markers.len(),
                     "exporting database skip markers to sidecar"
+                );
+                exported_count += 1;
+                let stable = stable_marker_fingerprints(
+                    state,
+                    &mut season_fingerprints,
+                    *library_key,
+                    library,
+                    root,
+                    media,
                 );
                 let mut fingerprints =
                     markers::marker_fingerprint_map(&db, &media.id).unwrap_or_default();
@@ -7582,20 +8281,52 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
                         }
                     }
                 }
-                let entry = markers::MarkerSidecarEntry {
-                    markers: database_markers,
-                    fingerprints,
-                };
-                if let Err(error) = markers::write_marker_sidecar_entry(path, key, Some(&entry)) {
-                    warn!(
-                        path = %path.display(),
-                        %error,
-                        "could not export markers to sidecar"
+                ensure_marker_sidecar(&mut sidecars, &mut loaded, path)
+                    .items
+                    .insert(
+                        key.clone(),
+                        markers::MarkerSidecarEntry {
+                            markers: database_markers,
+                            fingerprints,
+                        },
                     );
-                }
+                dirty.insert(path.clone());
             }
         }
     }
+
+    let mut failed_writes = HashSet::new();
+    for path in &dirty {
+        if let Some(sidecar) = sidecars.get(path) {
+            if let Err(error) = markers::write_marker_sidecar_snapshot(path, sidecar) {
+                warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not save marker sidecar"
+                );
+                failed_writes.insert(path.clone());
+            }
+        }
+    }
+    for (path, stamp) in current_stamps {
+        if failed_writes.contains(&path) {
+            continue;
+        }
+        let stamp = if dirty.contains(&path) {
+            current_sidecar_stamp(&path)
+        } else {
+            stamp
+        };
+        set_stored_sidecar_stamp(&db, &path, stamp);
+    }
+    info!(
+        items = items.len(),
+        changed_items = prepared.len(),
+        imported = imported_count,
+        exported = exported_count,
+        sidecars = loaded.len(),
+        "skip marker sidecar sync completed"
+    );
 }
 
 pub(crate) fn export_marker_sidecar(

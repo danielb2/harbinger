@@ -1,8 +1,8 @@
 use super::{
-    build_app, build_plex_listener_app, build_web_listener_app, markers, migrate_library_model,
-    open_database, plex_external_subtitle_id, plex_part_id, plex_remux_audio_mode,
-    sidebar_nav_with_settings, sync_config_libraries, sync_marker_sidecars, AppState, Config,
-    ConfigLibrary, Media, PlexTls, SkipMode,
+    build_app, build_plex_listener_app, build_web_listener_app, load_cached_media, markers,
+    migrate_library_model, open_database, persist_media_records, plex_external_subtitle_id,
+    plex_part_id, plex_remux_audio_mode, sidebar_nav_with_settings, sync_config_libraries,
+    sync_marker_sidecars, AppState, Config, ConfigLibrary, Media, PlexTls, SkipMode,
 };
 use axum::{
     body::{to_bytes, Body},
@@ -138,6 +138,8 @@ fn fixture() -> Fixture {
         libraries: vec![library],
         metadata_storage: "media".to_owned(),
         tmdb_bearer_token: None,
+        audio_language_primary: "en".to_owned(),
+        audio_language_secondary: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
         bilingual_subtitles_enabled: true,
@@ -175,6 +177,8 @@ fn fixture() -> Fixture {
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
+        media_info_pending: Arc::new(Mutex::new(HashSet::new())),
+        media_info_inspection_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -196,6 +200,159 @@ fn fixture() -> Fixture {
         subtitle_id,
         change_stamp,
     }
+}
+
+#[test]
+fn cached_media_is_loaded_from_database_without_scanning() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let media_dir = media.path.parent().unwrap().to_path_buf();
+    let canonical_dir = std::fs::canonicalize(&media_dir).unwrap();
+    {
+        let db = fixture.db.lock().unwrap();
+        let mut items = vec![media.clone()];
+        super::assign_media_ids(&db, 1, &canonical_dir, &media_dir, &mut items).unwrap();
+        persist_media_records(&db, &media_dir, &items).unwrap();
+    }
+    let config = fixture.config.lock().unwrap().clone();
+    let cached = load_cached_media(&fixture.db.lock().unwrap(), &config).unwrap();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].id, "1-1");
+    assert_eq!(cached[0].path, media.path);
+    assert_eq!(cached[0].title, media.title);
+}
+
+#[tokio::test]
+async fn media_info_for_uses_sidecar_without_inspection() {
+    let fixture = fixture();
+    fixture.state.media_info.lock().unwrap().clear();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let sidecar = serde_json::json!({
+        "technical": {"media": {"track": [{"@type": "General", "Duration": "12000"}]}}
+    });
+    std::fs::write(
+        media.path.parent().unwrap().join(".hbgr/data.json"),
+        serde_json::to_string(&sidecar).unwrap(),
+    )
+    .unwrap();
+
+    let cached = super::cached_media_info(&fixture.state, &media)
+        .await
+        .expect("sidecar technical info should be cached");
+    assert_eq!(cached["media"]["track"][0]["Duration"], "12000");
+    assert!(fixture.state.media_info_pending.lock().unwrap().is_empty());
+
+    let through_helper = super::media_info_for(&fixture.state, &media)
+        .await
+        .expect("media_info_for should return cached sidecar info");
+    assert_eq!(through_helper, cached);
+    assert!(fixture.state.media_info_pending.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn config_metadata_writes_preserve_technical_info() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let key = super::database_media_key(1, &media.id);
+    let path = super::config_metadata_sidecar_path(&fixture.state, &key);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "metadata_json": {"id": 1, "title": "Original"},
+            "technical": {"media": {"track": [{"@type": "General", "Duration": "12000"}]}}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    assert!(super::write_config_metadata(
+        &fixture.state,
+        &key,
+        &serde_json::json!({"id": 1, "title": "Updated"})
+    ));
+
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(info["metadata_json"]["title"], "Updated");
+    assert_eq!(info["technical"]["media"]["track"][0]["Duration"], "12000");
+
+    fixture.state.media_info.lock().unwrap().clear();
+    let cached = super::cached_media_info(&fixture.state, &media)
+        .await
+        .expect("config sidecar should provide cached technical info");
+    assert_eq!(cached["media"]["track"][0]["Duration"], "12000");
+}
+
+#[tokio::test]
+async fn tv_episode_technical_sidecar_survives_metadata_writes() {
+    let fixture = tv_fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let root = fixture.root.join("media");
+    let technical =
+        serde_json::json!({"media": {"track": [{"@type": "General", "Duration": "12000"}]}});
+    super::write_tv_episode_sidecar_metadata(
+        &root,
+        &media,
+        &serde_json::json!({"name": "Pilot", "technical": technical}),
+    )
+    .unwrap();
+
+    super::write_tv_episode_sidecar_metadata(
+        &root,
+        &media,
+        &serde_json::json!({"name": "Updated"}),
+    )
+    .unwrap();
+
+    let path = media
+        .path
+        .parent()
+        .unwrap()
+        .join(".hbgr/episodes/s01e01.json");
+    let sidecar: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(sidecar["name"], "Updated");
+    assert_eq!(
+        sidecar["technical"]["media"]["track"][0]["Duration"],
+        "12000"
+    );
+
+    fixture.state.media_info.lock().unwrap().clear();
+    let cached = super::cached_media_info(&fixture.state, &media)
+        .await
+        .expect("episode sidecar should provide cached technical info");
+    assert_eq!(cached["media"]["track"][0]["Duration"], "12000");
+}
+
+#[tokio::test]
+async fn web_page_does_not_await_media_inspection() {
+    let fixture = fixture();
+    fixture.state.media_info.lock().unwrap().clear();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let inspection_guard = fixture.state.media_info_inspection_lock.lock().await;
+
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        send(
+            &fixture.app,
+            Method::GET,
+            "/?library=0&play=Demo.mkv",
+            Body::empty(),
+        ),
+    )
+    .await
+    .expect("web page render waited for media inspection");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(fixture
+        .state
+        .media_info_pending
+        .lock()
+        .unwrap()
+        .contains(&media.id));
+
+    drop(inspection_guard);
 }
 
 fn tv_fixture() -> Fixture {
@@ -252,6 +409,8 @@ fn tv_fixture() -> Fixture {
         }],
         metadata_storage: "media".to_owned(),
         tmdb_bearer_token: None,
+        audio_language_primary: "en".to_owned(),
+        audio_language_secondary: None,
         subtitle_language_primary: "en".to_owned(),
         subtitle_language_secondary: "vi".to_owned(),
         bilingual_subtitles_enabled: true,
@@ -278,6 +437,8 @@ fn tv_fixture() -> Fixture {
         inventory_scan_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_notifications,
         media_info: Arc::new(Mutex::new(HashMap::new())),
+        media_info_pending: Arc::new(Mutex::new(HashSet::new())),
+        media_info_inspection_lock: Arc::new(tokio::sync::Mutex::new(())),
         plex_stream_selections: Arc::new(Mutex::new(HashMap::new())),
         plex_play_queues: Arc::new(Mutex::new(HashMap::new())),
         next_plex_play_queue_id: Arc::new(std::sync::atomic::AtomicU64::new(1)),
@@ -3317,6 +3478,273 @@ async fn built_in_player_lists_embedded_text_subtitle_tracks() {
 }
 
 #[tokio::test]
+async fn built_in_player_selects_primary_subtitle_language_by_default() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains(&format!(
+        "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
+        fixture.subtitle_id
+    )));
+
+    let selection = send(
+        &fixture.app,
+        Method::GET,
+        "/web/subtitle-selection?library=0&path=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let selection: serde_json::Value =
+        serde_json::from_slice(&to_bytes(selection.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(selection["streamId"], fixture.subtitle_id);
+}
+
+#[tokio::test]
+async fn saved_subtitle_off_overrides_the_language_default() {
+    let fixture = fixture();
+    let update = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/subtitle-selection")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"path":"Demo.mkv","library":0,"stream_id":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("<option value=\"-1\" data-stream-id=\"0\" selected>Off</option>"));
+    assert!(!page.contains(&format!(
+        "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
+        fixture.subtitle_id
+    )));
+}
+
+#[tokio::test]
+async fn subtitle_selection_survives_an_in_memory_reset() {
+    let fixture = fixture();
+    let update = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/subtitle-selection")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"Demo.mkv","library":0,"stream_id":{}}}"#,
+                    fixture.subtitle_id
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+    fixture.state.plex_stream_selections.lock().unwrap().clear();
+
+    let selection = send(
+        &fixture.app,
+        Method::GET,
+        "/web/subtitle-selection?library=0&path=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let selection: serde_json::Value =
+        serde_json::from_slice(&to_bytes(selection.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(selection["streamId"], fixture.subtitle_id);
+}
+
+#[tokio::test]
+async fn plex_subtitle_selection_is_remembered_by_hb_web() {
+    let fixture = fixture();
+    let update = send(
+        &fixture.app,
+        Method::PUT,
+        &format!(
+            "/library/parts/{}?subtitleStreamID={}",
+            fixture.part_id, fixture.subtitle_id
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+    fixture.state.plex_stream_selections.lock().unwrap().clear();
+
+    let page = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains(&format!(
+        "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
+        fixture.subtitle_id
+    )));
+}
+
+#[tokio::test]
+async fn last_subtitle_language_is_reused_for_another_item() {
+    let fixture = fixture();
+    let first = fixture.state.media.read().unwrap()[0].clone();
+    let media_dir = first.path.parent().unwrap().to_path_buf();
+    let first_vietnamese = media_dir.join("Demo.vi.srt");
+    std::fs::write(
+        &first_vietnamese,
+        b"1\n00:00:01,000 --> 00:00:02,000\nXin chao\n",
+    )
+    .unwrap();
+    let first_vietnamese_id = super::plex_external_subtitle_id(&first, &first_vietnamese);
+
+    let second_path = media_dir.join("Second.mkv");
+    std::fs::write(&second_path, b"0123456789abcdef").unwrap();
+    let second_vietnamese = media_dir.join("Second.vi.srt");
+    std::fs::write(
+        &second_vietnamese,
+        b"1\n00:00:01,000 --> 00:00:02,000\nXin chao\n",
+    )
+    .unwrap();
+    let second_vietnamese_id = super::plex_external_subtitle_id(
+        &Media {
+            id: "1-2".to_owned(),
+            path: second_path.clone(),
+            title: "Second".to_owned(),
+            size: 16,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
+        },
+        &second_vietnamese,
+    );
+    {
+        let mut media = (**fixture.state.media.read().unwrap()).clone();
+        media.push(Media {
+            id: "1-2".to_owned(),
+            path: second_path.clone(),
+            title: "Second".to_owned(),
+            size: 16,
+            container: "mkv".to_owned(),
+            mime: "video/x-matroska".to_owned(),
+            metadata_revision: 0,
+        });
+        *fixture.state.media.write().unwrap() = Arc::new(media);
+    }
+
+    let update = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/subtitle-selection")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"path":"Demo.mkv","library":0,"stream_id":{first_vietnamese_id}}}"#
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+    fixture.state.plex_stream_selections.lock().unwrap().clear();
+
+    let page = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Second.mkv",
+        Body::empty(),
+    )
+    .await;
+    let page = String::from_utf8(
+        to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains(&format!(
+        "data-stream-id=\"{second_vietnamese_id}\" data-bilingual=\"false\" selected"
+    )));
+}
+
+#[tokio::test]
+async fn built_in_player_selects_primary_embedded_subtitle_by_default() {
+    let fixture = fixture();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.subtitle_language_primary = "vi".to_owned();
+    }
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    fixture.state.media_info.lock().unwrap().insert(media.id.clone(), serde_json::json!({
+        "media":{"track":[
+            {"@type":"Video","StreamOrder":"0","Format":"AVC"},
+            {"@type":"Text","StreamOrder":"1","Format":"UTF-8","Language":"eng","Title":"English"},
+            {"@type":"Text","StreamOrder":"2","Format":"UTF-8","Language":"vie","Title":"Vietnamese"}
+        ]}
+    }));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Embedded: Vietnamese"));
+    assert!(page.contains("data-stream-id=\"3\" data-bilingual=\"false\" selected"));
+}
+
+#[tokio::test]
 async fn translation_settings_do_not_require_credentials() {
     let fixture = fixture();
     let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
@@ -3331,9 +3759,98 @@ async fn translation_settings_do_not_require_credentials() {
     assert!(page.contains("No API key is required"));
     assert!(page.contains("Enable bilingual subtitles"));
     assert!(page.contains("checked"));
-    assert!(page.contains("id=\"subtitle-settings\""));
+    assert!(page.contains("id=\"language-settings\""));
     assert!(!page.contains("href=\"/settings/translation\""));
     assert!(!page.contains("google_translate_api_key"));
+}
+
+#[tokio::test]
+async fn language_settings_save_voice_preferences_and_sync_plex_preferences() {
+    let fixture = fixture();
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings",
+        "audio_language_primary=ja&audio_language_secondary=ko&language_primary=ja&language_secondary=ko&bilingual_enabled=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    let config = fixture.config.lock().unwrap();
+    assert_eq!(config.audio_language_primary, "ja");
+    assert_eq!(config.audio_language_secondary.as_deref(), Some("ko"));
+    assert_eq!(config.subtitle_language_primary, "ja");
+    assert_eq!(config.subtitle_language_secondary, "ko");
+    assert!(config.bilingual_subtitles_enabled);
+    assert_eq!(
+        config
+            .plex_account_preferences
+            .get("defaultAudioLanguage")
+            .map(String::as_str),
+        Some("ja")
+    );
+    assert_eq!(
+        config
+            .plex_account_preferences
+            .get("defaultSubtitleLanguage")
+            .map(String::as_str),
+        Some("ja")
+    );
+    drop(config);
+
+    let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("name=\"audio_language_primary\">"));
+    assert!(page.contains("name=\"audio_language_secondary\">"));
+    assert!(page.contains("<option value=\"ja\" selected>Japanese</option>"));
+    assert!(page.contains("<option value=\"ko\" selected>Korean</option>"));
+}
+
+#[tokio::test]
+async fn bilingual_combo_is_offered_from_config_metadata_location() {
+    let fixture = fixture();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.metadata_storage = "config".to_owned();
+        config.bilingual_subtitles_enabled = true;
+        config.subtitle_language_primary = "en".to_owned();
+        config.subtitle_language_secondary = "vi".to_owned();
+    }
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let saved =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "vtt");
+    std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
+    std::fs::write(
+        &saved,
+        "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n",
+    )
+    .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("Bilingual: English + Vietnamese"));
+    assert!(page.contains("bilingual=1"));
+    assert!(!fixture.root.join("media/Demo.en-vi.vtt").exists());
 }
 
 #[tokio::test]
@@ -7936,6 +8453,44 @@ async fn marker_routes_write_sidecars_and_sync_restores_markers() {
     assert_eq!(restored[0].kind, markers::MarkerKind::Intro);
     assert_eq!(restored[0].start_ms, 5_000);
     assert_eq!(restored[0].end_ms, 45_000);
+}
+
+#[tokio::test]
+async fn marker_sync_skips_unchanged_sidecars() {
+    let fixture = fixture();
+    let create = send(
+        &fixture.app,
+        Method::POST,
+        "/library/metadata/1-1/marker?type=1&startTimeOffset=5000&endTimeOffset=45000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(create.status(), StatusCode::OK);
+    let sidecar_path = fixture.root.join("media/.hbgr/skip_markers.json");
+    let media = fixture.state.media.read().unwrap().as_ref().clone();
+
+    sync_marker_sidecars(&fixture.state, &media);
+    {
+        let db = fixture.db.lock().unwrap();
+        db.execute("DELETE FROM media_markers", []).unwrap();
+    }
+    sync_marker_sidecars(&fixture.state, &media);
+    {
+        let db = fixture.db.lock().unwrap();
+        assert!(markers::markers_for_media(&db, "1-1").unwrap().is_empty());
+    }
+
+    let entry: markers::MarkerSidecarEntry = serde_json::from_value(serde_json::json!({
+        "markers": [{ "type": "intro", "startTimeOffset": 7_000, "endTimeOffset": 45_000 }]
+    }))
+    .unwrap();
+    markers::write_marker_sidecar_entry(&sidecar_path, "Demo.mkv", Some(&entry)).unwrap();
+    sync_marker_sidecars(&fixture.state, &media);
+
+    let db = fixture.db.lock().unwrap();
+    let restored = markers::markers_for_media(&db, "1-1").unwrap();
+    assert_eq!(restored.len(), 1);
+    assert_eq!(restored[0].start_ms, 7_000);
 }
 
 #[test]

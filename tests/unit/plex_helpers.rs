@@ -179,6 +179,8 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         &[subtitle],
         None,
         "en",
+        None,
+        "en",
         "vi",
         false,
     );
@@ -254,6 +256,8 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
             subtitle_stream_id: Some(subtitle_id),
         }),
         "en",
+        None,
+        "en",
         "vi",
         false,
     );
@@ -319,6 +323,8 @@ fn plex_metadata_can_advertise_one_generated_bilingual_track() {
         &[subtitle],
         None,
         "en",
+        None,
+        "en",
         "vi",
         true,
     );
@@ -373,7 +379,18 @@ fn plex_metadata_advertises_translation_for_embedded_text_subtitles() {
         {"@type":"Text","StreamOrder":"2","Format":"UTF-8","Language":"eng","Title":"English"}
     ]}});
     let mut item = plex_video_json(&media, 1, &library, None);
-    apply_plex_technical_metadata(&mut item, &media, &info, &[], None, "en", "vi", true);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[],
+        None,
+        "en",
+        None,
+        "en",
+        "vi",
+        true,
+    );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     let generated = streams
         .iter()
@@ -424,7 +441,18 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
     ]}});
     let mut item = plex_video_json(&media, 1, &library, None);
 
-    apply_plex_technical_metadata(&mut item, &media, &info, &[], None, "en", "vi", false);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[],
+        None,
+        "en",
+        None,
+        "en",
+        "vi",
+        false,
+    );
 
     assert_eq!(item["Media"][0]["bitrate"], 598);
     assert_eq!(item["Media"][0]["Part"][0]["bitrate"], 598);
@@ -1434,4 +1462,80 @@ fn startup_banner_spells_harbinger() {
 `   '`---^`    `---'``   '`---|`---'`
                           `---'`"#;
     assert_eq!(super::startup_banner().trim(), expected);
+}
+
+#[test]
+fn configured_voice_languages_choose_the_default_plex_audio_track() {
+    let media = Media {
+        id: "1-9".to_owned(),
+        title: "Film".to_owned(),
+        path: PathBuf::from("/media/Film.mkv"),
+        size: 9_000_000,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    };
+    let library = ConfigLibrary {
+        name: "Movies".to_owned(),
+        kind: "movie".to_owned(),
+        folders: Vec::new(),
+        show_recently_added: true,
+        show_continue_watching: true,
+        scan_enabled: true,
+        scan_interval_value: 5,
+        scan_interval_unit: "minutes".to_owned(),
+        plex_agent: None,
+        plex_scanner: None,
+        plex_language: None,
+        metadata_agent_provider_group_id: None,
+        plex_preferences: None,
+    };
+    let info = serde_json::json!({"media":{"track":[
+        {"@type":"Video", "StreamOrder":"0", "Format":"AVC"},
+        {"@type":"Audio", "StreamOrder":"1", "Format":"AAC", "Channels":"2", "Language":"eng", "Title":"English"},
+        {"@type":"Audio", "StreamOrder":"2", "Format":"AAC", "Channels":"2", "Language":"vie", "Title":"Vietnamese"}
+    ]}});
+
+    let mut item = plex_video_json(&media, 1, &library, None);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[],
+        None,
+        "vi",
+        Some("en"),
+        "en",
+        "vi",
+        false,
+    );
+    let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+    let selected = streams
+        .iter()
+        .find(|stream| stream["streamType"] == 2 && stream["selected"] == true)
+        .unwrap();
+    assert_eq!(selected["languageTag"], "vi");
+
+    let mut item = plex_video_json(&media, 1, &library, None);
+    apply_plex_technical_metadata(
+        &mut item,
+        &media,
+        &info,
+        &[],
+        Some(PlexStreamSelection {
+            audio_stream_id: Some(2),
+            subtitle_stream_id: None,
+        }),
+        "vi",
+        Some("en"),
+        "en",
+        "vi",
+        false,
+    );
+    let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
+    let selected = streams
+        .iter()
+        .find(|stream| stream["streamType"] == 2 && stream["selected"] == true)
+        .unwrap();
+    assert_eq!(selected["languageTag"], "en");
 }
