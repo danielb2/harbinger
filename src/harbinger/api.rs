@@ -2954,29 +2954,18 @@ pub(crate) async fn web_client(
         audio_language_secondary,
         language_primary,
         language_secondary,
-        skip_intro_mode,
-        skip_credits_mode,
-    ) = s
+    ) = effective_plex_language_settings(&s);
+    let (skip_intro_mode, skip_credits_mode) = s
         .config
         .lock()
         .ok()
         .map(|config| {
             (
-                config.bilingual_subtitles_enabled,
-                config.audio_language_primary.clone(),
-                config.audio_language_secondary.clone(),
-                config.subtitle_language_primary.clone(),
-                config.subtitle_language_secondary.clone(),
                 config.skip_intro_mode.as_str().to_owned(),
                 config.skip_credits_mode.as_str().to_owned(),
             )
         })
         .unwrap_or((
-            false,
-            PLEX_DEFAULT_AUDIO_LANGUAGE.to_owned(),
-            None,
-            "en".to_owned(),
-            "vi".to_owned(),
             default_skip_mode().as_str().to_owned(),
             default_skip_mode().as_str().to_owned(),
         ));

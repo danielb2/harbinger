@@ -234,6 +234,64 @@ fn default_subtitle_language_secondary() -> String {
     "vi".to_owned()
 }
 
+fn normalize_preferred_language(language: &str) -> Option<String> {
+    let trimmed = language.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let code = plex_language(trimmed).0;
+    let normalized = if code == "und" {
+        trimmed.to_ascii_lowercase()
+    } else {
+        code.to_owned()
+    };
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+pub(crate) fn effective_plex_language_settings(
+    state: &AppState,
+) -> (bool, String, Option<String>, String, String) {
+    state
+        .config
+        .lock()
+        .ok()
+        .map(|config| {
+            let preferred = |key: &str, fallback: &str| {
+                config
+                    .plex_account_preferences
+                    .get(key)
+                    .and_then(|language| normalize_preferred_language(language))
+                    .unwrap_or_else(|| {
+                        normalize_preferred_language(fallback)
+                            .unwrap_or_else(|| fallback.to_owned())
+                    })
+            };
+            let audio_secondary = config
+                .audio_language_secondary
+                .as_deref()
+                .and_then(normalize_preferred_language);
+            let subtitle_secondary =
+                normalize_preferred_language(&config.subtitle_language_secondary)
+                    .unwrap_or_else(|| config.subtitle_language_secondary.clone());
+            (
+                config.bilingual_subtitles_enabled,
+                preferred("defaultAudioLanguage", &config.audio_language_primary),
+                audio_secondary,
+                preferred("defaultSubtitleLanguage", &config.subtitle_language_primary),
+                subtitle_secondary,
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                false,
+                default_audio_language_primary(),
+                None,
+                default_subtitle_language_primary(),
+                default_subtitle_language_secondary(),
+            )
+        })
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ConfigLibrary {
     pub(crate) name: String,
@@ -2972,12 +3030,7 @@ pub(crate) fn selected_web_subtitle_stream_id(
             return track.stream_id;
         }
     }
-    let primary = state
-        .config
-        .lock()
-        .ok()
-        .map(|config| config.subtitle_language_primary.clone())
-        .unwrap_or_default();
+    let primary = effective_plex_language_settings(state).3;
     subtitles
         .iter()
         .find(|track| track.language.as_deref() == Some(primary.as_str()))
@@ -5043,28 +5096,7 @@ pub(crate) async fn add_plex_technical_metadata(
         audio_language_secondary,
         language_primary,
         language_secondary,
-    ) = state
-        .config
-        .lock()
-        .ok()
-        .map(|config| {
-            (
-                config.bilingual_subtitles_enabled,
-                config.audio_language_primary.clone(),
-                config.audio_language_secondary.clone(),
-                config.subtitle_language_primary.clone(),
-                config.subtitle_language_secondary.clone(),
-            )
-        })
-        .unwrap_or_else(|| {
-            (
-                false,
-                default_audio_language_primary(),
-                None,
-                default_subtitle_language_primary(),
-                default_subtitle_language_secondary(),
-            )
-        });
+    ) = effective_plex_language_settings(state);
     let external_subtitles = if enabled {
         if state
             .config
@@ -5111,6 +5143,58 @@ pub(crate) async fn add_plex_technical_metadata(
         &language_secondary,
         translation_available,
     );
+}
+
+fn plex_stream_is_subtitle(stream: &serde_json::Value) -> bool {
+    stream.get("streamType").and_then(serde_json::Value::as_u64) == Some(3)
+}
+
+fn plex_stream_title_has_word(stream: &serde_json::Value, word: &str) -> bool {
+    ["title", "displayTitle", "extendedDisplayTitle"]
+        .into_iter()
+        .any(|key| {
+            stream
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|title| {
+                    title
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .any(|part| part.eq_ignore_ascii_case(word))
+                })
+        })
+}
+
+fn plex_subtitle_is_forced_or_special(stream: &serde_json::Value) -> bool {
+    stream.get("forced") == Some(&serde_json::Value::Bool(true))
+        || ["sign", "signs", "song", "songs"]
+            .into_iter()
+            .any(|word| plex_stream_title_has_word(stream, word))
+}
+
+fn plex_default_subtitle_stream_id(streams: &[serde_json::Value], language: &str) -> Option<u64> {
+    let subtitles = streams
+        .iter()
+        .filter(|stream| plex_stream_is_subtitle(stream))
+        .collect::<Vec<_>>();
+    let preferred_code = plex_language(language).0;
+    let preferred = if preferred_code == "und" {
+        None
+    } else {
+        subtitles.iter().find(|stream| {
+            stream
+                .get("languageTag")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|tag| plex_language(tag).0 == preferred_code)
+        })
+    };
+    preferred
+        .or_else(|| {
+            subtitles
+                .iter()
+                .find(|stream| !plex_subtitle_is_forced_or_special(stream))
+        })
+        .or_else(|| subtitles.first())
+        .and_then(|stream| stream.get("id").and_then(serde_json::Value::as_u64))
 }
 
 fn apply_plex_technical_metadata(
@@ -5244,9 +5328,7 @@ fn apply_plex_technical_metadata(
                     .and_then(|selection| selection.audio_stream_id)
                     .map(|selected| selected == track_id + 1)
                     .unwrap_or(selected_audio == Some(track_id)),
-                3 => selection
-                    .and_then(|selection| selection.subtitle_stream_id)
-                    .is_some_and(|selected| selected == track_id + 1),
+                3 => false,
                 _ => false,
             },
             "forced": technical_text(track, "Forced") == Some("Yes")
@@ -5329,9 +5411,7 @@ fn apply_plex_technical_metadata(
             // extension to Stream.key when fetching the sidecar.
             "key": format!("/library/streams/{id}"),
             "default": false,
-            "selected": selection
-                .and_then(|selection| selection.subtitle_stream_id)
-                .is_some_and(|selected| selected == id),
+            "selected": false,
             "forced": false
         }));
     }
@@ -5348,9 +5428,19 @@ fn apply_plex_technical_metadata(
             "languageCode": plex_language_code_3(language_primary), "languageTag": language_primary,
             "displayTitle": label, "extendedDisplayTitle": "Bilingual VTT External", "title": "Bilingual VTT External",
             "external": true, "key": format!("/library/streams/{id}"), "default": false,
-            "selected": selection.and_then(|selection| selection.subtitle_stream_id).is_some_and(|selected| selected == id),
+            "selected": false,
             "forced": false
         }));
+    }
+    let selected_subtitle_stream_id = selection
+        .and_then(|selection| selection.subtitle_stream_id)
+        .or_else(|| plex_default_subtitle_stream_id(&plex_streams, &language_primary));
+    for stream in &mut plex_streams {
+        if plex_stream_is_subtitle(stream) {
+            stream["selected"] = serde_json::json!(
+                stream.get("id").and_then(serde_json::Value::as_u64) == selected_subtitle_stream_id
+            );
+        }
     }
     media_json["id"] = serde_json::json!(plex_media_id(media));
     let part_technical_fields = ["bitrate", "videoProfile", "videoLevel"]

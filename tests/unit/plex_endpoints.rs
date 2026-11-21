@@ -7160,6 +7160,78 @@ async fn plex_account_preferences_can_be_updated_and_read_back() {
 }
 
 #[tokio::test]
+async fn plex_language_preferences_select_default_audio_and_subtitle_streams() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    fixture.state.media_info.lock().unwrap().insert(
+        media.id.clone(),
+        serde_json::json!({"media":{"track":[
+            {"@type":"Video", "StreamOrder":"0", "Format":"AVC"},
+            {"@type":"Audio", "StreamOrder":"1", "Format":"AAC", "Channels":"2", "Language":"eng", "Title":"English"},
+            {"@type":"Audio", "StreamOrder":"2", "Format":"AAC", "Channels":"2", "Language":"jpn", "Title":"Japanese"}
+        ]}}),
+    );
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(metadata.status(), StatusCode::OK);
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    let audio = streams
+        .iter()
+        .find(|stream| stream["streamType"] == 2 && stream["selected"] == true)
+        .unwrap();
+    assert_eq!(audio["languageTag"], "en");
+    let subtitles = streams
+        .iter()
+        .filter(|stream| stream["streamType"] == 3 && stream["selected"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(subtitles.len(), 1);
+    assert_eq!(subtitles[0]["id"], fixture.subtitle_id);
+
+    let update = send(
+        &fixture.app,
+        Method::PUT,
+        "/accounts/1?defaultAudioLanguage=ja&defaultSubtitleLanguage=en&autoSelectAudio=1&subtitleMode=2",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(update.status(), StatusCode::OK);
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    let audio = streams
+        .iter()
+        .find(|stream| stream["streamType"] == 2 && stream["selected"] == true)
+        .unwrap();
+    assert_eq!(audio["languageTag"], "ja");
+    let subtitles = streams
+        .iter()
+        .filter(|stream| stream["streamType"] == 3 && stream["selected"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(subtitles.len(), 1);
+    assert_eq!(subtitles[0]["id"], fixture.subtitle_id);
+}
+
+#[tokio::test]
 async fn every_registered_plex_route_has_success_and_failure_cases() {
     let fixture = fixture();
     let queue = send(

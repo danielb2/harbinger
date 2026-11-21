@@ -8388,11 +8388,12 @@ pub(crate) fn plex_can_transcode_audio(video: &serde_json::Value) -> bool {
             && stream.get("codec").and_then(serde_json::Value::as_str) == Some("eac3")
             && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
     });
-    let has_selected_subtitle = streams.iter().any(|stream| {
+    let has_selected_embedded_subtitle = streams.iter().any(|stream| {
         stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(3)
             && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+            && stream.get("external").and_then(serde_json::Value::as_bool) != Some(true)
     });
-    has_hevc_video && has_selected_eac3_audio && !has_selected_subtitle
+    has_hevc_video && has_selected_eac3_audio && !has_selected_embedded_subtitle
 }
 
 pub(crate) fn plex_can_transcode_video(video: &serde_json::Value) -> bool {
@@ -8411,11 +8412,12 @@ pub(crate) fn plex_can_transcode_video(video: &serde_json::Value) -> bool {
             && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
             && stream.get("codec").and_then(serde_json::Value::as_str) != Some("eac3")
     });
-    let has_selected_subtitle = streams.iter().any(|stream| {
+    let has_selected_embedded_subtitle = streams.iter().any(|stream| {
         stream.get("streamType").and_then(serde_json::Value::as_i64) == Some(3)
             && stream.get("selected").and_then(serde_json::Value::as_bool) == Some(true)
+            && stream.get("external").and_then(serde_json::Value::as_bool) != Some(true)
     });
-    has_hevc_video && !unsupported_selected_audio && !has_selected_subtitle
+    has_hevc_video && !unsupported_selected_audio && !has_selected_embedded_subtitle
 }
 
 pub(crate) fn plex_mark_audio_transcode_decision(
