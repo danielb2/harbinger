@@ -8053,6 +8053,49 @@ pub(crate) fn plex_tv_show_playback_media(state: &AppState, rating_key: &str) ->
     None
 }
 
+pub(crate) fn plex_continuous_episode_medias(
+    media_items: &[Media],
+    media: &Media,
+    section: usize,
+    library: &ConfigLibrary,
+) -> Vec<Media> {
+    if library.kind != "tv" {
+        return vec![media.clone()];
+    }
+    let library_media = media_items
+        .iter()
+        .filter(|candidate| media_in_library(candidate, library))
+        .collect::<Vec<_>>();
+    let shows = plex_tv_show_groups(section, &library.folders, library_media.iter().copied());
+    let Some(show) = shows
+        .iter()
+        .find(|show| show.episodes.iter().any(|episode| episode.id == media.id))
+    else {
+        return vec![media.clone()];
+    };
+    let seasons = plex_tv_season_groups(show, &library.folders);
+    let Some((season, start_index)) = seasons.iter().find_map(|(season, episodes)| {
+        episodes
+            .iter()
+            .position(|episode| episode.files.iter().any(|file| file.id == media.id))
+            .map(|index| (*season, index))
+    }) else {
+        return vec![media.clone()];
+    };
+    let remaining = seasons
+        .get(&season)
+        .into_iter()
+        .flatten()
+        .skip(start_index)
+        .filter_map(|episode| episode.files.first().map(|file| (*file).clone()))
+        .collect::<Vec<_>>();
+    if remaining.is_empty() {
+        vec![media.clone()]
+    } else {
+        remaining
+    }
+}
+
 pub(crate) async fn plex_create_play_queue(
     State(state): State<AppState>,
     Query(query): Query<BTreeMap<String, String>>,
@@ -8100,37 +8143,56 @@ pub(crate) async fn plex_create_play_queue(
     };
     let metadata = plex_section_metadata(&state, section);
     let media_index = media_snapshot(&state);
-    let mut item = if let Some(item) = plex_tv_episode_json_for_media(
-        &state,
-        media_index.as_ref(),
-        &media,
-        section,
-        &library,
-        &metadata,
-    )
-    .await
-    {
-        item
+    let continuous = query.get("continuous").map(String::as_str) == Some("1");
+    let queue_media = if continuous {
+        plex_continuous_episode_medias(media_index.as_ref(), &media, section, &library)
     } else {
-        let mut item = plex_video_json(&media, section, &library, metadata.get(&media.id));
-        add_plex_technical_metadata(&state, &mut item, &media).await;
-        item
+        vec![media.clone()]
     };
     let include_markers = marker_include_value(query.get("includeMarkers").map(String::as_str));
-    attach_markers_to_item(&state, &mut item, &media.id, include_markers);
     let direct_play = query.get("directPlay").map(String::as_str) != Some("0");
-    if direct_play {
-        plex_mark_direct_play(&mut item);
-    } else {
-        plex_queue_item_without_playback_decision(&mut item);
+    let mut items = Vec::with_capacity(queue_media.len());
+    for queue_media_item in &queue_media {
+        let mut item = if let Some(item) = plex_tv_episode_json_for_media(
+            &state,
+            media_index.as_ref(),
+            queue_media_item,
+            section,
+            &library,
+            &metadata,
+        )
+        .await
+        {
+            item
+        } else {
+            let mut item = plex_video_json(
+                queue_media_item,
+                section,
+                &library,
+                metadata.get(&queue_media_item.id),
+            );
+            add_plex_technical_metadata(&state, &mut item, queue_media_item).await;
+            item
+        };
+        attach_markers_to_item(&state, &mut item, &queue_media_item.id, include_markers);
+        if direct_play {
+            plex_mark_direct_play(&mut item);
+        } else {
+            plex_queue_item_without_playback_decision(&mut item);
+        }
+        items.push(item);
     }
     let queue_id = state
         .next_plex_play_queue_id
         .fetch_add(1, Ordering::Relaxed);
-    // This queue currently contains one item, so its server-unique queue ID
-    // also serves as the compact integer playQueueItemID expected by PMS clients.
-    let queue_item_id = queue_id;
-    item["playQueueItemID"] = serde_json::json!(queue_item_id);
+    let first_queue_item_id = state
+        .next_plex_play_queue_id
+        .fetch_add(items.len() as u64, Ordering::Relaxed);
+    for (offset, item) in items.iter_mut().enumerate() {
+        item["playQueueItemID"] =
+            serde_json::json!(first_queue_item_id.saturating_add(offset as u64));
+    }
+    let selected_item_id = first_queue_item_id;
     let library_uuid = plex_library_uuid(&state, &library.name, section);
     let plex_rating_key = plex_rating_key(&media).to_string();
     let normalized_source_uri = plex_play_queue_source_uri(&library_uuid, &plex_rating_key);
@@ -8140,12 +8202,13 @@ pub(crate) async fn plex_create_play_queue(
         incoming_key = %rating_key,
         public_rating_key = %plex_rating_key,
         selected_metadata_item_id,
-        queue_item_id,
+        selected_item_id,
+        queue_size = items.len(),
         source_uri = %normalized_source_uri,
         "Plex play queue created"
     );
     let response =
-        plex_play_queue_response(queue_id, &normalized_source_uri, vec![item], 0, direct_play);
+        plex_play_queue_response(queue_id, &normalized_source_uri, items, 0, direct_play);
     if let Ok(mut queues) = state.plex_play_queues.lock() {
         queues.insert(queue_id, response.clone());
     } else {

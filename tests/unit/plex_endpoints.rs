@@ -7021,6 +7021,62 @@ async fn plex_playback_endpoints_cover_success_and_failure_paths() {
 }
 
 #[tokio::test]
+async fn plex_continuous_play_queue_includes_following_episodes() {
+    let fixture = tv_fixture();
+    let continuous = send(
+        &fixture.app,
+        Method::POST,
+        "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2Ftv-0&key=%2Flibrary%2Fmetadata%2Ftv-0&continuous=1&includeMarkers=1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(continuous.status(), StatusCode::OK);
+    let continuous: serde_json::Value =
+        serde_json::from_slice(&to_bytes(continuous.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let container = &continuous["MediaContainer"];
+    assert_eq!(container["playQueueSelectedItemOffset"], 0);
+    assert_eq!(container["playQueueTotalCount"], 2);
+    assert_eq!(container["size"], 2);
+    let items = container["Metadata"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0]["index"], 1);
+    assert_eq!(items[1]["index"], 2);
+    assert_ne!(items[0]["ratingKey"], items[1]["ratingKey"]);
+    assert_eq!(
+        container["playQueueSelectedMetadataItemID"],
+        items[0]["ratingKey"]
+    );
+    let first_item_id = items[0]["playQueueItemID"].as_u64().unwrap();
+    let second_item_id = items[1]["playQueueItemID"].as_u64().unwrap();
+    assert_ne!(first_item_id, second_item_id);
+    assert_eq!(container["playQueueSelectedItemID"], first_item_id);
+    for item in items {
+        assert_eq!(item["Media"][0]["decision"], "directplay");
+    }
+
+    let single = send(
+        &fixture.app,
+        Method::POST,
+        "/playQueues?type=video&uri=%2Flibrary%2Fmetadata%2Ftv-0&key=%2Flibrary%2Fmetadata%2Ftv-0",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(single.status(), StatusCode::OK);
+    let single: serde_json::Value =
+        serde_json::from_slice(&to_bytes(single.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(single["MediaContainer"]["playQueueTotalCount"], 1);
+    assert_eq!(single["MediaContainer"]["size"], 1);
+    assert_eq!(
+        single["MediaContainer"]["Metadata"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn myplex_claim_and_reachability_require_a_claimed_account() {
     let fixture = fixture();
     let claim = send(&fixture.app, Method::POST, "/myplex/claim", Body::empty()).await;
