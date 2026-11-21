@@ -1477,7 +1477,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbinger to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbinger.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata, artwork, and skip markers are written only to the selected location. Config mode never writes to media folders.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
 {}{}
-<section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
+<section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="audiobooks">Audiobooks</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
 </div>{}{dashboard_content_html}
  </main></div><script>
@@ -1999,8 +1999,8 @@ pub(crate) async fn scan_media_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
-    if library.kind == "other" {
-        return settings_error("TMDB matching is not available for Other libraries");
+    if !is_metadata_library(&library.kind) {
+        return settings_error("TMDB matching is not available for this library type");
     }
     let sidecar_mode = config.metadata_storage == "media";
     let Some(token) = config
@@ -2224,7 +2224,7 @@ pub(crate) async fn create_library(
         }
     }
     let kind = match kind.as_str() {
-        "movie" | "tv" | "other" => kind,
+        "movie" | "tv" | "audiobooks" | "other" => kind,
         _ => return library_form_error("Invalid library type"),
     };
     let name = name.trim();
@@ -2676,7 +2676,7 @@ pub(crate) async fn home_client(State(state): State<AppState>) -> Response {
             .unwrap_or_else(|| {
                 format!(
                     r#"<span class="library-art library-art-fallback" style="display:grid;place-items:center;min-height:120px;font-size:2.5rem;background:linear-gradient(135deg,#1e3a8a,#312e81)">{}</span>"#,
-                    if library.kind == "tv" { "📺" } else { "🎬" }
+                    library_kind_emoji(&library.kind)
                 )
             });
         libraries.push_str(&format!(
@@ -3029,7 +3029,7 @@ pub(crate) async fn web_client(
         .and_then(clean_relative_path);
     if let Some(selected_relative) = selected_relative.as_deref() {
         match web_path(&s, &library_root, selected_relative).await {
-            Ok(path) if path.is_file() && media_type(&path).is_some() => {}
+            Ok(path) if path.is_file() && web_media_type(&path).is_some() => {}
             _ => return StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -3298,7 +3298,7 @@ pub(crate) async fn web_client(
             if file_type.is_dir() {
                 directories.push((name, child_relative));
             } else if file_type.is_file()
-                && (files_view || media_type(&path).is_some())
+                && (files_view || web_media_type(&path).is_some())
                 && selected_relative
                     .as_deref()
                     .is_none_or(|selected| selected == child_relative)
@@ -3471,7 +3471,53 @@ pub(crate) async fn web_client(
                 .iter()
                 .filter(|item| media_in_library(item, library))
                 .collect::<Vec<_>>();
-            if library.kind == "tv" {
+            if is_audiobook_library(&library.kind) {
+                let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+                if let Some(abs_library) = catalog
+                    .libraries
+                    .iter()
+                    .find(|entry| entry.source_index == library_index)
+                {
+                    for item in &abs_library.items {
+                        let Some((folder_index, source_root, _)) = library
+                            .folders
+                            .iter()
+                            .enumerate()
+                            .find_map(|(index, root)| {
+                                let canonical =
+                                    std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                                item.path
+                                    .strip_prefix(&canonical)
+                                    .ok()
+                                    .map(|path| (index, canonical, path.to_path_buf()))
+                            })
+                        else {
+                            continue;
+                        };
+                        let item_relative = item
+                            .path
+                            .strip_prefix(&source_root)
+                            .unwrap_or(std::path::Path::new(&item.rel_path));
+                        let details = format!(
+                            "{} track{}",
+                            item.audio_files.len(),
+                            if item.audio_files.len() == 1 { "" } else { "s" }
+                        );
+                        folder_cards.push_str(&folder_card_with_badge(
+                            &item.title,
+                            item_relative,
+                            Some(library_index),
+                            (folder_index > 0).then_some(folder_index),
+                            None,
+                            item.cover_path.is_some(),
+                            false,
+                            None,
+                            Some(&details),
+                            Some(&item.author),
+                        ));
+                    }
+                }
+            } else if library.kind == "tv" {
                 for show in
                     plex_tv_show_groups(library_index + 1, &library.folders, media.iter().copied())
                 {
@@ -3649,9 +3695,10 @@ pub(crate) async fn web_client(
                 continue;
             }
         }
-        let media_count = media_file_count(&directory).await;
+        let include_audio = library_kind.as_deref() == Some("audiobooks");
+        let media_count = media_file_count(&directory, include_audio).await;
         if media_count > 0 {
-            let preview = first_media_file(&directory)
+            let preview = first_media_file(&directory, include_audio)
                 .await
                 .and_then(|path| path.strip_prefix(&library_root).ok().map(PathBuf::from));
             let cover = sidecar_mode
@@ -3666,6 +3713,7 @@ pub(crate) async fn web_client(
                 &name,
                 &child_relative,
                 query.library,
+                query.folder,
                 preview.as_deref(),
                 cover,
                 banner,
@@ -3676,7 +3724,7 @@ pub(crate) async fn web_client(
     for (name, child_relative, path) in files {
         has_content = true;
         if files_view && selected_relative.is_none() {
-            let row = if media_type(&path).is_some() {
+            let row = if web_media_type(&path).is_some() {
                 let folder = child_relative.parent().unwrap_or(&relative);
                 let href = format!(
                     "/?library={}&path={}&play={}&view=files",
@@ -3695,7 +3743,7 @@ pub(crate) async fn web_client(
             items.push_str(&row);
             continue;
         }
-        if let Some((_, mime)) = media_type(&path) {
+        if let Some((_, mime)) = web_media_type(&path) {
             let matched_media = web_media_for_relative(&s, &library_root, &child_relative).await;
             if tv_season_view && selected_relative.is_none() {
                 let item_metadata = matched_media
@@ -5151,9 +5199,24 @@ pub(crate) async fn web_artwork(
     if !config_mode {
         paths.reverse();
     }
+    if is_audiobook_library(&library.kind) && kind == "cover" {
+        let mut local_paths = [
+            "cover.jpg",
+            "cover.jpeg",
+            "cover.png",
+            "folder.jpg",
+            "folder.png",
+        ]
+        .into_iter()
+        .map(|name| directory.join(name))
+        .collect::<Vec<_>>();
+        local_paths.extend(paths);
+        paths = local_paths;
+    }
     for path in paths {
-        if let Ok(bytes) = tokio::fs::read(path).await {
-            return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+        if let Ok(bytes) = tokio::fs::read(&path).await {
+            let content_type = crate::audiobookshelf::catalog::image_content_type(&path);
+            return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
         }
     }
     StatusCode::NOT_FOUND.into_response()
@@ -5233,11 +5296,27 @@ pub(crate) fn artwork_url(
     library: Option<usize>,
     kind: &str,
 ) -> String {
-    format!(
-        "/web/artwork?{}path={}&kind={}",
+    artwork_url_with_folder(relative, library, None, kind)
+}
+
+fn artwork_url_with_folder(
+    relative: &std::path::Path,
+    library: Option<usize>,
+    folder: Option<usize>,
+    kind: &str,
+) -> String {
+    let location_query = format!(
+        "{}{}",
         library
             .map(|index| format!("library={index}&"))
             .unwrap_or_default(),
+        folder
+            .map(|index| format!("folder={index}&"))
+            .unwrap_or_default()
+    );
+    format!(
+        "/web/artwork?{}path={}&kind={}",
+        location_query,
         url_encode(&relative.to_string_lossy()),
         kind
     )
@@ -5273,6 +5352,25 @@ pub(crate) fn web_client_item(
             .map(|index| format!("folder={index}&"))
             .unwrap_or_default()
     );
+    if mime.starts_with("audio/") {
+        let stream_url = format!("/web/stream?{}path={}", library_query, stream_path);
+        return format!(
+            r#"<article>
+  <div class="player-stage"><audio controls preload="auto" data-library="{}" data-folder="{}" data-progress-path="{}" src="{}">Your browser does not support HTML audio. <a href="{}">Open the stream</a>.</audio></div>
+  <div class="details">
+    <h2>{}</h2>
+    <div class="play-actions"><a href="{}">Open stream</a></div>
+  </div>
+</article>"#,
+            library.map(|index| index.to_string()).unwrap_or_default(),
+            folder.map(|index| index.to_string()).unwrap_or_default(),
+            html(relative),
+            html(&stream_url),
+            html(&stream_url),
+            html(name),
+            html(&stream_url),
+        );
+    }
     let tracks = subtitles
         .iter()
         .map(|track| {
@@ -5523,7 +5621,7 @@ pub(crate) fn sidebar_library_links(state: &AppState, selected_library: Option<u
                             ""
                         },
                         index,
-                        if library.kind == "tv" { "▣" } else { "▤" },
+                        library_kind_glyph(&library.kind),
                         html(&library.name)
                     )
                 })
@@ -5654,13 +5752,14 @@ pub(crate) fn folder_card(
     name: &str,
     relative: &std::path::Path,
     library: Option<usize>,
+    folder: Option<usize>,
     preview: Option<&std::path::Path>,
     cover: bool,
     banner: bool,
     progress: Option<f64>,
 ) -> String {
     folder_card_with_badge(
-        name, relative, library, preview, cover, banner, progress, None,
+        name, relative, library, folder, preview, cover, banner, progress, None, None,
     )
 }
 
@@ -5739,7 +5838,7 @@ pub(crate) fn media_card(
         media_path,
         library,
         tv,
-        library_config.kind != "other",
+        is_metadata_library(&library_config.kind),
         "item",
         show_remove_from_continue,
     )
@@ -6213,19 +6312,28 @@ pub(crate) fn folder_card_with_badge(
     name: &str,
     relative: &std::path::Path,
     library: Option<usize>,
+    folder: Option<usize>,
     preview: Option<&std::path::Path>,
     cover: bool,
     banner: bool,
     progress: Option<f64>,
     badge: Option<&str>,
+    subtitle: Option<&str>,
 ) -> String {
+    let location_query = format!(
+        "{}{}",
+        library
+            .map(|index| format!("library={index}&"))
+            .unwrap_or_default(),
+        folder
+            .map(|index| format!("folder={index}&"))
+            .unwrap_or_default()
+    );
     let preview_markup = if cover { None } else { preview }
         .map(|path| {
             format!(
                 r#"<video class="folder-preview-video" muted playsinline preload="auto" src="/web/stream?{}path={}" aria-label="Preview of {}"></video>"#,
-                library
-                    .map(|index| format!("library={index}&"))
-                    .unwrap_or_default(),
+                location_query,
                 url_encode(&path.to_string_lossy()),
                 html(name)
             )
@@ -6234,7 +6342,7 @@ pub(crate) fn folder_card_with_badge(
     let artwork_markup = if cover {
         format!(
             r#"<img class="folder-cover" src="{}" alt="Cover for {}">"#,
-            artwork_url(relative, library, "cover"),
+            artwork_url_with_folder(relative, library, folder, "cover"),
             html(name)
         )
     } else {
@@ -6248,7 +6356,7 @@ pub(crate) fn folder_card_with_badge(
     let banner_style = if banner {
         format!(
             r#" style="background-image: linear-gradient(90deg, rgba(17,24,39,.45), rgba(17,24,39,.8)), url('{}')""#,
-            artwork_url(relative, library, "banner")
+            artwork_url_with_folder(relative, library, folder, "banner")
         )
     } else {
         String::new()
@@ -6263,14 +6371,21 @@ pub(crate) fn folder_card_with_badge(
             )
         })
         .unwrap_or_default();
+    let subtitle_markup = subtitle
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                r#"<p style="margin:.25rem 0 0;color:#9ca3af;font-size:.8rem">{}</p>"#,
+                html(value)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<a class="folder-card" data-spa-link style="display:block;overflow:hidden;padding:0;color:inherit;text-decoration:none;border:1px solid #374151;border-radius:.75rem;background:#1f2937" href="/?{}path={}">
   <div class="folder-preview" style="position:relative;display:grid;place-items:center;overflow:hidden;aspect-ratio:2/3;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827)"{}>{}{}{}{}</div>
-  <div class="folder-info" style="padding:.9rem 1rem 1rem"><h2 style="font-size:1rem;line-height:1.25;margin:0;overflow-wrap:anywhere">{}</h2>{}</div>
+  <div class="folder-info" style="padding:.9rem 1rem 1rem"><h2 style="font-size:1rem;line-height:1.25;margin:0;overflow-wrap:anywhere">{}</h2>{}{}</div>
 </a>"#,
-        library
-            .map(|index| format!("library={index}&"))
-            .unwrap_or_default(),
+        location_query,
         url_encode(&relative.to_string_lossy()),
         banner_style,
         preview_markup,
@@ -6278,11 +6393,20 @@ pub(crate) fn folder_card_with_badge(
         fallback_icon,
         artwork_markup,
         html(name),
+        subtitle_markup,
         progress_markup,
     )
 }
 
-pub(crate) async fn first_media_file(directory: &std::path::Path) -> Option<PathBuf> {
+fn web_media_type(path: &std::path::Path) -> Option<(&'static str, &'static str)> {
+    media_type(path)
+        .or_else(|| crate::audiobookshelf::catalog::audio_mime(path).map(|mime| ("audio", mime)))
+}
+
+pub(crate) async fn first_media_file(
+    directory: &std::path::Path,
+    include_audio: bool,
+) -> Option<PathBuf> {
     let mut pending = vec![directory.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let mut entries = tokio::fs::read_dir(directory).await.ok()?;
@@ -6294,7 +6418,11 @@ pub(crate) async fn first_media_file(directory: &std::path::Path) -> Option<Path
             }
             let path = entry.path();
             let file_type = entry.file_type().await.ok()?;
-            if file_type.is_file() && media_type(&path).is_some() {
+            if file_type.is_file()
+                && (media_type(&path).is_some()
+                    || (include_audio
+                        && crate::audiobookshelf::catalog::audio_mime(&path).is_some()))
+            {
                 return Some(path);
             }
             if file_type.is_dir() {
@@ -6307,7 +6435,7 @@ pub(crate) async fn first_media_file(directory: &std::path::Path) -> Option<Path
     None
 }
 
-pub(crate) async fn media_file_count(directory: &std::path::Path) -> usize {
+pub(crate) async fn media_file_count(directory: &std::path::Path, include_audio: bool) -> usize {
     let mut pending = vec![directory.to_path_buf()];
     let mut count = 0;
     while let Some(directory) = pending.pop() {
@@ -6324,7 +6452,11 @@ pub(crate) async fn media_file_count(directory: &std::path::Path) -> usize {
             };
             if file_type.is_dir() {
                 pending.push(path);
-            } else if file_type.is_file() && media_type(&path).is_some() {
+            } else if file_type.is_file()
+                && (media_type(&path).is_some()
+                    || (include_audio
+                        && crate::audiobookshelf::catalog::audio_mime(&path).is_some()))
+            {
                 count += 1;
             }
         }
@@ -6352,7 +6484,7 @@ pub(crate) async fn web_stream(
     let Ok(metadata) = tokio::fs::metadata(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((container, mime)) = media_type(&path) else {
+    let Some((container, mime)) = web_media_type(&path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if !metadata.is_file() {

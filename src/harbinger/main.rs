@@ -100,6 +100,7 @@ use tracing::{debug, info, warn, Span};
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const WEB_UI_PORT: u16 = 4826;
+const ABS_PORT: u16 = 13378;
 pub(crate) const USER_ID: &str = "mplex-user";
 
 static MARKER_DETECTION_GROUPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
@@ -818,10 +819,19 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     });
     let plex_app = build_plex_listener_app(state.clone());
     let web_app = build_web_listener_app(state.clone());
+    let abs_app = crate::audiobookshelf::router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.bind.parse::<SocketAddr>()?).await?;
     let address = listener.local_addr()?;
     let web_address = SocketAddr::new(address.ip(), WEB_UI_PORT);
     let web_listener = tokio::net::TcpListener::bind(web_address).await?;
+    let abs_address = SocketAddr::new(address.ip(), ABS_PORT);
+    let abs_listener = match tokio::net::TcpListener::bind(abs_address).await {
+        Ok(listener) => Some(listener),
+        Err(error) => {
+            warn!(%error, address = %abs_address, "could not bind Audiobookshelf compatibility listener");
+            None
+        }
+    };
     let gdm_task = tokio::spawn(run_gdm_responder(
         gdm_machine_identifier,
         address.port(),
@@ -835,16 +845,19 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     print!("\n");
     print_startup_banner();
     println!(
-        "harbinger Plex API: http://{}:{}/\nHarbinger web UI: http://{}:{}/\n",
+        "harbinger Plex API: http://{}:{}/\nHarbinger web UI: http://{}:{}/\nHarbinger Audiobookshelf API: http://{}:{}/\n",
         host,
         address.port(),
         host,
-        web_address.port()
+        web_address.port(),
+        host,
+        abs_address.port()
     );
     #[cfg(unix)]
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let (web_shutdown_tx, web_shutdown_rx) = tokio::sync::oneshot::channel();
+    let (abs_shutdown_tx, abs_shutdown_rx) = tokio::sync::oneshot::channel();
     let plex_server = server_tls.serve_until(listener, plex_app, async move {
         let _ = shutdown_rx.await;
     });
@@ -855,8 +868,21 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             })
             .await
     };
+    let abs_server = async move {
+        match abs_listener {
+            Some(listener) => {
+                axum::serve(listener, abs_app)
+                    .with_graceful_shutdown(async move {
+                        let _ = abs_shutdown_rx.await;
+                    })
+                    .await
+            }
+            None => Ok(()),
+        }
+    };
     tokio::pin!(plex_server);
     tokio::pin!(web_server);
+    tokio::pin!(abs_server);
     #[cfg(unix)]
     let outcome = tokio::select! {
         result = &mut plex_server => {
@@ -864,6 +890,10 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             RunOutcome::Shutdown
         }
         result = &mut web_server => {
+            result?;
+            RunOutcome::Shutdown
+        }
+        result = &mut abs_server => {
             result?;
             RunOutcome::Shutdown
         }
@@ -886,6 +916,10 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             result?;
             RunOutcome::Shutdown
         }
+        result = &mut abs_server => {
+            result?;
+            RunOutcome::Shutdown
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
             RunOutcome::Shutdown
@@ -893,10 +927,12 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     };
     let _ = shutdown_tx.send(());
     let _ = web_shutdown_tx.send(());
+    let _ = abs_shutdown_tx.send(());
     let plex_drain = tokio::time::timeout(Duration::from_secs(5), &mut plex_server);
     let web_drain = tokio::time::timeout(Duration::from_secs(5), &mut web_server);
-    let (plex_result, web_result) = tokio::join!(plex_drain, web_drain);
-    if plex_result.is_err() || web_result.is_err() {
+    let abs_drain = tokio::time::timeout(Duration::from_secs(5), &mut abs_server);
+    let (plex_result, web_result, abs_result) = tokio::join!(plex_drain, web_drain, abs_drain);
+    if plex_result.is_err() || web_result.is_err() || abs_result.is_err() {
         warn!("timed out waiting for active connections to close during shutdown");
     }
     gdm_task.abort();
@@ -1155,7 +1191,7 @@ async fn scan_media(dir: &PathBuf) -> Result<Vec<Media>, Box<dyn std::error::Err
     Ok(result)
 }
 
-fn media_type(path: &PathBuf) -> Option<(&'static str, &'static str)> {
+fn media_type(path: &std::path::Path) -> Option<(&'static str, &'static str)> {
     match path
         .extension()
         .and_then(|x| x.to_str())
@@ -1347,6 +1383,12 @@ pub(crate) async fn scan_library_inventory(
         library.name.clone(),
         "Scanning configured folders",
     );
+    if is_audiobook_library(&library.kind) {
+        let count = crate::audiobookshelf::catalog::count_audio_files(&library);
+        crate::audiobookshelf::catalog::invalidate_cache();
+        info!(library = %library.name, count, "audiobook file scan completed");
+        return Ok(count);
+    }
     let mut roots = Vec::with_capacity(library.folders.len());
     for configured_root in &library.folders {
         let canonical_root = tokio::fs::canonicalize(configured_root)
@@ -1548,7 +1590,7 @@ pub(crate) async fn scan_library_inventory(
             "background media inspection warm-up completed"
         );
     });
-    if library.kind != "other" {
+    if is_metadata_library(&library.kind) {
         let assets_only = metadata_scan_assets_only(newly_found.len(), match_unmatched);
         if !assets_only {
             info!(library = %library.name, count = newly_found.len(), "automatic metadata detection started");
@@ -2008,11 +2050,36 @@ fn migrate_library_model(connection: &Connection) -> Result<(), rusqlite::Error>
     Ok(())
 }
 
+pub(crate) fn is_metadata_library(kind: &str) -> bool {
+    matches!(kind, "movie" | "tv")
+}
+
+pub(crate) fn is_audiobook_library(kind: &str) -> bool {
+    kind == "audiobooks"
+}
+
 fn library_kind_label(kind: &str) -> &str {
     match kind {
         "movie" => "Movies",
         "tv" => "TV Shows",
+        "audiobooks" => "Audiobooks",
         _ => "Other",
+    }
+}
+
+fn library_kind_emoji(kind: &str) -> &'static str {
+    match kind {
+        "tv" => "📺",
+        "audiobooks" => "🎧",
+        _ => "🎬",
+    }
+}
+
+fn library_kind_glyph(kind: &str) -> &'static str {
+    match kind {
+        "tv" => "▣",
+        "audiobooks" => "♪",
+        _ => "▤",
     }
 }
 
@@ -3404,8 +3471,8 @@ pub(crate) async fn scan_library_metadata(
     let Some(library) = config.libraries.get(library_id) else {
         return settings_error("Library does not exist");
     };
-    if library.kind == "other" {
-        info!(library = %library.name, "TMDB metadata matching skipped for other library kind");
+    if !is_metadata_library(&library.kind) {
+        info!(library = %library.name, kind = %library.kind, "TMDB metadata matching skipped for library kind");
         return Redirect::to("/settings?metadata_matched=0").into_response();
     }
     let client = reqwest::Client::new();

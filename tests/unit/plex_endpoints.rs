@@ -2378,6 +2378,174 @@ async fn other_libraries_skip_tmdb_metadata_matching() {
         .contains("TMDB"));
 }
 
+#[tokio::test]
+async fn audiobook_libraries_skip_tmdb_metadata_matching() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "audiobooks".to_owned();
+
+    let scan = send(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/0/scan",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(scan.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        scan.headers()[header::LOCATION],
+        "/settings?metadata_matched=0"
+    );
+
+    let manual_match = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/media/scan",
+        "library=0&path=Demo.mkv&title=Demo",
+    )
+    .await;
+    assert_eq!(manual_match.status(), StatusCode::SEE_OTHER);
+    assert!(manual_match.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .contains("TMDB"));
+}
+
+#[tokio::test]
+async fn scan_files_counts_audio_for_audiobook_libraries() {
+    let fixture = fixture();
+    let root = fixture.root.join("audiobooks-scan");
+    std::fs::create_dir_all(&root).unwrap();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        let mut audiobooks = config.libraries[0].clone();
+        audiobooks.name = "Scan Audiobooks".to_owned();
+        audiobooks.kind = "audiobooks".to_owned();
+        audiobooks.folders = vec![root.clone()];
+        config.libraries.push(audiobooks);
+    }
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let empty = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+    assert!(empty.libraries[0].items.is_empty());
+
+    let book_dir = root.join("Author Two").join("Book Two");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::write(book_dir.join("01.m4b"), b"one").unwrap();
+    std::fs::write(book_dir.join("02.mp3"), b"two").unwrap();
+    std::fs::write(book_dir.join("notes.txt"), b"ignored").unwrap();
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/libraries/1/scan-files",
+        "",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION],
+        "/settings?inventory_scan=2"
+    );
+
+    let catalog = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+    assert_eq!(catalog.libraries.len(), 1);
+    assert_eq!(catalog.libraries[0].items.len(), 1);
+    assert_eq!(catalog.libraries[0].items[0].audio_files.len(), 2);
+}
+
+fn audiobook_web_fixture(name: &str) -> Fixture {
+    let fixture = fixture();
+    let root = fixture.root.join(name);
+    let book_dir = root.join("Author One").join("Book One");
+    std::fs::create_dir_all(&book_dir).unwrap();
+    std::fs::write(book_dir.join("Chapter 01.m4b"), b"0123456789abcdef").unwrap();
+    std::fs::write(book_dir.join("cover.png"), b"cover-bytes").unwrap();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.libraries[0].name = format!("{name} Library");
+        config.libraries[0].kind = "audiobooks".to_owned();
+        config.libraries[0].folders = vec![root];
+    }
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    fixture
+}
+
+async fn body_string(response: axum::response::Response) -> String {
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+#[tokio::test]
+async fn web_library_root_shows_audiobook_cards() {
+    let fixture = audiobook_web_fixture("audiobooks-web-root");
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("Book One"));
+    assert!(body.contains("Author One"));
+    assert!(body.contains("1 track"));
+    assert!(body.contains(&format!(
+        "path={}",
+        super::url_encode("Author One/Book One")
+    )));
+    assert!(body.contains("/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover"));
+    assert!(!body.contains("No supported media or subfolders here."));
+}
+
+#[tokio::test]
+async fn web_library_book_folder_renders_audio_player() {
+    let fixture = audiobook_web_fixture("audiobooks-web-player");
+    let uri = format!(
+        "/?library=0&path={}",
+        super::url_encode("Author One/Book One")
+    );
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("<audio"));
+    assert!(body.contains("Chapter 01.m4b"));
+    assert!(body
+        .contains("/web/stream?library=0&amp;path=Author%20One%2FBook%20One%2FChapter%2001.m4b"));
+    assert!(!body.contains("No supported media or subfolders here."));
+}
+
+#[tokio::test]
+async fn web_stream_serves_audio_with_range_requests() {
+    let fixture = audiobook_web_fixture("audiobooks-web-stream");
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/web/stream?library=0&path=Author%20One%2FBook%20One%2FChapter%2001.m4b")
+                .header(header::RANGE, "bytes=2-5")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/mp4");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"2345");
+}
+
+#[tokio::test]
+async fn web_artwork_serves_local_audiobook_cover() {
+    let fixture = audiobook_web_fixture("audiobooks-web-cover");
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(&bytes[..], b"cover-bytes");
+}
+
 #[test]
 fn tv_episode_info_accepts_trailing_episode_number_without_filename_marker() {
     let root = PathBuf::from("/media/tv/Rurouni Kenshin");
@@ -6085,6 +6253,30 @@ async fn library_creation_keeps_settings_open_and_publishes_stable_scan_metadata
     assert_eq!(tv["key"], "/library/sections/1");
     assert_eq!(tv["uuid"], tv_uuid);
     assert!(providers["MediaContainer"]["updatedAt"].as_u64().unwrap() > updated_at_after_scan);
+}
+
+#[tokio::test]
+async fn library_creation_accepts_audiobooks_kind() {
+    let fixture = fixture();
+    let media_root = fixture.root.join("audiobooks");
+    std::fs::create_dir_all(&media_root).unwrap();
+    let form = format!(
+        "name=Books&kind=audiobooks&path%5B%5D={}",
+        media_root.to_string_lossy()
+    );
+
+    let response = send_form(&fixture.app, Method::POST, "/settings/libraries", &form).await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        fixture.config.lock().unwrap().libraries[1].kind,
+        "audiobooks"
+    );
+
+    let settings = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    let settings_body = to_bytes(settings.into_body(), usize::MAX).await.unwrap();
+    let settings_body = String::from_utf8(settings_body.to_vec()).unwrap();
+    assert!(settings_body.contains("<option value=\"audiobooks\">Audiobooks</option>"));
+    assert!(settings_body.contains("<span class=\"type-pill\">Audiobooks</span>"));
 }
 
 #[test]

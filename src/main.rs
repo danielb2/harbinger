@@ -1,5 +1,7 @@
 #![recursion_limit = "256"]
 
+#[path = "audiobookshelf/main.rs"]
+mod audiobookshelf;
 #[path = "harbinger/main.rs"]
 mod harbinger;
 #[path = "plex/main.rs"]
