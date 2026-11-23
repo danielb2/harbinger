@@ -358,10 +358,8 @@ pub(crate) async fn web_translated_subtitle(
         client_source_cues = request.source_cues.len(),
         "bilingual subtitle generation started"
     );
-    let job_key = format!(
-        "prepared:{}:{}:{}",
-        media.id, request.first_language, request.second_language
-    );
+    let job_key =
+        bilingual_translation_job_key(&media, &request.first_language, &request.second_language);
     let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true) else {
         warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
         return (
@@ -3810,6 +3808,13 @@ pub(crate) async fn web_client(
             let selected_subtitle = matched_media
                 .as_ref()
                 .map(|media| selected_web_subtitle_stream_id(&s, media, &subtitles));
+            let bilingual_stream_id = matched_media
+                .as_ref()
+                .filter(|_| bilingual_enabled)
+                .map(|media| {
+                    plex_translated_subtitle_id(media, &language_primary, &language_secondary)
+                })
+                .unwrap_or_default();
             let player_title = matched_media
                 .as_ref()
                 .and_then(|media| section_metadata.get(&media.id))
@@ -3838,6 +3843,7 @@ pub(crate) async fn web_client(
                 selected_audio,
                 selected_subtitle,
                 bilingual_enabled,
+                bilingual_stream_id,
                 &audio_language_primary,
                 audio_language_secondary.as_deref(),
                 &language_primary,
@@ -4190,6 +4196,8 @@ pub(crate) async fn web_client(
         video.addEventListener("loadedmetadata", () => applyAudioTrack(Number(audioSelect.selectedOptions[0]?.dataset.trackIndex ?? -1)), {{ once: true }});
       }}
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
+      let lastSubtitleValue = subtitleSelect?.value ?? "-1";
+      let startPendingBilingual = null;
       let activeStreamingSourceKey = null;
       let activeStreamingSourceName = null;
       let updateTranslationSourceLabel = () => {{}};
@@ -4213,12 +4221,18 @@ pub(crate) async fn web_client(
       }};
       if (subtitleSelect) {{
         applyServerSubtitle(Number(subtitleSelect.dataset.selectedStreamId || 0));
+        lastSubtitleValue = subtitleSelect.value;
         const subtitleQuery = new URLSearchParams({{ path }});
         if (library) subtitleQuery.set("library", library);
         if (folder) subtitleQuery.set("folder", folder);
         subtitleSelect.addEventListener("change", event => {{
           const select = event.currentTarget;
           const option = select.selectedOptions[0];
+          if (option?.dataset.pendingBilingual === "true") {{
+            if (startPendingBilingual) startPendingBilingual(select, option);
+            return;
+          }}
+          lastSubtitleValue = String(select.value);
           const streamId = Number(option?.dataset.streamId || 0);
           applySubtitle(Number(select.value));
           select.dataset.selectedStreamId = String(streamId);
@@ -4327,7 +4341,7 @@ pub(crate) async fn web_client(
             }} catch (_) {{}}
           }}
         }};
-        const translate = async prepared => {{
+        const translate = async (prepared, sourceOptionOverride = null, waitingForBilingual = false) => {{
           const status = translationControls.querySelector(".translation-status");
           const showTranslationError = message => {{
             status.setAttribute("role", "alert");
@@ -4338,7 +4352,7 @@ pub(crate) async fn web_client(
           status.setAttribute("aria-live", "polite");
           const generationProgress = translationControls.querySelector(".translation-progress");
           const generationProgressLabel = translationControls.querySelector(".translation-progress-label");
-          const selectedOption = subtitleSelect?.selectedOptions[0];
+          const selectedOption = sourceOptionOverride || subtitleSelect?.selectedOptions[0];
           if (selectedOption?.dataset.bilingual === "true") {{
             showTranslationError("This subtitle is already bilingual.");
             return;
@@ -4371,7 +4385,9 @@ pub(crate) async fn web_client(
             subtitleSelect.disabled = true;
           }}
           updateTranslationSourceLabel();
-          status.textContent = prepared ? `Generating from ${{selectedSourceName}}…` : `Translating from ${{selectedSourceName}}…`;
+          status.textContent = waitingForBilingual
+            ? `Generating bilingual subtitles… showing ${{selectedSourceName}} until ready.`
+            : prepared ? `Generating from ${{selectedSourceName}}…` : `Translating from ${{selectedSourceName}}…`;
           translationControls.querySelectorAll("button").forEach(button => button.disabled = true);
           try {{
             latestTranslationRequest = {{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null,
@@ -4421,14 +4437,23 @@ pub(crate) async fn web_client(
             if (subtitleSelect) {{
               translatedOption = document.createElement("option");
               translatedOption.value = String(video.textTracks.length - 1);
-              translatedOption.dataset.streamId = "0";
+              translatedOption.dataset.streamId = String(Number(subtitleSelect?.dataset.bilingualStreamId || 0));
               translatedOption.dataset.bilingual = "true";
               translatedOption.textContent = `${{track.label}} (Translated)`;
               subtitleSelect.append(translatedOption);
               subtitleSelect.value = translatedOption.value;
-              subtitleSelect.dataset.selectedStreamId = "0";
+              subtitleSelect.dataset.selectedStreamId = translatedOption.dataset.streamId;
+              lastSubtitleValue = translatedOption.value;
+              if (waitingForBilingual) {{
+                fetch("/web/subtitle-selection", {{
+                  method: "POST", headers: {{ "content-type": "application/json" }},
+                  body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: Number(translatedOption.dataset.streamId) }})
+                }}).catch(() => {{}});
+              }}
             }}
             track.addEventListener("load", () => {{
+              const wasPlaying = !video.paused && !video.ended;
+              const resumeAt = video.currentTime;
               track.track.mode = "showing";
               if (!prepared) {{
                 addTranslatedCues(initialContents, track);
@@ -4441,12 +4466,20 @@ pub(crate) async fn web_client(
                   }} catch (_) {{}}
                 }}, 2500);
               }}
+              if (prepared) {{
+                video.pause();
+                video.currentTime = resumeAt;
+                if (wasPlaying) video.play().catch(() => {{}});
+              }}
             }}, {{ once: true }});
-            status.textContent = prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
+            status.textContent = waitingForBilingual
+              ? "Bilingual subtitle ready and selected."
+              : prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
             if (prepared) {{ generationProgress.value = 100; generationProgressLabel.textContent = "Complete · saved as .srt"; }}
           }} catch (error) {{
-            if (error.status === 429) showTranslationError(error.message);
-            else showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}`);
+            const reloadHint = waitingForBilingual ? " Showing the original subtitle; generation didn't have time to complete last time, reload again." : "";
+            if (error.status === 429) showTranslationError(error.message + reloadHint);
+            else showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}${{reloadHint}}`);
             if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume.";
           }} finally {{
             if (generationProgressTimer) clearInterval(generationProgressTimer);
@@ -4455,6 +4488,31 @@ pub(crate) async fn web_client(
             if (prepared && subtitleSelect) subtitleSelect.disabled = false;
             translationControls.querySelectorAll("button").forEach(button => button.disabled = false);
           }}
+        }};
+        startPendingBilingual = (select, pendingOption) => {{
+          const status = translationControls.querySelector(".translation-status");
+          const sourceOption = (() => {{
+            const previousIndex = Number(lastSubtitleValue);
+            const previous = previousIndex >= 0 ? select.options[previousIndex] : null;
+            if (previous && previous !== pendingOption && previous.dataset.pendingBilingual !== "true") return previous;
+            return [...select.options].find(option =>
+              option !== pendingOption &&
+              option.dataset.pendingBilingual !== "true" &&
+              option.dataset.bilingual !== "true" &&
+              Number(option.dataset.streamId || 0) !== 0
+            );
+          }})();
+          if (!sourceOption) {{
+            status.setAttribute("role", "alert");
+            status.textContent = "Select a single-language subtitle first, then choose the bilingual option.";
+            select.value = lastSubtitleValue;
+            return;
+          }}
+          select.value = String(sourceOption.index);
+          applySubtitle(Number(sourceOption.index));
+          select.dataset.selectedStreamId = sourceOption.dataset.streamId || "0";
+          updateTranslationSourceLabel();
+          translate(true, sourceOption, true);
         }};
         translationControls.querySelector(".translate-prepare").addEventListener("click", () => translate(true));
       }}
@@ -5323,6 +5381,7 @@ pub(crate) fn web_client_item(
     selected_audio_stream_id: Option<u64>,
     selected_subtitle_stream_id: Option<u64>,
     bilingual_enabled: bool,
+    bilingual_stream_id: u64,
     audio_language_primary: &str,
     audio_language_secondary: Option<&str>,
     language_primary: &str,
@@ -5427,7 +5486,7 @@ pub(crate) fn web_client_item(
         .enumerate()
         .map(|(index, track)| {
             format!(
-                r#"<option value="{}" data-stream-id="{}" data-bilingual="{}"{}>{}</option>"#,
+                r#"<option value="{}" data-stream-id="{}" data-bilingual="{}"{} data-pending-bilingual="{}">{}</option>"#,
                 index,
                 track.stream_id,
                 track.bilingual,
@@ -5436,6 +5495,7 @@ pub(crate) fn web_client_item(
                 } else {
                     ""
                 },
+                track.pending_bilingual,
                 html(&track.label)
             )
         })
@@ -5445,10 +5505,11 @@ pub(crate) fn web_client_item(
             .to_owned()
     } else {
         format!(
-            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select" data-progress-path="{}" data-library="{}" data-selected-stream-id="{}"><option value="-1" data-stream-id="0"{}>Off</option>{}</select></label><span class="subtitle-note">External subtitle selection syncs with Plex clients.</span>"#,
+            r#"<label class="subtitle-picker">Subtitles <select class="subtitle-select" data-progress-path="{}" data-library="{}" data-selected-stream-id="{}" data-bilingual-stream-id="{}"><option value="-1" data-stream-id="0"{}>Off</option>{}</select></label><span class="subtitle-note">External subtitle selection syncs with Plex clients.</span>"#,
             html(relative),
             library.map(|index| index.to_string()).unwrap_or_default(),
             selected_subtitle_stream_id,
+            bilingual_stream_id,
             if selected_subtitle_stream_id == 0 {
                 " selected"
             } else {

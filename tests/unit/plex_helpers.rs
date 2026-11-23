@@ -21,7 +21,7 @@ use super::{
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
     tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
-    HeaderValue, Media, PathBuf, PlexStreamSelection, TvEpisodeInfo, Uri,
+    HeaderValue, Media, PathBuf, PlexBilingualStream, PlexStreamSelection, TvEpisodeInfo, Uri,
 };
 
 #[test]
@@ -182,7 +182,7 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         None,
         "en",
         "vi",
-        false,
+        None,
     );
 
     assert_eq!(item["duration"], 120_500);
@@ -259,7 +259,7 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         None,
         "en",
         "vi",
-        false,
+        None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     assert_eq!(streams[1]["selected"], true);
@@ -326,7 +326,10 @@ fn plex_metadata_can_advertise_one_generated_bilingual_track() {
         None,
         "en",
         "vi",
-        true,
+        Some(PlexBilingualStream {
+            extension: "vtt",
+            pending: false,
+        }),
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     let generated = streams
@@ -389,7 +392,10 @@ fn plex_metadata_advertises_translation_for_embedded_text_subtitles() {
         None,
         "en",
         "vi",
-        true,
+        Some(PlexBilingualStream {
+            extension: "vtt",
+            pending: false,
+        }),
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     let generated = streams
@@ -451,7 +457,7 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
         None,
         "en",
         "vi",
-        false,
+        None,
     );
 
     assert_eq!(item["Media"][0]["bitrate"], 598);
@@ -1507,7 +1513,7 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
         Some("en"),
         "en",
         "vi",
-        false,
+        None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     let selected = streams
@@ -1530,7 +1536,7 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
         Some("en"),
         "en",
         "vi",
-        false,
+        None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
     let selected = streams
