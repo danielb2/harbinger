@@ -1,7 +1,7 @@
 subtitles:
 
 1. "off" is the empty subtitle entry in the normal selection list; a stored "off" is displayed and persisted like any other stored selection.
-2. when a file opens, display the stored per-item selection if it is valid.
+2. when opening an episode, display the stored per-episode selection if it is valid.
 3. if there is no valid stored selection, use a bilingual subtitle matching the primary and secondary languages, then the configured primary subtitle language.
 4. if the configured primary subtitle language has no track, open with "off".
 5. a stale, invalid, or deleted stored selection falls back to the configured primary subtitle language, or "off" if that language has no track.
@@ -12,4 +12,6 @@ subtitles:
 10. the incomplete-generation notice is an SRT/VTT cue starting at the existing last untranslated cue timestamp, ending at 09:00:00.000, and remaining the final line until the SRT is finished; its text matches the generation-failure message.
 11. all explicit settings are persisted in the database and mirrored to Plex clients.
 12. the primary subtitle setting allows "off"; when set to "off", bilingual is disabled.
-13. bilingual: if an immediate 429 is encountered still generate vtt, and switch to bilingual (user can switch back manually)
+13. bilingual: if an immediate 429 is encountered - the behavior should be the same as the 429 was encountered in the mid stream. the vtt.part should still be created
+14. 429 error from google translate should say that the limit for translations for the moment has been reached and to wait to try again
+15. just opening an episode should not save subtitle options. it should only save if different from default.
