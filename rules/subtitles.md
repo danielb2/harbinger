@@ -1,17 +1,17 @@
-subtitles:
+# subtitle rules
+Rules are flat list with snake_case names. Rules refer to each other by name, so nothing needs numbering.
 
-1. "off" is the empty subtitle entry in the normal selection list; a stored "off" is displayed and persisted like any other stored selection.
-2. when opening an episode, display the stored per-episode selection if it is valid.
-3. if there is no valid stored selection, use a bilingual subtitle matching the primary and secondary languages, then the configured primary subtitle language.
-4. if the configured primary subtitle language has no track, open with "off".
-5. a stale, invalid, or deleted stored selection falls back to the configured primary subtitle language, or "off" if that language has no track.
-6. deleting a generated subtitle uses the same fallback.
-7. selecting generate shows a temporary "(generating…)" state, keeps the pending option selected, plays the source subtitle, and persists that source selection.
-8. if a partial bilingual VTT checkpoint exists, resume translation during playback when no translation thread is already running.
-9. if generation fails, change nothing about the selection or partial VTT; on 429, set the wait-for-subtitles message to "encountered 429, try again later" in both the UI and the VTT.
-10. the incomplete-generation notice is an SRT/VTT cue starting at the existing last untranslated cue timestamp, ending at 09:00:00.000, and remaining the final line until the SRT is finished; its text matches the generation-failure message.
-11. all explicit settings are persisted in the database and mirrored to Plex clients.
-12. the primary subtitle setting allows "off"; when set to "off", bilingual is disabled.
-13. bilingual: if an immediate 429 is encountered - the behavior should be the same as the 429 was encountered in the mid stream. the vtt.part should still be created
-14. 429 error from google translate should say that the limit for translations for the moment has been reached and to wait to try again
-15. just opening an episode should not save subtitle options. it should only save if different from default.
+* off: "off" is a valid selection meaning no subtitle is displayed during playback. It is stored and restored like any other selection.
+* default_fallback: the bilingual subtitle matching the primary and secondary languages if one exists, otherwise the configured primary subtitle language, otherwise off (when that language has no track or the primary setting is off).
+* open_episode: show the stored per-episode selection if valid, including a stored off. If it is missing, stale, invalid, or deleted, use default_fallback.
+* no_save_on_open: opening an episode never saves subtitle options. Save only when the selection differs from the default.
+* delete_generated: deleting a generated subtitle uses default_fallback.
+* settings_persistence: all explicit settings are stored in the database and mirrored to Plex clients.
+* primary_off: the primary subtitle setting allows off. When it is off, bilingual is disabled.
+* start_generation: selecting generate creates the `.vtt.part` checkpoint immediately, before the first translation request. The pending option is shown as "(generating…)" and stays selected, and the source selection is persisted as a fallback.
+* serve_during_generation: while generation is in progress, the bilingual subtitle stream serves the `.vtt.part` file. The "(generating…)" state is shown by serving this file. The English source file is never substituted for it.
+* resume_generation: if a partial bilingual VTT checkpoint exists and no translation thread is running, resume translation during playback.
+* generation_failure: if generation fails, the selection and partial VTT stay unchanged except for incomplete_notice.
+* rate_limit: a 429 is Google's Translate API reporting that the translation rate limit was reached. The UI and the VTT both show "Google Translate rate limit reached. Wait a while and try again."
+* immediate_rate_limit: a 429 on the first request behaves exactly like a mid-stream 429. The checkpoint already exists from start_generation and carries incomplete_notice. No special response, no second VTT body, no extra UI state.
+* incomplete_notice: a cue starting at the timestamp of the last untranslated cue and ending at 09:00:00.000. It remains the final line of the file until the SRT is finished, and its text matches the failure message in use (for a 429, the rate_limit message).
