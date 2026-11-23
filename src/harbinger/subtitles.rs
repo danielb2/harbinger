@@ -141,7 +141,7 @@ async fn translate_bilingual_resumable_at(
         source_language,
         first_language,
         second_language,
-        "bilingual subtitle translation started (sequential per-cue requests)"
+        "bilingual subtitle translation started (concurrent batched requests)"
     );
     for cue in &staged_cues {
         if let Some(progress) = progress.as_ref() {
@@ -161,65 +161,104 @@ async fn translate_bilingual_resumable_at(
             }
         }
     }
-    for (cue_index, cue) in cues.iter().enumerate().skip(staged_cues.len()) {
+    let first_needed = source_language != first_language;
+    let second_needed = source_language != second_language && first_language != second_language;
+    // Two target languages share the request budget. Each target still gets up
+    // to four concurrent cues, so the pair stays at eight requests in flight.
+    let batch_size = if first_needed && second_needed { 4 } else { 8 };
+    let remaining = &cues[staged_cues.len()..];
+    for (batch_index, batch) in remaining.chunks(batch_size).enumerate() {
+        let batch_first_cue = staged_cues.len() + batch_index * batch_size + 1;
         if cancellation
             .as_ref()
             .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
         {
             info!(
-                cue_number = cue_index + 1,
+                cue_number = batch_first_cue,
                 "playback stopped; no further subtitle requests will be sent"
             );
             return Err("Bilingual translation stopped with playback".to_owned());
         }
-        let first = if source_language == first_language {
-            cue.text.clone()
-        } else {
-            translate_batch(
+        let texts = batch.iter().map(|cue| cue.text.clone()).collect::<Vec<_>>();
+        let (first, second) = if first_needed && second_needed {
+            tokio::try_join!(
+                translate_batch(
+                    client,
+                    endpoint,
+                    &texts,
+                    source_language,
+                    first_language,
+                    batch_first_cue,
+                    cancellation.clone(),
+                ),
+                translate_batch(
+                    client,
+                    endpoint,
+                    &texts,
+                    source_language,
+                    second_language,
+                    batch_first_cue,
+                    cancellation.clone(),
+                )
+            )?
+        } else if first_needed {
+            let first = translate_batch(
                 client,
                 endpoint,
-                std::slice::from_ref(&cue.text),
+                &texts,
                 source_language,
                 first_language,
-                cue_index + 1,
+                batch_first_cue,
                 cancellation.clone(),
             )
-            .await?
-            .remove(0)
-        };
-        let second = if source_language == second_language {
-            cue.text.clone()
-        } else if first_language == second_language {
-            first.clone()
-        } else {
-            translate_batch(
+            .await?;
+            let second = if first_language == second_language {
+                first.clone()
+            } else {
+                texts.clone()
+            };
+            (first, second)
+        } else if second_needed {
+            let second = translate_batch(
                 client,
                 endpoint,
-                std::slice::from_ref(&cue.text),
+                &texts,
                 source_language,
                 second_language,
-                cue_index + 1,
+                batch_first_cue,
                 cancellation.clone(),
             )
-            .await?
-            .remove(0)
+            .await?;
+            (texts.clone(), second)
+        } else {
+            (texts.clone(), texts.clone())
         };
-        append_staged_vtt_cue(output_part_path, cue, &first, &second).await?;
-        if let Some(progress) = progress.as_ref() {
-            if progress
-                .send(format!(
-                    "{} --> {}\n{}\n{}\n\n",
-                    cue.start.replace(',', "."),
-                    cue.end.replace(',', "."),
-                    escape_vtt(&first),
-                    escape_vtt(&second)
-                ))
-                .is_err()
+        for (offset, cue) in batch.iter().enumerate() {
+            let cue_number = batch_first_cue + offset;
+            if cancellation
+                .as_ref()
+                .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
             {
-                if let Some(token) = cancellation.as_ref() {
-                    token.store(true, std::sync::atomic::Ordering::Release);
+                info!(cue_number, "playback stopped; checkpoint was not advanced");
+                return Err("Bilingual translation stopped with playback".to_owned());
+            }
+            append_staged_vtt_cue(output_part_path, cue, &first[offset], &second[offset]).await?;
+            if let Some(progress) = progress.as_ref() {
+                if progress
+                    .send(format!(
+                        "{} --> {}\n{}\n{}\n\n",
+                        cue.start.replace(',', "."),
+                        cue.end.replace(',', "."),
+                        escape_vtt(&first[offset]),
+                        escape_vtt(&second[offset])
+                    ))
+                    .is_err()
+                {
+                    if let Some(token) = cancellation.as_ref() {
+                        token.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                    return Err("Bilingual subtitle stream closed".to_owned());
                 }
-                return Err("Bilingual subtitle stream closed".to_owned());
             }
         }
     }
@@ -630,6 +669,19 @@ mod tests {
         .into_response()
     }
 
+    async fn barrier_translation_stub(
+        State(barrier): State<Arc<tokio::sync::Barrier>>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> impl axum::response::IntoResponse {
+        barrier.wait().await;
+        axum::Json(serde_json::json!([
+            [[format!("{}:{}", query["tl"], query["q"]), query["q"]]],
+            null,
+            query["sl"]
+        ]))
+        .into_response()
+    }
+
     async fn stub_endpoint() -> String {
         use axum::routing::get;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -717,6 +769,54 @@ mod tests {
         let staged = tokio::fs::read_to_string(output_part).await.unwrap();
         assert!(staged.contains("Hello\nXin chào"));
         assert!(staged.contains("World\nvi:World"));
+    }
+
+    #[tokio::test]
+    async fn bilingual_translation_sends_both_languages_concurrently_and_keeps_cue_order() {
+        use axum::routing::get;
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new()
+            .route("/", get(barrier_translation_stub))
+            .with_state(barrier);
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let source = (1..=8)
+            .map(|index| {
+                format!("{index}\n00:00:0{index},000 --> 00:00:0{index},500\nCue {index}\n\n")
+            })
+            .collect::<String>();
+        let directory = tempfile::tempdir().unwrap();
+        let output_part = directory.path().join("Movie.en-fr-vi.vtt.part");
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            translate_bilingual_resumable_at(
+                &reqwest::Client::new(),
+                &format!("http://{address}/"),
+                &source,
+                "en",
+                "fr",
+                "vi",
+                &output_part,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("translation did not run concurrently")
+        .unwrap();
+
+        let staged = tokio::fs::read_to_string(&output_part).await.unwrap();
+        assert_eq!(staged, output);
+        let cues = parse_subtitles(&staged).unwrap();
+        assert_eq!(cues.len(), 8);
+        for (offset, cue) in cues.iter().enumerate() {
+            let number = offset + 1;
+            assert_eq!(cue.start, format!("00:00:0{number}.000"));
+            assert_eq!(cue.text, format!("fr:Cue {number}\nvi:Cue {number}"));
+        }
     }
 
     #[tokio::test]
