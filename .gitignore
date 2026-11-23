@@ -6,3 +6,4 @@
 *.7z
 plex-log-*
 PLAN-*.md
+.DS_Store

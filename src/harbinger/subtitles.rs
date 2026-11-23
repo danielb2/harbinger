@@ -897,6 +897,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn immediate_rate_limit_still_creates_the_checkpoint() {
+        use axum::routing::get;
+
+        async fn rate_limited_stub() -> axum::http::StatusCode {
+            axum::http::StatusCode::TOO_MANY_REQUESTS
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", get(rate_limited_stub));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let directory = tempfile::tempdir().unwrap();
+        let output_part = directory.path().join("Movie.en-vi.vtt.part");
+        let result = translate_bilingual_resumable_at(
+            &reqwest::Client::new(),
+            &format!("http://{address}/"),
+            "00:00:01,000 --> 00:00:02,000\nHello\n",
+            "en",
+            "en",
+            "vi",
+            &output_part,
+            None,
+            None,
+        )
+        .await;
+        assert!(result
+            .unwrap_err()
+            .starts_with("Google Translate rate limit (HTTP 429)"));
+        assert_eq!(
+            tokio::fs::read_to_string(&output_part).await.unwrap(),
+            "WEBVTT\n\n"
+        );
+    }
+
+    #[tokio::test]
     async fn resumable_translation_emits_each_finished_cue_to_its_stream() {
         let directory = tempfile::tempdir().unwrap();
         let output_part = directory.path().join("Movie.en-en.vtt.part");

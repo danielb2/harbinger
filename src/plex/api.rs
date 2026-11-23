@@ -8645,15 +8645,17 @@ pub(crate) async fn plex_set_streams(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let current = stored_plex_stream_selection(&state, &media).unwrap_or_default();
-    save_plex_stream_selection(
-        &state,
-        &media,
-        PlexStreamSelection {
-            audio_stream_id: selection.audio_stream_id.or(current.audio_stream_id),
-            subtitle_stream_id: selection.subtitle_stream_id.or(current.subtitle_stream_id),
-        },
-    );
-    if let Some(stream_id) = selection.subtitle_stream_id {
+    let generated_source_stream_id =
+        start_bilingual_generation_for_plex_selection(&state, &media, selection.subtitle_stream_id)
+            .await;
+    let persisted = PlexStreamSelection {
+        audio_stream_id: selection.audio_stream_id.or(current.audio_stream_id),
+        subtitle_stream_id: generated_source_stream_id
+            .or(selection.subtitle_stream_id)
+            .or(current.subtitle_stream_id),
+    };
+    save_plex_stream_selection(&state, &media, persisted);
+    if let Some(stream_id) = persisted.subtitle_stream_id {
         let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), stream_id));
     }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))

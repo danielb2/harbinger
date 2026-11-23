@@ -2951,13 +2951,10 @@ pub(crate) async fn web_client(
     State(s): State<AppState>,
     Query(mut query): Query<WebPath>,
 ) -> Response {
-    let (
-        bilingual_enabled,
-        audio_language_primary,
-        audio_language_secondary,
-        language_primary,
-        language_secondary,
-    ) = effective_plex_language_settings(&s);
+    let (_, audio_language_primary, audio_language_secondary, _, _) =
+        effective_plex_language_settings(&s);
+    let (bilingual_enabled, language_primary, language_secondary) =
+        configured_bilingual_languages(&s);
     let (skip_intro_mode, skip_credits_mode) = s
         .config
         .lock()
@@ -4499,7 +4496,7 @@ pub(crate) async fn web_client(
               : prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
             if (prepared) {{ generationProgress.value = 100; generationProgressLabel.textContent = "Complete · saved as .srt"; }}
           }} catch (error) {{
-            if (error.status === 429) showTranslationError("encountered 429, try again later");
+            if (error.status === 429) showTranslationError("Google Translate rate limit reached. Wait a while and try again.");
             else if (!(silentConflict && error.status === 409)) {{
               showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}`);
             }}

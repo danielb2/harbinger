@@ -8,6 +8,7 @@ Rules are flat list with snake_case names. Rules refer to each other by name, so
 * delete_generated: deleting a generated subtitle uses default_fallback.
 * settings_persistence: all explicit settings are stored in the database and mirrored to Plex clients.
 * primary_off: the primary subtitle setting allows off. When it is off, bilingual is disabled.
+- generate_option: when the bilingual subtitle file for an episode does not exist, the subtitle selection list must include an entry labeled “<primary> + <secondary> (generate)”, in both the Plex client and the web UI. For English and Vietnamese the label is exactly “English + Vietnamese (generate)”. Selecting it triggers start_generation.
 * start_generation: selecting generate creates the `.vtt.part` checkpoint immediately, before the first translation request. The pending option is shown as "(generating…)" and stays selected, and the source selection is persisted as a fallback.
 * serve_during_generation: while generation is in progress, the bilingual subtitle stream serves the `.vtt.part` file. The "(generating…)" state is shown by serving this file. The English source file is never substituted for it.
 * resume_generation: if a partial bilingual VTT checkpoint exists and no translation thread is running, resume translation during playback.

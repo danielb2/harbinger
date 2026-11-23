@@ -31,6 +31,11 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 - Whenever the project version is bumped, create a Git tag for that version after the version bump commit, using the `v` prefix (for example, `v0.1.1`).
 - Before work begins on a task refer to https://developer.plex.tv/pms and check offcial API for a solution rather than guessing or checking logs. also consolt implementations from https://github.com/debridmediamanager/rex, https://github.com/braedonsaunders/ether/, and https://github.com/edde746/plezy
 
+## rules/
+Rules are flat list with snake_case names. Rules refer to each other by name, so nothing needs numbering.
+
+- Follow feature based rules in the rules folder and make sure those are adhered to
+
 ## Commands
 
 - Build: `cargo build`
