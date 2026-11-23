@@ -270,14 +270,16 @@ pub(crate) fn effective_plex_language_settings(
                 .audio_language_secondary
                 .as_deref()
                 .and_then(normalize_preferred_language);
+            let subtitle_primary =
+                preferred("defaultSubtitleLanguage", &config.subtitle_language_primary);
             let subtitle_secondary =
                 normalize_preferred_language(&config.subtitle_language_secondary)
                     .unwrap_or_else(|| config.subtitle_language_secondary.clone());
             (
-                config.bilingual_subtitles_enabled,
+                config.bilingual_subtitles_enabled && subtitle_primary != "off",
                 preferred("defaultAudioLanguage", &config.audio_language_primary),
                 audio_secondary,
-                preferred("defaultSubtitleLanguage", &config.subtitle_language_primary),
+                subtitle_primary,
                 subtitle_secondary,
             )
         })
@@ -376,8 +378,7 @@ struct ActiveTranslationJob {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
-const BILINGUAL_INCOMPLETE_NOTICE: &str =
-    "generation didn't have time to complete last time, reload again";
+const BILINGUAL_INCOMPLETE_NOTICE: &str = "encountered 429, try again later";
 
 pub(crate) fn bilingual_translation_job_key(media: &Media, first: &str, second: &str) -> String {
     format!("prepared:{}:{}:{}", media.id, first, second)
@@ -754,8 +755,9 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     if let Some(bind) = args.bind {
         config.bind = bind.to_string();
     }
-    save_config(&config_path, &config)?;
     let (db, machine_identifier) = open_database(&config_path)?;
+    apply_stored_settings(&db, &mut config);
+    save_config(&config_path, &config)?;
     let server_name = db
         .query_row(
             "SELECT server_name FROM server_identity WHERE id = 1",
@@ -1777,6 +1779,95 @@ pub(crate) fn save_config(
     }
     std::fs::write(path, serialized)?;
     Ok(())
+}
+
+fn explicit_setting_key(name: &str) -> String {
+    format!("setting:{name}")
+}
+
+fn explicit_setting_from_db(connection: &Connection, name: &str) -> Option<String> {
+    let mut statement = connection
+        .prepare("SELECT value FROM playback_preferences WHERE key = ?1")
+        .ok()?;
+    let mut rows = statement
+        .query_map([explicit_setting_key(name)], |row| row.get::<_, String>(0))
+        .ok()?;
+    rows.next().and_then(Result::ok)
+}
+
+pub(crate) fn store_explicit_setting(state: &AppState, name: &str, value: &str) {
+    let Ok(connection) = state.db.lock() else {
+        return;
+    };
+    let result = connection.execute(
+        "INSERT INTO playback_preferences (key, value, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![explicit_setting_key(name), value, now_timestamp()],
+    );
+    if result.is_err() {
+        warn!(name, "Could not persist explicit setting");
+    }
+}
+
+pub(crate) fn store_config_settings(state: &AppState, config: &Config) {
+    store_explicit_setting(
+        state,
+        "audio_language_primary",
+        &config.audio_language_primary,
+    );
+    store_explicit_setting(
+        state,
+        "audio_language_secondary",
+        config
+            .audio_language_secondary
+            .as_deref()
+            .unwrap_or_default(),
+    );
+    store_explicit_setting(
+        state,
+        "subtitle_language_primary",
+        &config.subtitle_language_primary,
+    );
+    store_explicit_setting(
+        state,
+        "subtitle_language_secondary",
+        &config.subtitle_language_secondary,
+    );
+    store_explicit_setting(
+        state,
+        "bilingual_subtitles_enabled",
+        if config.bilingual_subtitles_enabled {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    if let Ok(preferences) = serde_json::to_string(&config.plex_account_preferences) {
+        store_explicit_setting(state, "plex_account_preferences", &preferences);
+    }
+}
+
+pub(crate) fn apply_stored_settings(db: &Connection, config: &mut Config) {
+    if let Some(value) = explicit_setting_from_db(db, "audio_language_primary") {
+        config.audio_language_primary = value;
+    }
+    if let Some(value) = explicit_setting_from_db(db, "audio_language_secondary") {
+        config.audio_language_secondary = (!value.is_empty()).then_some(value);
+    }
+    if let Some(value) = explicit_setting_from_db(db, "subtitle_language_primary") {
+        config.subtitle_language_primary = value;
+    }
+    if let Some(value) = explicit_setting_from_db(db, "subtitle_language_secondary") {
+        config.subtitle_language_secondary = value;
+    }
+    if let Some(value) = explicit_setting_from_db(db, "bilingual_subtitles_enabled") {
+        config.bilingual_subtitles_enabled = value == "true";
+    }
+    if let Some(value) = explicit_setting_from_db(db, "plex_account_preferences") {
+        if let Ok(preferences) = serde_json::from_str(&value) {
+            config.plex_account_preferences = preferences;
+        }
+    }
 }
 
 pub(crate) fn sync_config_libraries(
@@ -2860,16 +2951,19 @@ fn vtt_time_from_millis(total: u64) -> String {
 }
 
 fn vtt_with_incomplete_notice(vtt: &str) -> Option<String> {
-    let last_end = subtitles::parse_subtitles(vtt)
-        .ok()?
-        .iter()
-        .filter_map(|cue| vtt_time_millis(&cue.end))
-        .max()?;
-    let mut output = vtt.trim_end().to_owned();
+    let normalized = vtt.replace("\r\n", "\n").replace('\r', "\n");
+    let blocks = normalized
+        .trim()
+        .split("\n\n")
+        .filter(|block| !block.contains(BILINGUAL_INCOMPLETE_NOTICE))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let cues = subtitles::parse_subtitles(&blocks).ok()?;
+    let last_start = vtt_time_millis(&cues.last()?.start)?;
+    let mut output = blocks;
     output.push_str(&format!(
-        "\n\n{} --> {}\n{}\n\n",
-        vtt_time_from_millis(last_end),
-        vtt_time_from_millis(last_end + 5_000),
+        "\n\n{} --> 09:00:00.000\n{}\n",
+        vtt_time_from_millis(last_start),
         BILINGUAL_INCOMPLETE_NOTICE
     ));
     Some(output)
@@ -3072,9 +3166,6 @@ pub(crate) struct WebWatchActionUpdate {
     pub(crate) scope: Option<String>,
 }
 
-const LAST_SUBTITLE_LANGUAGE_KEY: &str = "last_subtitle_language";
-const SUBTITLE_OFF_LANGUAGE: &str = "off";
-
 fn now_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3141,78 +3232,6 @@ pub(crate) fn save_plex_stream_selection(
     }
 }
 
-fn playback_preference(state: &AppState, key: &str) -> Option<String> {
-    let connection = state.db.lock().ok()?;
-    let mut statement = connection
-        .prepare("SELECT value FROM playback_preferences WHERE key = ?1")
-        .ok()?;
-    let mut rows = statement
-        .query_map([key], |row| row.get::<_, String>(0))
-        .ok()?;
-    rows.next().and_then(Result::ok)
-}
-
-fn set_playback_preference(state: &AppState, key: &str, value: Option<&str>) {
-    let Ok(connection) = state.db.lock() else {
-        return;
-    };
-    let result = match value {
-        Some(value) => connection.execute(
-            "INSERT INTO playback_preferences (key, value, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-            params![key, value, now_timestamp()],
-        ),
-        None => connection.execute(
-            "DELETE FROM playback_preferences WHERE key = ?1",
-            params![key],
-        ),
-    };
-    if result.is_err() {
-        warn!(key, "Could not persist playback preference");
-    }
-}
-
-pub(crate) fn remember_last_subtitle_language(state: &AppState, language: &str) {
-    set_playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY, Some(language));
-}
-
-pub(crate) fn clear_last_subtitle_language(state: &AppState) {
-    set_playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY, None);
-}
-
-pub(crate) fn subtitle_language_for_plex_stream_id(
-    state: &AppState,
-    media: &Media,
-    info: &serde_json::Value,
-    subtitle_paths: &[std::path::PathBuf],
-    stream_id: u64,
-) -> Option<String> {
-    if stream_id == 0 {
-        return Some(SUBTITLE_OFF_LANGUAGE.to_owned());
-    }
-    if let Some(track) = technical_tracks(info).iter().find(|track| {
-        technical_text(track, "@type") == Some("Text")
-            && technical_track_id(track).saturating_add(1) == stream_id
-    }) {
-        return Some(plex_track_language(track).0.to_owned());
-    }
-    if let Some(path) = subtitle_paths
-        .iter()
-        .find(|path| plex_external_subtitle_id(media, path) == stream_id)
-    {
-        return Some(external_subtitle_language(&media.path, path).0.to_owned());
-    }
-    state.config.lock().ok().and_then(|config| {
-        (stream_id
-            == plex_translated_subtitle_id(
-                media,
-                &config.subtitle_language_primary,
-                &config.subtitle_language_secondary,
-            ))
-        .then(|| config.subtitle_language_primary.clone())
-    })
-}
-
 pub(crate) fn selected_web_subtitle_stream_id(
     state: &AppState,
     media: &Media,
@@ -3229,22 +3248,19 @@ pub(crate) fn selected_web_subtitle_stream_id(
             return stream_id;
         }
     }
-    if let Some(last_language) = playback_preference(state, LAST_SUBTITLE_LANGUAGE_KEY) {
-        if last_language == SUBTITLE_OFF_LANGUAGE {
-            return 0;
-        }
-        if let Some(track) = subtitles.iter().find(|track| {
-            !track.pending_bilingual && track.language.as_deref() == Some(last_language.as_str())
-        }) {
-            return track.stream_id;
-        }
-    }
     let primary = effective_plex_language_settings(state).3;
+    if primary == "off" {
+        return 0;
+    }
+    if let Some(track) = subtitles
+        .iter()
+        .find(|track| track.bilingual && !track.pending_bilingual)
+    {
+        return track.stream_id;
+    }
     subtitles
         .iter()
-        .find(|track| {
-            !track.pending_bilingual && track.language.as_deref() == Some(primary.as_str())
-        })
+        .find(|track| track.language.as_deref() == Some(primary.as_str()))
         .map(|track| track.stream_id)
         .unwrap_or_default()
 }
@@ -5371,33 +5387,14 @@ fn plex_stream_is_subtitle(stream: &serde_json::Value) -> bool {
     stream.get("streamType").and_then(serde_json::Value::as_u64) == Some(3)
 }
 
-fn plex_stream_title_has_word(stream: &serde_json::Value, word: &str) -> bool {
-    ["title", "displayTitle", "extendedDisplayTitle"]
-        .into_iter()
-        .any(|key| {
-            stream
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|title| {
-                    title
-                        .split(|character: char| !character.is_ascii_alphanumeric())
-                        .any(|part| part.eq_ignore_ascii_case(word))
-                })
-        })
-}
-
-fn plex_subtitle_is_forced_or_special(stream: &serde_json::Value) -> bool {
-    stream.get("forced") == Some(&serde_json::Value::Bool(true))
-        || ["sign", "signs", "song", "songs"]
-            .into_iter()
-            .any(|word| plex_stream_title_has_word(stream, word))
-}
-
 fn plex_stream_is_pending_bilingual(stream: &serde_json::Value) -> bool {
     stream.get("pending").and_then(serde_json::Value::as_bool) == Some(true)
 }
 
 fn plex_default_subtitle_stream_id(streams: &[serde_json::Value], language: &str) -> Option<u64> {
+    if language == "off" {
+        return None;
+    }
     let subtitles = streams
         .iter()
         .filter(|stream| {
@@ -5415,13 +5412,10 @@ fn plex_default_subtitle_stream_id(streams: &[serde_json::Value], language: &str
                 .is_some_and(|tag| plex_language(tag).0 == preferred_code)
         })
     };
-    preferred
-        .or_else(|| {
-            subtitles
-                .iter()
-                .find(|stream| !plex_subtitle_is_forced_or_special(stream))
-        })
-        .or_else(|| subtitles.first())
+    subtitles
+        .iter()
+        .find(|stream| stream.get("bilingual").and_then(serde_json::Value::as_bool) == Some(true))
+        .or_else(|| preferred)
         .and_then(|stream| stream.get("id").and_then(serde_json::Value::as_u64))
 }
 
@@ -5622,6 +5616,10 @@ fn apply_plex_technical_metadata(
         let id = plex_external_subtitle_id(media, &subtitle_path);
         let (display_title, extended_display_title) =
             external_subtitle_titles(&media.path, &subtitle_path);
+        let bilingual =
+            external_subtitle_pair(&media.path, &subtitle_path).is_some_and(|(first, second)| {
+                first == language_primary && second == language_secondary
+            });
         plex_streams.push(serde_json::json!({
             "id": id,
             "streamType": 3,
@@ -5640,7 +5638,8 @@ fn apply_plex_technical_metadata(
             "key": format!("/library/streams/{id}"),
             "default": false,
             "selected": false,
-            "forced": false
+            "forced": false,
+            "bilingual": bilingual
         }));
     }
     if let Some(translation) = translation_stream {
@@ -5668,22 +5667,24 @@ fn apply_plex_technical_metadata(
             "languageCode": plex_language_code_3(language.0), "languageTag": language.0,
             "displayTitle": label, "extendedDisplayTitle": extra_info, "title": extra_info,
             "external": true, "key": format!("/library/streams/{id}"), "default": false,
-            "selected": false, "pending": translation.pending,
+            "selected": false, "pending": translation.pending, "bilingual": true,
             "forced": false
         }));
     }
-    let saved_subtitle_stream_id = selection
-        .and_then(|selection| selection.subtitle_stream_id)
-        .filter(|stream_id| {
-            *stream_id != 0
-                && !plex_streams.iter().any(|stream| {
-                    plex_stream_is_subtitle(stream)
-                        && stream.get("id").and_then(serde_json::Value::as_u64) == Some(*stream_id)
-                        && plex_stream_is_pending_bilingual(stream)
-                })
-        });
-    let selected_subtitle_stream_id = saved_subtitle_stream_id
-        .or_else(|| plex_default_subtitle_stream_id(&plex_streams, &language_primary));
+    let saved_subtitle_stream_id = selection.and_then(|selection| selection.subtitle_stream_id);
+    let selected_subtitle_stream_id = match saved_subtitle_stream_id {
+        Some(0) => None,
+        Some(stream_id)
+            if plex_streams.iter().any(|stream| {
+                plex_stream_is_subtitle(stream)
+                    && stream.get("id").and_then(serde_json::Value::as_u64) == Some(stream_id)
+                    && !plex_stream_is_pending_bilingual(stream)
+            }) =>
+        {
+            Some(stream_id)
+        }
+        _ => plex_default_subtitle_stream_id(&plex_streams, &language_primary),
+    };
     for stream in &mut plex_streams {
         if plex_stream_is_subtitle(stream) {
             stream["selected"] = serde_json::json!(
@@ -7394,14 +7395,9 @@ async fn subtitle_tracks(
             .map(|index| format!("folder={index}&"))
             .unwrap_or_default()
     );
-    let languages = state.config.lock().ok().and_then(|config| {
-        config.bilingual_subtitles_enabled.then(|| {
-            (
-                config.subtitle_language_primary.clone(),
-                config.subtitle_language_secondary.clone(),
-            )
-        })
-    });
+    let (bilingual_enabled, _, _, subtitle_primary, subtitle_secondary) =
+        effective_plex_language_settings(state);
+    let languages = bilingual_enabled.then_some((subtitle_primary, subtitle_secondary));
     let bilingual_enabled = languages.is_some();
     if let Some((first, second)) = languages.as_ref() {
         if state

@@ -687,14 +687,15 @@ pub(crate) async fn update_web_audio_selection(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    if let Ok(mut selections) = state.plex_stream_selections.lock() {
-        selections
-            .entry(plex_part_id(&media))
-            .or_default()
-            .audio_stream_id = (update.stream_id != 0).then_some(update.stream_id);
-    } else {
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    let current = stored_plex_stream_selection(&state, &media).unwrap_or_default();
+    save_plex_stream_selection(
+        &state,
+        &media,
+        PlexStreamSelection {
+            audio_stream_id: (update.stream_id != 0).then_some(update.stream_id),
+            ..current
+        },
+    );
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -745,11 +746,6 @@ pub(crate) async fn update_web_subtitle_selection(
             ..selection
         },
     );
-    if let Some(language) =
-        subtitle_language_for_plex_stream_id(&state, &media, &info, &external, update.stream_id)
-    {
-        remember_last_subtitle_language(&state, &language);
-    }
     let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), update.stream_id));
     StatusCode::NO_CONTENT.into_response()
 }
@@ -951,14 +947,15 @@ pub(crate) async fn save_translation_settings(
     let subtitle_primary = form.language_primary.trim().to_ascii_lowercase();
     let subtitle_secondary = form.language_secondary.trim().to_ascii_lowercase();
     let supported = |language: &str| isolang::Language::from_639_1(language).is_some();
+    let bilingual_enabled = subtitle_primary != "off" && form.bilingual_enabled;
     if !supported(&audio_language_primary)
         || audio_language_secondary
             .as_deref()
             .is_some_and(|language| !supported(language))
         || audio_language_secondary.as_deref() == Some(audio_language_primary.as_str())
-        || !supported(&subtitle_primary)
+        || (subtitle_primary != "off" && !supported(&subtitle_primary))
         || !supported(&subtitle_secondary)
-        || subtitle_primary == subtitle_secondary
+        || (subtitle_primary != "off" && subtitle_primary == subtitle_secondary)
     {
         return (
             StatusCode::BAD_REQUEST,
@@ -970,17 +967,25 @@ pub(crate) async fn save_translation_settings(
     config.audio_language_secondary = audio_language_secondary;
     config.subtitle_language_primary = subtitle_primary.clone();
     config.subtitle_language_secondary = subtitle_secondary;
-    config.bilingual_subtitles_enabled = form.bilingual_enabled;
+    config.bilingual_subtitles_enabled = bilingual_enabled;
     config
         .plex_account_preferences
         .insert("defaultAudioLanguage".to_owned(), audio_language_primary);
+    config.plex_account_preferences.insert(
+        "defaultSubtitleLanguage".to_owned(),
+        subtitle_primary.clone(),
+    );
     config
         .plex_account_preferences
-        .insert("defaultSubtitleLanguage".to_owned(), subtitle_primary);
+        .insert("autoSelectAudio".to_owned(), "1".to_owned());
+    config.plex_account_preferences.insert(
+        "subtitleMode".to_owned(),
+        if subtitle_primary == "off" { "0" } else { "2" }.to_owned(),
+    );
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    clear_last_subtitle_language(&state);
+    store_config_settings(&state, &config);
     if !config.bilingual_subtitles_enabled {
         cancel_all_translation_jobs();
     }
@@ -1149,7 +1154,7 @@ pub(crate) async fn settings_page(
         r#"<details class="settings-card settings-section" id="language-settings"><summary class="settings-section-summary"><span><strong>Playback languages</strong><small>Choose preferred voice and subtitle languages, including the bilingual subtitle pair.</small></span></summary><form method="post" action="/settings" class="settings-form settings-section-content"><p class="note">Primary and secondary voice languages set the preferred audio tracks shown to Plex clients and the built-in player. Bilingual subtitles combine the selected subtitle languages. No API key is required. Subtitle text is sent to Google for translation. Generated subtitle files use the selected metadata location.</p><div class="form-grid"><label class="field"><span>Primary voice</span><select name="audio_language_primary">{}</select></label><label class="field"><span>Secondary voice</span><select name="audio_language_secondary">{}</select></label><label class="field"><span>Primary subtitles</span><select name="language_primary">{}</select></label><label class="field"><span>Secondary subtitles</span><select name="language_secondary">{}</select></label></div><label class="settings-toggle"><input type="checkbox" name="bilingual_enabled" value="true"{}> Enable bilingual subtitles</label><div><button type="submit">Save language settings</button></div></form></details>"#,
         translation_language_options(&audio_language_primary),
         voice_language_options(audio_language_secondary.as_deref()),
-        translation_language_options(&subtitle_language_primary),
+        subtitle_language_options(&subtitle_language_primary),
         translation_language_options(&subtitle_language_secondary),
         if bilingual_enabled { " checked" } else { "" },
     );
@@ -4196,6 +4201,7 @@ pub(crate) async fn web_client(
         video.addEventListener("loadedmetadata", () => applyAudioTrack(Number(audioSelect.selectedOptions[0]?.dataset.trackIndex ?? -1)), {{ once: true }});
       }}
       const subtitleSelect = video.closest("article")?.querySelector(".subtitle-select");
+      let pendingBilingualNoticeVisible = false;
       let lastSubtitleValue = subtitleSelect?.value ?? "-1";
       let startPendingBilingual = null;
       let activeStreamingSourceKey = null;
@@ -4302,6 +4308,14 @@ pub(crate) async fn web_client(
         let generationProgressPending = false;
         let latestTranslationRequest = null;
         const sourceLabel = translationControls.querySelector(".translation-source-label");
+        const status = translationControls.querySelector(".translation-status");
+        const clearPendingBilingualNotice = () => {{
+          if (!pendingBilingualNoticeVisible || !status) return;
+          pendingBilingualNoticeVisible = false;
+          status.textContent = "";
+          status.removeAttribute("role");
+          status.setAttribute("aria-live", "polite");
+        }};
         updateTranslationSourceLabel = () => {{
           const option = subtitleSelect?.selectedOptions[0];
           const selectedName = option?.textContent.trim() || "No subtitle selected";
@@ -4316,6 +4330,7 @@ pub(crate) async fn web_client(
             sourceLabel.textContent = `Selected translation source: ${{selectedName}}`;
           }}
         }};
+        subtitleSelect?.addEventListener("change", clearPendingBilingualNotice);
         subtitleSelect?.addEventListener("change", updateTranslationSourceLabel);
         updateTranslationSourceLabel();
         const addTranslatedCues = (contents, track) => {{
@@ -4341,13 +4356,18 @@ pub(crate) async fn web_client(
             }} catch (_) {{}}
           }}
         }};
-        const translate = async (prepared, sourceOptionOverride = null, waitingForBilingual = false) => {{
+        let pendingResumeStarted = false;
+        const translate = async (prepared, sourceOptionOverride = null, waitingForBilingual = false, pendingOption = null, silentConflict = false) => {{
+          const pendingOriginalText = pendingOption?.textContent;
+          let ready = false;
+          let bilingualReady = false;
           const status = translationControls.querySelector(".translation-status");
           const showTranslationError = message => {{
             status.setAttribute("role", "alert");
             status.setAttribute("aria-live", "assertive");
             status.textContent = message;
           }};
+          if (waitingForBilingual) pendingBilingualNoticeVisible = true;
           status.setAttribute("role", "status");
           status.setAttribute("aria-live", "polite");
           const generationProgress = translationControls.querySelector(".translation-progress");
@@ -4472,23 +4492,55 @@ pub(crate) async fn web_client(
                 if (wasPlaying) video.play().catch(() => {{}});
               }}
             }}, {{ once: true }});
+            ready = true;
+            if (waitingForBilingual) bilingualReady = true;
             status.textContent = waitingForBilingual
               ? "Bilingual subtitle ready and selected."
               : prepared ? "Bilingual subtitle generated and saved as SRT." : "Bilingual subtitles ready.";
             if (prepared) {{ generationProgress.value = 100; generationProgressLabel.textContent = "Complete · saved as .srt"; }}
           }} catch (error) {{
-            const reloadHint = waitingForBilingual ? " Showing the original subtitle; generation didn't have time to complete last time, reload again." : "";
-            if (error.status === 429) showTranslationError(error.message + reloadHint);
-            else showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}${{reloadHint}}`);
+            if (error.status === 429) showTranslationError("encountered 429, try again later");
+            else if (!(silentConflict && error.status === 409)) {{
+              showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}`);
+            }}
             if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume.";
           }} finally {{
             if (generationProgressTimer) clearInterval(generationProgressTimer);
             generationProgressTimer = null;
             generationProgressPending = false;
+            if (pendingOption && pendingOriginalText) {{
+              pendingOption.textContent = pendingOriginalText;
+            }}
+            if (!ready) pendingResumeStarted = false;
+            if (ready) pendingBilingualNoticeVisible = false;
             if (prepared && subtitleSelect) subtitleSelect.disabled = false;
             translationControls.querySelectorAll("button").forEach(button => button.disabled = false);
           }}
         }};
+        const resumePartialTranslation = async () => {{
+          if (!subtitleSelect || pendingResumeStarted) return;
+          const pendingOption = [...subtitleSelect.options].find(option => option.dataset.pendingBilingual === "true");
+          const sourceOption = subtitleSelect.selectedOptions[0];
+          if (!pendingOption || !sourceOption || sourceOption === pendingOption) return;
+          if (sourceOption.dataset.bilingual === "true" || Number(sourceOption.dataset.streamId || 0) === 0) return;
+          const sourceId = Number(sourceOption.dataset.streamId || 0);
+          const sourceKey = sourceOption.dataset.browserTrack !== undefined
+            ? `embedded:${{sourceOption.dataset.browserTrack}}`
+            : `stream:${{sourceId}}`;
+          const firstLanguage = translationControls.querySelector(".translation-first").value;
+          const secondLanguage = translationControls.querySelector(".translation-second").value;
+          const progressResponse = await fetch("/web/translation-progress", {{
+            method: "POST", headers: {{ "content-type": "application/json" }}, cache: "no-store",
+            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null,
+              stream_id: sourceId, first_language: firstLanguage, second_language: secondLanguage, source_key: sourceKey }})
+          }}).catch(() => null);
+          if (!progressResponse?.ok) return;
+          const progress = await progressResponse.json().catch(() => null);
+          if (!progress || progress.complete || progress.completed === 0 || progress.completed >= progress.total) return;
+          pendingResumeStarted = true;
+          await translate(true, sourceOption, true, pendingOption, true);
+        }};
+        video.addEventListener("play", resumePartialTranslation);
         startPendingBilingual = (select, pendingOption) => {{
           const status = translationControls.querySelector(".translation-status");
           const sourceOption = (() => {{
@@ -4508,11 +4560,20 @@ pub(crate) async fn web_client(
             select.value = lastSubtitleValue;
             return;
           }}
-          select.value = String(sourceOption.index);
-          applySubtitle(Number(sourceOption.index));
+          const originalPendingText = pendingOption.textContent;
+          pendingOption.textContent = originalPendingText.replace(/\s*\(generate\)\s*$/, "") + " (generating…)";
+          select.value = String(pendingOption.index);
+          [...video.textTracks].forEach((track, index) => {{
+            track.mode = index === Number(sourceOption.value) ? "showing" : "disabled";
+          }});
           select.dataset.selectedStreamId = sourceOption.dataset.streamId || "0";
+          lastSubtitleValue = String(sourceOption.index);
+          fetch("/web/subtitle-selection", {{
+            method: "POST", headers: {{ "content-type": "application/json" }},
+            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: Number(sourceOption.dataset.streamId || 0) }})
+          }}).catch(() => {{}});
           updateTranslationSourceLabel();
-          translate(true, sourceOption, true);
+          translate(true, sourceOption, true, pendingOption);
         }};
         translationControls.querySelector(".translate-prepare").addEventListener("click", () => translate(true));
       }}
@@ -5619,6 +5680,15 @@ pub(crate) fn translation_language_options(selected: &str) -> String {
         )
     })
     .collect()
+}
+
+pub(crate) fn subtitle_language_options(selected: &str) -> String {
+    let mut options = format!(
+        "<option value=\"off\"{}>Off</option>",
+        if selected == "off" { " selected" } else { "" }
+    );
+    options.push_str(&translation_language_options(selected));
+    options
 }
 
 fn voice_language_options(selected: Option<&str>) -> String {

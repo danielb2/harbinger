@@ -3224,6 +3224,7 @@ pub(crate) async fn update_plex_account(
     if save_config(&state.config_path, &config).is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
+    store_config_settings(&state, &config);
     StatusCode::OK.into_response()
 }
 
@@ -8653,11 +8654,6 @@ pub(crate) async fn plex_set_streams(
         },
     );
     if let Some(stream_id) = selection.subtitle_stream_id {
-        if let Some(language) =
-            subtitle_language_for_plex_stream_id(&state, &media, &info, &subtitle_paths, stream_id)
-        {
-            remember_last_subtitle_language(&state, &language);
-        }
         let _ = web_subtitle_selection_broadcast().send((plex_part_id(&media), stream_id));
     }
     plex_json(serde_json::json!({"MediaContainer": {"size": 0}}))

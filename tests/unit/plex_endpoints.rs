@@ -3700,6 +3700,22 @@ async fn saved_subtitle_off_overrides_the_language_default() {
         .await
         .unwrap();
     assert_eq!(update.status(), StatusCode::NO_CONTENT);
+    fixture.state.plex_stream_selections.lock().unwrap().clear();
+    let media_path = fixture.state.media.read().unwrap()[0]
+        .path
+        .to_string_lossy()
+        .into_owned();
+    let stored_subtitle: Option<i64> = fixture
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT subtitle_stream_id FROM stream_selections WHERE media_path = ?1",
+            [&media_path],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_subtitle, Some(0));
 
     let response = send(
         &fixture.app,
@@ -3720,6 +3736,22 @@ async fn saved_subtitle_off_overrides_the_language_default() {
         "data-stream-id=\"{}\" data-bilingual=\"false\" selected",
         fixture.subtitle_id
     )));
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    assert!(!streams
+        .iter()
+        .any(|stream| stream["streamType"] == 3 && stream["selected"] == true));
 }
 
 #[tokio::test]
@@ -3794,8 +3826,9 @@ async fn plex_subtitle_selection_is_remembered_by_hb_web() {
 }
 
 #[tokio::test]
-async fn last_subtitle_language_is_reused_for_another_item() {
+async fn subtitle_selection_is_not_reused_for_another_item() {
     let fixture = fixture();
+    fixture.config.lock().unwrap().subtitle_language_secondary = "ja".to_owned();
     let first = fixture.state.media.read().unwrap()[0].clone();
     let media_dir = first.path.parent().unwrap().to_path_buf();
     let first_vietnamese = media_dir.join("Demo.vi.srt");
@@ -3808,35 +3841,32 @@ async fn last_subtitle_language_is_reused_for_another_item() {
 
     let second_path = media_dir.join("Second.mkv");
     std::fs::write(&second_path, b"0123456789abcdef").unwrap();
+    let second = Media {
+        id: "1-2".to_owned(),
+        path: second_path.clone(),
+        title: "Second".to_owned(),
+        size: 16,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    };
+    let second_english = media_dir.join("Second.en.srt");
+    std::fs::write(
+        &second_english,
+        b"1\n00:00:01,000 --> 00:00:02,000\nHello\n",
+    )
+    .unwrap();
+    let second_english_id = super::plex_external_subtitle_id(&second, &second_english);
     let second_vietnamese = media_dir.join("Second.vi.srt");
     std::fs::write(
         &second_vietnamese,
         b"1\n00:00:01,000 --> 00:00:02,000\nXin chao\n",
     )
     .unwrap();
-    let second_vietnamese_id = super::plex_external_subtitle_id(
-        &Media {
-            id: "1-2".to_owned(),
-            path: second_path.clone(),
-            title: "Second".to_owned(),
-            size: 16,
-            container: "mkv".to_owned(),
-            mime: "video/x-matroska".to_owned(),
-            metadata_revision: 0,
-        },
-        &second_vietnamese,
-    );
+    let second_vietnamese_id = super::plex_external_subtitle_id(&second, &second_vietnamese);
     {
         let mut media = (**fixture.state.media.read().unwrap()).clone();
-        media.push(Media {
-            id: "1-2".to_owned(),
-            path: second_path.clone(),
-            title: "Second".to_owned(),
-            size: 16,
-            container: "mkv".to_owned(),
-            mime: "video/x-matroska".to_owned(),
-            metadata_revision: 0,
-        });
+        media.push(second);
         *fixture.state.media.write().unwrap() = Arc::new(media);
     }
 
@@ -3873,6 +3903,9 @@ async fn last_subtitle_language_is_reused_for_another_item() {
     )
     .unwrap();
     assert!(page.contains(&format!(
+        "data-stream-id=\"{second_english_id}\" data-bilingual=\"false\" selected"
+    )));
+    assert!(!page.contains(&format!(
         "data-stream-id=\"{second_vietnamese_id}\" data-bilingual=\"false\" selected"
     )));
 }
@@ -3966,6 +3999,23 @@ async fn language_settings_save_voice_preferences_and_sync_plex_preferences() {
     );
     drop(config);
 
+    let db = fixture.db.lock().unwrap();
+    let stored = |key: &str| {
+        db.query_row(
+            "SELECT value FROM playback_preferences WHERE key = ?1",
+            [format!("setting:{key}")],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(stored("audio_language_primary"), "ja");
+    assert_eq!(stored("audio_language_secondary"), "ko");
+    assert_eq!(stored("subtitle_language_primary"), "ja");
+    assert_eq!(stored("subtitle_language_secondary"), "ko");
+    assert_eq!(stored("bilingual_subtitles_enabled"), "true");
+    assert!(stored("plex_account_preferences").contains("\"defaultSubtitleLanguage\":\"ja\""));
+    drop(db);
+
     let response = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let page = String::from_utf8(
@@ -3979,6 +4029,130 @@ async fn language_settings_save_voice_preferences_and_sync_plex_preferences() {
     assert!(page.contains("name=\"audio_language_secondary\">"));
     assert!(page.contains("<option value=\"ja\" selected>Japanese</option>"));
     assert!(page.contains("<option value=\"ko\" selected>Korean</option>"));
+}
+
+#[tokio::test]
+async fn primary_subtitle_off_disables_bilingual_and_is_mirrored_to_plex() {
+    let fixture = fixture();
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings",
+        "audio_language_primary=en&audio_language_secondary=none&language_primary=off&language_secondary=vi&bilingual_enabled=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+
+    {
+        let config = fixture.config.lock().unwrap();
+        assert_eq!(config.subtitle_language_primary, "off");
+        assert!(!config.bilingual_subtitles_enabled);
+        assert_eq!(
+            config
+                .plex_account_preferences
+                .get("defaultSubtitleLanguage")
+                .map(String::as_str),
+            Some("off")
+        );
+        assert_eq!(
+            config
+                .plex_account_preferences
+                .get("subtitleMode")
+                .map(String::as_str),
+            Some("0")
+        );
+    }
+    {
+        let db = fixture.db.lock().unwrap();
+        let primary: String = db
+            .query_row(
+                "SELECT value FROM playback_preferences WHERE key = ?1",
+                ["setting:subtitle_language_primary"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(primary, "off");
+        let bilingual: String = db
+            .query_row(
+                "SELECT value FROM playback_preferences WHERE key = ?1",
+                ["setting:bilingual_subtitles_enabled"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(bilingual, "false");
+        let preferences: String = db
+            .query_row(
+                "SELECT value FROM playback_preferences WHERE key = ?1",
+                ["setting:plex_account_preferences"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(preferences.contains("\"defaultSubtitleLanguage\":\"off\""));
+    }
+    let mut restored = fixture.config.lock().unwrap().clone();
+    restored.subtitle_language_primary = "en".to_owned();
+    restored.bilingual_subtitles_enabled = true;
+    restored.plex_account_preferences.clear();
+    {
+        let db = fixture.db.lock().unwrap();
+        super::apply_stored_settings(&db, &mut restored);
+    }
+    assert_eq!(restored.subtitle_language_primary, "off");
+    assert!(!restored.bilingual_subtitles_enabled);
+    assert_eq!(
+        restored
+            .plex_account_preferences
+            .get("defaultSubtitleLanguage")
+            .map(String::as_str),
+        Some("off")
+    );
+
+    let settings = send(&fixture.app, Method::GET, "/settings", Body::empty()).await;
+    let settings = String::from_utf8(
+        to_bytes(settings.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(settings.contains("<option value=\"off\" selected>Off</option>"));
+    assert!(!settings.contains("name=\"bilingual_enabled\" value=\"true\" checked"));
+
+    let player = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    let player = String::from_utf8(
+        to_bytes(player.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(player.contains("<option value=\"-1\" data-stream-id=\"0\" selected>Off</option>"));
+    assert!(!player.contains("class=\"subtitle-translation\""));
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    assert!(!streams
+        .iter()
+        .any(|stream| stream["streamType"] == 3 && stream["selected"] == true));
+    assert!(!streams
+        .iter()
+        .any(|stream| stream["displayTitle"] == "English + Vietnamese"));
 }
 
 #[tokio::test]
@@ -4045,7 +4219,15 @@ async fn missing_bilingual_combo_is_offered_for_generation_but_not_selected() {
     assert!(page.contains("selected data-pending-bilingual=\"false\">External: English"));
     assert!(page.contains("data-bilingual-stream-id=\""));
     assert!(page.contains("startPendingBilingual"));
-    assert!(page.contains("generation didn't have time to complete last time, reload again"));
+    assert!(page.contains("(generating…)"));
+    assert!(page.contains("showTranslationError(\"encountered 429, try again later\")"));
+    assert!(page.contains("video.addEventListener(\"play\", resumePartialTranslation)"));
+    assert!(page.contains("\"/web/translation-progress\""));
+    assert!(
+        !page.contains("if (pendingOption && !bilingualReady && selectedOption && subtitleSelect)")
+    );
+    assert!(!page.contains("Showing the original subtitle"));
+    assert!(!page.contains("reload again"));
 }
 
 #[tokio::test]
@@ -4111,7 +4293,7 @@ async fn plex_generate_stream_serves_source_subtitle_while_generating() {
     .unwrap();
     assert!(body.starts_with("WEBVTT\n\n"));
     assert!(body.contains("Hello"));
-    assert!(!body.contains("generation didn't have time"));
+    assert!(!body.contains("encountered 429, try again later"));
 
     super::finish_translation_job(&job_key);
     drop(cancellation);
@@ -4192,7 +4374,6 @@ async fn stale_bilingual_selection_does_not_select_the_generation_option() {
 async fn stale_subtitle_stream_falls_back_to_preferred_existing_subtitle() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
-    super::remember_last_subtitle_language(&fixture.state, "en");
     super::save_plex_stream_selection(
         &fixture.state,
         &media,
@@ -4218,6 +4399,121 @@ async fn stale_subtitle_stream_falls_back_to_preferred_existing_subtitle() {
     .unwrap();
     assert!(page.contains("selected data-pending-bilingual=\"false\">External: English"));
     assert!(!page.contains("data-selected-stream-id=\"18446744073709551615\""));
+}
+
+#[tokio::test]
+async fn stale_bilingual_selection_falls_back_to_primary_language() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let translated_id = super::plex_translated_subtitle_id(&media, "en", "vi");
+    super::save_plex_stream_selection(
+        &fixture.state,
+        &media,
+        super::PlexStreamSelection {
+            audio_stream_id: None,
+            subtitle_stream_id: Some(translated_id),
+        },
+    );
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("selected data-pending-bilingual=\"false\">External: English"));
+    assert!(!page.contains("data-stream-id=\"0\" selected>Off"));
+}
+
+#[tokio::test]
+async fn completed_bilingual_is_preferred_over_primary_language() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let saved =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "srt");
+    std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
+    std::fs::write(
+        &saved,
+        "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
+    )
+    .unwrap();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(
+        page.contains("selected data-pending-bilingual=\"false\">Bilingual: English + Vietnamese")
+    );
+    assert!(!page.contains("selected data-pending-bilingual=\"false\">External: English"));
+
+    let metadata = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1",
+        Body::empty(),
+    )
+    .await;
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&to_bytes(metadata.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let streams = metadata["MediaContainer"]["Metadata"][0]["Media"][0]["Part"][0]["Stream"]
+        .as_array()
+        .unwrap();
+    let selected = streams
+        .iter()
+        .filter(|stream| stream["streamType"] == 3 && stream["selected"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(selected.len(), 1);
+    assert_eq!(selected[0]["bilingual"], true);
+}
+
+#[tokio::test]
+async fn explicit_subtitle_off_is_preserved() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    super::save_plex_stream_selection(
+        &fixture.state,
+        &media,
+        super::PlexStreamSelection {
+            audio_stream_id: None,
+            subtitle_stream_id: Some(0),
+        },
+    );
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("data-stream-id=\"0\" selected>Off"));
 }
 
 #[tokio::test]
@@ -4622,9 +4918,10 @@ async fn plex_translated_subtitle_stream_serves_staged_partial_then_manually_gen
     let partial = to_bytes(partial.into_body(), usize::MAX).await.unwrap();
     let partial = String::from_utf8(partial.to_vec()).unwrap();
     assert!(partial.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
-    assert!(partial.contains(
-        "00:00:02.000 --> 00:00:07.000\ngeneration didn't have time to complete last time, reload again"
-    ));
+    assert!(partial
+        .trim_end()
+        .ends_with("00:00:01.000 --> 09:00:00.000\nencountered 429, try again later"));
+    assert!(!partial.contains("00:00:00.000 --> "));
     super::finish_translation_job(&job_key);
     drop(cancellation);
 
@@ -4647,7 +4944,7 @@ async fn plex_translated_subtitle_stream_serves_staged_partial_then_manually_gen
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.starts_with("WEBVTT\n\n"));
     assert!(body.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
-    assert!(!body.contains("didn't have time"));
+    assert!(!body.contains("encountered 429, try again later"));
 }
 
 #[test]
@@ -9354,7 +9651,7 @@ async fn skipping_settings_render_validate_and_persist_both_modes() {
             .count(),
         2
     );
-    assert_eq!(page.matches("<option value=\"off\"").count(), 2);
+    assert_eq!(page.matches("<option value=\"off\"").count(), 3);
 
     let response = send_form(
         &fixture.app,

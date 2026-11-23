@@ -3,5 +3,6 @@
 /config/
 *.log
 *.zip
+*.7z
 plex-log-*
 PLAN-*.md

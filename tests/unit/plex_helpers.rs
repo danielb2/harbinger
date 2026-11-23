@@ -1545,3 +1545,15 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
         .unwrap();
     assert_eq!(selected["languageTag"], "en");
 }
+
+#[test]
+fn incomplete_notice_starts_at_last_cue_and_stays_last() {
+    let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n";
+    let result = super::vtt_with_incomplete_notice(vtt).unwrap();
+    assert!(result.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
+    assert!(result
+        .trim_end()
+        .ends_with("00:00:01.000 --> 09:00:00.000\nencountered 429, try again later"));
+    let repeated = super::vtt_with_incomplete_notice(&result).unwrap();
+    assert_eq!(repeated, result);
+}
