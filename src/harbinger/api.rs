@@ -358,55 +358,47 @@ pub(crate) async fn web_translated_subtitle(
         client_source_cues = request.source_cues.len(),
         "bilingual subtitle generation started"
     );
-    let job_key =
-        bilingual_translation_job_key(&media, &request.first_language, &request.second_language);
-    let Some(cancellation) = start_translation_job(job_key.clone(), media.id.clone(), true) else {
-        warn!(media = %media.title, "bilingual subtitle generation stopped because another preparation is active");
-        return (
-            StatusCode::CONFLICT,
-            "This bilingual subtitle is already being prepared",
-        )
-            .into_response();
-    };
-    let translated = translate_subtitle_cached_cancellable(
+    let started = spawn_bilingual_generation(
         &state,
         &media,
-        &contents,
-        &source_language,
-        &format,
         &request.first_language,
         &request.second_language,
-        Some(cancellation),
-        request.source_key.as_deref(),
+        contents,
+        source_language,
+        format,
+        true,
     )
     .await;
-    finish_translation_job(&job_key);
-    match translated {
-        Ok(vtt) => {
-            info!(
-                media = %media.title,
-                prepared = request.prepared,
-                elapsed_ms = generation_started.elapsed().as_millis(),
-                "bilingual subtitle generation stopped successfully"
-            );
-            ([(header::CONTENT_TYPE, "text/vtt; charset=utf-8")], vtt).into_response()
-        }
-        Err(error) => {
-            tracing::error!(
-                media = %media.title,
-                prepared = request.prepared,
-                elapsed_ms = generation_started.elapsed().as_millis(),
-                error = %error,
-                "bilingual subtitle generation stopped with an error"
-            );
-            let status = if error.starts_with("Google Translate rate limit (HTTP 429)") {
-                StatusCode::TOO_MANY_REQUESTS
-            } else {
-                StatusCode::BAD_GATEWAY
-            };
-            (status, error).into_response()
-        }
+    let checkpoint = staged_bilingual_vtt(
+        &state,
+        &media,
+        &request.first_language,
+        &request.second_language,
+    )
+    .await;
+    if let Some(vtt) = checkpoint {
+        info!(
+            media = %media.title,
+            prepared = request.prepared,
+            started,
+            elapsed_ms = generation_started.elapsed().as_millis(),
+            "bilingual subtitle generation checkpoint ready"
+        );
+        return (
+            [
+                (header::CONTENT_TYPE, "text/vtt; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            vtt,
+        )
+            .into_response();
     }
+    warn!(media = %media.title, "bilingual subtitle generation could not create a checkpoint");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Bilingual subtitle generation could not be started",
+    )
+        .into_response()
 }
 
 pub(crate) async fn web_progress(
@@ -4403,7 +4395,7 @@ pub(crate) async fn web_client(
           }}
           updateTranslationSourceLabel();
           status.textContent = waitingForBilingual
-            ? `Generating bilingual subtitles… showing ${{selectedSourceName}} until ready.`
+            ? `Generating bilingual subtitles… showing ${{selectedSourceName}} until ready. Reload the bilingual subtitles if generation was interrupted.`
             : prepared ? `Generating from ${{selectedSourceName}}…` : `Translating from ${{selectedSourceName}}…`;
           translationControls.querySelectorAll("button").forEach(button => button.disabled = true);
           try {{
@@ -4500,7 +4492,7 @@ pub(crate) async fn web_client(
             else if (!(silentConflict && error.status === 409)) {{
               showTranslationError(`Translation unavailable: ${{error.message || "request failed"}}`);
             }}
-            if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume.";
+            if (prepared) generationProgressLabel.textContent = "Generation stopped; completed cues remain staged for resume. Reload the bilingual subtitles to try again.";
           }} finally {{
             if (generationProgressTimer) clearInterval(generationProgressTimer);
             generationProgressTimer = null;
@@ -4557,20 +4549,58 @@ pub(crate) async fn web_client(
             select.value = lastSubtitleValue;
             return;
           }}
-          const originalPendingText = pendingOption.textContent;
-          pendingOption.textContent = originalPendingText.replace(/\s*\(generate\)\s*$/, "") + " (generating…)";
-          select.value = String(pendingOption.index);
-          [...video.textTracks].forEach((track, index) => {{
-            track.mode = index === Number(sourceOption.value) ? "showing" : "disabled";
-          }});
-          select.dataset.selectedStreamId = sourceOption.dataset.streamId || "0";
-          lastSubtitleValue = String(sourceOption.index);
+          if (!pendingOption.dataset.originalLabel) pendingOption.dataset.originalLabel = pendingOption.textContent;
+          pendingOption.textContent = pendingOption.dataset.originalLabel.replace(/\s*\(generate\)\s*$/, "") + " (generating…)";
+          select.value = String(pendingOption.value);
+          applySubtitle(Number(pendingOption.value));
+          const bilingualTrack = video.querySelector(`track[src*="bilingual="]`);
+          if (bilingualTrack) {{
+            const src = new URL(bilingualTrack.getAttribute("src"), window.location.href);
+            src.searchParams.set("_ts", Date.now().toString());
+            bilingualTrack.src = src.pathname + src.search;
+            bilingualTrack.track.mode = "showing";
+          }}
+          select.dataset.selectedStreamId = pendingOption.dataset.streamId || "0";
+          lastSubtitleValue = String(pendingOption.value);
           fetch("/web/subtitle-selection", {{
             method: "POST", headers: {{ "content-type": "application/json" }},
-            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: Number(sourceOption.dataset.streamId || 0) }})
+            body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null, stream_id: Number(pendingOption.dataset.streamId || 0) }})
           }}).catch(() => {{}});
-          updateTranslationSourceLabel();
-          translate(true, sourceOption, true, pendingOption);
+          status.setAttribute("role", "status");
+          status.setAttribute("aria-live", "polite");
+          status.textContent = "Generating bilingual subtitles… Reload subtitles for updates.";
+          const sourceId = Number(sourceOption.dataset.streamId || 0);
+          const browserTrackIndex = sourceOption.dataset.browserTrack;
+          const sourceKey = browserTrackIndex !== undefined ? `embedded:${{browserTrackIndex}}` : `stream:${{sourceId}}`;
+          let browserCues = [];
+          let sourceLanguage = "und";
+          if (browserTrackIndex !== undefined) {{
+            const embeddedTrack = video.textTracks[Number(browserTrackIndex)];
+            sourceLanguage = embeddedTrack?.language || "und";
+            browserCues = embeddedTrack?.cues ? [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }})) : [];
+          }}
+          const showTranslationError = message => {{
+            status.setAttribute("role", "alert");
+            status.setAttribute("aria-live", "assertive");
+            status.textContent = message;
+          }};
+          fetch("/web/translated-subtitle", {{
+            method: "POST", headers: {{ "content-type": "application/json" }},
+            body: JSON.stringify({{
+              path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null,
+              stream_id: sourceId, first_language: translationControls.querySelector(".translation-first").value,
+              second_language: translationControls.querySelector(".translation-second").value,
+              source_language: sourceLanguage, source_cues: browserCues, source_key: sourceKey, prepared: true
+            }})
+          }}).then(async response => {{
+            if (response.ok) {{
+              status.textContent = "Generating bilingual subtitles…";
+              return;
+            }}
+            const message = await response.text();
+            if (response.status === 429) showTranslationError("Google Translate rate limit reached. Wait a while and try again.");
+            else showTranslationError(message || "Translation unavailable.");
+          }}).catch(() => showTranslationError("Translation unavailable."));
         }};
         translationControls.querySelector(".translate-prepare").addEventListener("click", () => translate(true));
       }}
@@ -4772,29 +4802,7 @@ pub(crate) async fn web_subtitle(
         let Some((first, second)) = languages else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        let saved = ["srt", "vtt", "ass"]
-            .into_iter()
-            .map(|extension| {
-                configured_bilingual_subtitle_path(&s, &media, &first, &second, extension)
-            })
-            .find(|candidate| candidate.is_file());
-        let Some(saved) = saved else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let Ok(contents) = tokio::fs::read_to_string(&saved).await else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let extension = saved
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
-        let Some((content_type, contents)) =
-            external_subtitle_content(&contents, &extension, "vtt")
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        return ([(header::CONTENT_TYPE, content_type)], contents).into_response();
+        return translated_subtitle_stream_response(&s, &media, &first, &second, "vtt").await;
     }
     if let Some(stream) = query.stream {
         let stream_id = stream as u64;

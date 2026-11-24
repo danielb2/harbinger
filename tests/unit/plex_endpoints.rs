@@ -4280,6 +4280,27 @@ async fn generate_option_survives_a_plex_subtitle_preference_of_off() {
     assert_eq!(generate["pending"], true);
     assert_eq!(generate["displayTitle"], "English + Vietnamese (generate)");
     assert_eq!(generate["title"], "SRT External • Generate");
+    assert_eq!(generate["selected"], false);
+    assert!(streams
+        .iter()
+        .any(|stream| stream["displayTitle"] == "English" && stream["selected"] == true));
+
+    let player = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&play=Demo.mkv",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(player.status(), StatusCode::OK);
+    let player = String::from_utf8(
+        to_bytes(player.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(player.contains("selected data-pending-bilingual=\"false\">External: English"));
 }
 
 #[tokio::test]
@@ -4319,7 +4340,7 @@ async fn plex_metadata_offers_generate_note_without_auto_selecting_it() {
 }
 
 #[tokio::test]
-async fn plex_pending_stream_prefetch_does_not_start_generation() {
+async fn plex_pending_stream_prefetch_serves_placeholder_without_starting_generation() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
     let translated_id = super::plex_translated_subtitle_id(&media, "en", "vi");
@@ -4344,9 +4365,59 @@ async fn plex_pending_stream_prefetch_does_not_start_generation() {
     )
     .unwrap();
     assert!(body.starts_with("WEBVTT\n\n"));
-    assert!(body.contains("Hello"));
+    assert!(body
+        .contains("00:00:00.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload"));
+    assert!(!body.contains("Hello"));
     assert!(!body.contains("Google Translate rate limit reached. Wait a while and try again."));
-    assert!(!checkpoint.exists());
+    assert!(checkpoint.exists());
+    let job_key = super::bilingual_translation_job_key(&media, "en", "vi");
+    assert!(!super::ACTIVE_TRANSLATION_JOBS
+        .get()
+        .and_then(|jobs| jobs.lock().ok())
+        .is_some_and(|jobs| jobs.contains_key(&job_key)));
+}
+
+#[tokio::test]
+async fn web_generate_bilingual_stream_serves_checkpoint_immediately() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let job_key = super::bilingual_translation_job_key(&media, "en", "vi");
+    super::finish_translation_job(&job_key);
+    let cancellation = super::start_translation_job(job_key.clone(), media.id.clone(), true)
+        .expect("test should reserve the generation job to avoid network translation");
+    std::fs::write(
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "vtt")
+            .with_extension("vtt.part"),
+        "WEBVTT\n\n00:00:00.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload\n",
+    )
+    .unwrap();
+    let checkpoint =
+        super::configured_bilingual_subtitle_path(&fixture.state, &media, "en", "vi", "vtt");
+    let checkpoint = PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/subtitle?library=0&path=Demo.mkv&bilingual=true",
+        Body::empty(),
+    )
+    .await;
+    let status = response.status();
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.contains("Generating bilingual subtitles, please reload"));
+    assert!(body.contains("09:00:00.000"));
+    assert!(!body.contains("Hello\nXin chào"));
+    assert!(checkpoint.exists());
+
+    super::finish_translation_job(&job_key);
+    drop(cancellation);
 }
 
 #[tokio::test]
@@ -4374,7 +4445,7 @@ async fn plex_selecting_generate_stream_starts_generation_and_persists_the_sourc
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let selection = super::stored_plex_stream_selection(&fixture.state, &media).unwrap();
-    assert_eq!(selection.subtitle_stream_id, Some(source_stream_id));
+    assert_eq!(selection.subtitle_stream_id, Some(translated_id));
 
     super::finish_translation_job(&job_key);
     drop(cancellation);
@@ -4869,6 +4940,39 @@ async fn changing_translation_source_resets_the_partial_without_mixing_cues() {
 }
 
 #[tokio::test]
+async fn translation_checkpoint_preparation_preserves_the_initial_generating_notice() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let checkpoint = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
+    let checkpoint = std::path::PathBuf::from(format!("{}.part", checkpoint.to_string_lossy()));
+    let source = "1\n00:00:01,000 --> 00:00:02,000\nHello\n";
+    let fingerprint = super::subtitle_translation_fingerprint(
+        &media,
+        source,
+        "en",
+        "srt",
+        "en",
+        "vi",
+        Some("stream:1"),
+    )
+    .unwrap();
+    let notice = format!(
+        "WEBVTT\n\n00:00:00.000 --> 09:00:00.000\n{}\n",
+        super::BILINGUAL_GENERATING_NOTICE
+    );
+    std::fs::write(&checkpoint, &notice).unwrap();
+
+    super::prepare_translation_checkpoint(&checkpoint, source, &fingerprint, Some("stream:1"))
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), notice);
+    assert!(
+        super::subtitle_source_marker_matches(&checkpoint, &fingerprint, Some("stream:1")).await
+    );
+}
+
+#[tokio::test]
 async fn bilingual_sidecar_keeps_vtt_or_ass_source_format() {
     let fixture = fixture();
     let media = fixture.state.media.read().unwrap()[0].clone();
@@ -5000,9 +5104,8 @@ async fn plex_translated_subtitle_stream_serves_staged_partial_then_manually_gen
     let partial = String::from_utf8(partial.to_vec()).unwrap();
     assert!(partial.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
     assert!(partial
-        .trim_end()
-        .ends_with("00:00:01.000 --> 09:00:00.000\nGoogle Translate rate limit reached. Wait a while and try again."));
-    assert!(!partial.contains("00:00:00.000 --> "));
+        .contains("00:00:01.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload"));
+    assert!(!partial.contains("Google Translate rate limit reached"));
     super::finish_translation_job(&job_key);
     drop(cancellation);
 
@@ -5043,10 +5146,6 @@ async fn plex_translated_subtitle_stream_marks_an_empty_checkpoint_like_a_partia
     std::fs::create_dir_all(checkpoint.parent().unwrap()).unwrap();
     std::fs::write(&checkpoint, "WEBVTT\n\n").unwrap();
 
-    super::record_incomplete_notice(&checkpoint, "00:00:01,000 --> 00:00:02,000\nHello\n").await;
-    let expected = "WEBVTT\n\n00:00:01.000 --> 09:00:00.000\nGoogle Translate rate limit reached. Wait a while and try again.\n";
-    assert_eq!(std::fs::read_to_string(&checkpoint).unwrap(), expected);
-
     let job_key = super::bilingual_translation_job_key(&media, "en", "vi");
     let cancellation = super::start_translation_job(job_key.clone(), media.id.clone(), true)
         .expect("test should reserve the generation job to avoid network translation");
@@ -5055,7 +5154,8 @@ async fn plex_translated_subtitle_stream_marks_an_empty_checkpoint_like_a_partia
     assert_eq!(response.status(), StatusCode::OK);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
-    assert_eq!(body, expected);
+    assert!(body.contains("Generating bilingual subtitles, please reload"));
+    assert!(body.contains("00:00:00.000 --> 09:00:00.000"));
     super::finish_translation_job(&job_key);
     drop(cancellation);
 }

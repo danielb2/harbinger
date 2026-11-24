@@ -8645,14 +8645,12 @@ pub(crate) async fn plex_set_streams(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let current = stored_plex_stream_selection(&state, &media).unwrap_or_default();
-    let generated_source_stream_id =
+    let _ =
         start_bilingual_generation_for_plex_selection(&state, &media, selection.subtitle_stream_id)
             .await;
     let persisted = PlexStreamSelection {
         audio_stream_id: selection.audio_stream_id.or(current.audio_stream_id),
-        subtitle_stream_id: generated_source_stream_id
-            .or(selection.subtitle_stream_id)
-            .or(current.subtitle_stream_id),
+        subtitle_stream_id: selection.subtitle_stream_id.or(current.subtitle_stream_id),
     };
     save_plex_stream_selection(&state, &media, persisted);
     if let Some(stream_id) = persisted.subtitle_stream_id {

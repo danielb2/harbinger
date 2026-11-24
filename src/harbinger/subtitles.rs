@@ -1,5 +1,5 @@
 use std::{path::Path, time::Instant};
-use tokio::io::AsyncWriteExt;
+
 use tokio::task::JoinSet;
 use tracing::{debug, info};
 
@@ -271,7 +271,7 @@ async fn translate_bilingual_resumable_at(
         elapsed_ms = started.elapsed().as_millis(),
         "bilingual subtitle translation finished"
     );
-    Ok(contents)
+    Ok(without_incomplete_notice(&contents))
 }
 
 async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<Cue>, String> {
@@ -285,7 +285,7 @@ async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<
     } else {
         parse_subtitles(&contents).unwrap_or_default()
     };
-    let completed = parsed
+    let completed_count = parsed
         .iter()
         .zip(source_cues)
         .take_while(|(saved, source)| {
@@ -293,8 +293,17 @@ async fn read_staged_vtt(output_path: &Path, source_cues: &[Cue]) -> Result<Vec<
                 && saved.end.replace(',', ".") == source.end.replace(',', ".")
         })
         .count();
-    let completed = parsed.into_iter().take(completed).collect::<Vec<_>>();
-    write_staged_vtt(output_path, &completed).await?;
+    let notice = parsed
+        .iter()
+        .skip(completed_count)
+        .find(|cue| cue.end.replace(',', ".") == "09:00:00.000")
+        .cloned();
+    let completed = parsed.into_iter().take(completed_count).collect::<Vec<_>>();
+    let mut to_write = completed.clone();
+    if let Some(notice) = notice {
+        to_write.push(notice);
+    }
+    write_staged_vtt(output_path, &to_write).await?;
     Ok(completed)
 }
 
@@ -355,6 +364,20 @@ async fn write_staged_vtt(output_path: &Path, cues: &[Cue]) -> Result<(), String
         .map_err(|_| "Could not create subtitle checkpoint in the media folder".to_owned())
 }
 
+fn without_incomplete_notice(contents: &str) -> String {
+    let normalized = contents.replace("\r\n", "\n").replace('\r', "\n");
+    let blocks = normalized
+        .trim()
+        .split("\n\n")
+        .filter(|block| {
+            !block.contains("09:00:00.000")
+                || (!block.contains("Generating bilingual subtitles")
+                    && !block.contains("Google Translate rate limit reached"))
+        })
+        .collect::<Vec<_>>();
+    format!("{}\n", blocks.join("\n\n"))
+}
+
 async fn append_staged_vtt_cue(
     output_path: &Path,
     cue: &Cue,
@@ -368,16 +391,56 @@ async fn append_staged_vtt_cue(
         escape_vtt(first),
         escape_vtt(second)
     );
-    let mut file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(output_path)
-        .await
-        .map_err(|_| "Could not open subtitle checkpoint in the media folder".to_owned())?;
-    file.write_all(cue_text.as_bytes())
-        .await
-        .map_err(|_| "Could not append subtitle checkpoint in the media folder".to_owned())?;
-    file.flush()
+    let contents = match tokio::fs::read_to_string(output_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => "WEBVTT\n\n".to_owned(),
+        Err(_) => return Err("Could not read subtitle checkpoint in the media folder".to_owned()),
+    };
+    let mut blocks = contents
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .split("\n\n")
+        .filter(|block| !block.trim().is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let notice = blocks.last().and_then(|block| {
+        (block.contains("09:00:00.000")
+            && (block.contains("Generating bilingual subtitles")
+                || block.contains("Google Translate rate limit reached")))
+        .then(|| block.clone())
+    });
+    if notice.is_some() {
+        blocks.pop();
+    }
+    if blocks.first().is_some_and(|block| block.trim() == "WEBVTT") {
+        blocks.remove(0);
+    }
+    blocks.push(cue_text.trim_end().to_owned());
+    let updated_notice = notice.unwrap_or_else(|| {
+        format!(
+            "{} --> 09:00:00.000\nGenerating bilingual subtitles, please reload",
+            cue.start.replace(',', ".")
+        )
+    });
+    let updated_notice = updated_notice
+        .lines()
+        .map(|line| {
+            if line.contains("-->") {
+                format!("{} --> 09:00:00.000", cue.start.replace(',', "."))
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    blocks.push(updated_notice);
+    let mut output = String::from("WEBVTT\n\n");
+    for block in blocks {
+        output.push_str(block.trim());
+        output.push_str("\n\n");
+    }
+    tokio::fs::write(output_path, output)
         .await
         .map_err(|_| "Could not save subtitle checkpoint in the media folder".to_owned())
 }
@@ -637,6 +700,33 @@ mod tests {
         assert!(bilingual_vtt(&cues, &[], &["Salut".into()]).is_err());
     }
 
+    #[tokio::test]
+    async fn first_translated_cue_moves_the_generation_notice_to_the_end() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("Movie.en-vi.vtt.part");
+        tokio::fs::write(
+            &output,
+            "WEBVTT\n\n00:00:00.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload\n",
+        )
+        .await
+        .unwrap();
+        let cue = Cue {
+            start: "00:00:01.000".to_owned(),
+            end: "00:00:02.000".to_owned(),
+            text: "Hello".to_owned(),
+        };
+
+        append_staged_vtt_cue(&output, &cue, "Hello", "Xin chào")
+            .await
+            .unwrap();
+
+        let contents = tokio::fs::read_to_string(output).await.unwrap();
+        assert_eq!(
+            contents,
+            "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n00:00:01.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload\n\n"
+        );
+    }
+
     async fn translation_stub(
         Query(query): Query<std::collections::HashMap<String, String>>,
     ) -> impl axum::response::IntoResponse {
@@ -809,8 +899,18 @@ mod tests {
         .unwrap();
 
         let staged = tokio::fs::read_to_string(&output_part).await.unwrap();
-        assert_eq!(staged, output);
-        let cues = parse_subtitles(&staged).unwrap();
+        assert!(staged.contains(
+            "00:00:08.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload"
+        ));
+        assert!(!output.contains("Generating bilingual subtitles, please reload"));
+        let staged_cues = parse_subtitles(&staged).unwrap();
+        assert_eq!(staged_cues.len(), 9);
+        assert_eq!(
+            staged_cues.last().unwrap().text,
+            "Generating bilingual subtitles, please reload"
+        );
+        assert_eq!(staged_cues.last().unwrap().end, "09:00:00.000");
+        let cues = parse_subtitles(&output).unwrap();
         assert_eq!(cues.len(), 8);
         for (offset, cue) in cues.iter().enumerate() {
             let number = offset + 1;

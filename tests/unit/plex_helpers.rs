@@ -182,6 +182,7 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         None,
         "en",
         "vi",
+        "en",
         None,
     );
 
@@ -259,6 +260,7 @@ fn plex_media_advertises_playable_part_audio_video_and_external_subtitle() {
         None,
         "en",
         "vi",
+        "en",
         None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
@@ -326,9 +328,11 @@ fn plex_metadata_can_advertise_one_generated_bilingual_track() {
         None,
         "en",
         "vi",
+        "en",
         Some(PlexBilingualStream {
             extension: "vtt",
             pending: false,
+            generating: false,
         }),
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
@@ -392,9 +396,11 @@ fn plex_metadata_advertises_translation_for_embedded_text_subtitles() {
         None,
         "en",
         "vi",
+        "en",
         Some(PlexBilingualStream {
             extension: "vtt",
             pending: false,
+            generating: false,
         }),
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
@@ -457,6 +463,7 @@ fn plex_media_infers_average_bitrate_when_media_info_omits_it() {
         None,
         "en",
         "vi",
+        "en",
         None,
     );
 
@@ -1513,6 +1520,7 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
         Some("en"),
         "en",
         "vi",
+        "en",
         None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
@@ -1536,6 +1544,7 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
         Some("en"),
         "en",
         "vi",
+        "en",
         None,
     );
     let streams = item["Media"][0]["Part"][0]["Stream"].as_array().unwrap();
@@ -1547,7 +1556,7 @@ fn configured_voice_languages_choose_the_default_plex_audio_track() {
 }
 
 #[test]
-fn incomplete_notice_starts_at_last_cue_and_stays_last() {
+fn incomplete_notice_starts_at_last_translated_cue_and_stays_last() {
     let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n";
     let result = super::vtt_with_incomplete_notice(vtt, None).unwrap();
     assert!(result.contains("00:00:01.000 --> 00:00:02.000\nHello\nXin chào"));
@@ -1567,4 +1576,15 @@ fn incomplete_notice_uses_the_first_source_cue_when_no_cue_was_staged() {
     );
     let repeated = super::vtt_with_incomplete_notice(&result, Some("00:00:03.000")).unwrap();
     assert_eq!(repeated, result);
+}
+
+#[test]
+fn generating_notice_is_replaced_by_rate_limit_notice() {
+    let vtt = "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n00:00:01.000 --> 09:00:00.000\nGenerating bilingual subtitles, please reload\n";
+    let result = super::vtt_with_incomplete_notice(vtt, None).unwrap();
+    assert!(result.contains("Hello\nXin chào"));
+    assert!(!result.contains("Generating bilingual subtitles, please reload"));
+    assert!(result
+        .trim_end()
+        .ends_with("00:00:01.000 --> 09:00:00.000\nGoogle Translate rate limit reached. Wait a while and try again."));
 }

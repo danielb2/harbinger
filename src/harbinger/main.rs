@@ -401,6 +401,7 @@ struct ActiveTranslationJob {
 
 const BILINGUAL_INCOMPLETE_NOTICE: &str =
     "Google Translate rate limit reached. Wait a while and try again.";
+const BILINGUAL_GENERATING_NOTICE: &str = "Generating bilingual subtitles, please reload";
 
 pub(crate) fn bilingual_translation_job_key(media: &Media, first: &str, second: &str) -> String {
     format!("prepared:{}:{}:{}", media.id, first, second)
@@ -2426,6 +2427,7 @@ pub(crate) struct WebTranslatedSubtitleRequest {
     #[serde(default)]
     pub(crate) source_cues: Vec<BrowserSubtitleCue>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub(crate) source_key: Option<String>,
     pub(crate) first_language: String,
     pub(crate) second_language: String,
@@ -2592,9 +2594,23 @@ async fn prepare_translation_checkpoint(
     let has_marker = tokio::fs::metadata(subtitle_source_marker_path(checkpoint_path))
         .await
         .is_ok();
+    let has_generating_placeholder = tokio::fs::read_to_string(checkpoint_path)
+        .await
+        .ok()
+        .filter(|contents| contents.contains(BILINGUAL_GENERATING_NOTICE))
+        .is_some_and(|contents| {
+            let without_notice = contents
+                .replace("\r\n", "\n")
+                .split("\n\n")
+                .filter(|block| !block.contains(BILINGUAL_GENERATING_NOTICE))
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            subtitles::parse_subtitles(&without_notice).map_or(true, |cues| cues.is_empty())
+        });
     let keep_legacy_checkpoint = has_checkpoint
-        && !has_marker
-        && subtitles::staged_vtt_matches_source(checkpoint_path, translation_input).await;
+        && ((!has_marker
+            && subtitles::staged_vtt_matches_source(checkpoint_path, translation_input).await)
+            || has_generating_placeholder);
     if has_checkpoint && !keep_legacy_checkpoint {
         tokio::fs::write(checkpoint_path, "WEBVTT\n\n")
             .await
@@ -2808,6 +2824,7 @@ async fn translate_subtitle_cached_with_progress(
         source_key,
     )
     .await?;
+    ensure_generating_checkpoint_exists(&sidecar_part_path, &translation_input, false).await;
     let translated = if cancellation.is_some() || progress.is_some() {
         subtitles::translate_bilingual_resumable_cancellable(
             &client,
@@ -2924,7 +2941,16 @@ pub(crate) async fn bilingual_generation_source_stream_id(
     {
         return Some(stream_id);
     }
-    let primary = effective_plex_language_settings(state).3;
+    let effective_primary = effective_plex_language_settings(state).3;
+    let primary = if effective_primary == "off" {
+        state
+            .config
+            .lock()
+            .map(|config| config.subtitle_language_primary.clone())
+            .unwrap_or(effective_primary)
+    } else {
+        effective_primary
+    };
     let mut fallback = None;
     for path in external_subtitle_files(&media.path).await {
         if external_subtitle_pair(&media.path, &path).is_some() {
@@ -2980,12 +3006,15 @@ fn vtt_time_from_millis(total: u64) -> String {
     )
 }
 
-fn vtt_with_incomplete_notice(vtt: &str, fallback_start: Option<&str>) -> Option<String> {
+fn vtt_with_notice(vtt: &str, fallback_start: Option<&str>, notice: &str) -> Option<String> {
     let normalized = vtt.replace("\r\n", "\n").replace('\r', "\n");
     let blocks = normalized
         .trim()
         .split("\n\n")
-        .filter(|block| !block.contains(BILINGUAL_INCOMPLETE_NOTICE))
+        .filter(|block| {
+            !block.contains(BILINGUAL_INCOMPLETE_NOTICE)
+                && !block.contains(BILINGUAL_GENERATING_NOTICE)
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
     let cues = subtitles::parse_subtitles(&blocks).unwrap_or_default();
@@ -2993,25 +3022,120 @@ fn vtt_with_incomplete_notice(vtt: &str, fallback_start: Option<&str>) -> Option
         .last()
         .and_then(|cue| vtt_time_millis(&cue.start))
         .or_else(|| fallback_start.and_then(vtt_time_millis))?;
-    let mut output = blocks;
+    let mut output = if blocks.is_empty() {
+        "WEBVTT".to_owned()
+    } else {
+        blocks
+    };
     output.push_str(&format!(
         "\n\n{} --> 09:00:00.000\n{}\n",
         vtt_time_from_millis(last_start),
-        BILINGUAL_INCOMPLETE_NOTICE
+        notice
     ));
     Some(output)
 }
 
-async fn record_incomplete_notice(checkpoint_path: &std::path::Path, translation_input: &str) {
+fn vtt_with_incomplete_notice(vtt: &str, fallback_start: Option<&str>) -> Option<String> {
+    vtt_with_notice(vtt, fallback_start, BILINGUAL_INCOMPLETE_NOTICE)
+}
+
+fn vtt_with_generating_notice(vtt: &str, fallback_start: Option<&str>) -> Option<String> {
+    vtt_with_notice(vtt, fallback_start, BILINGUAL_GENERATING_NOTICE)
+}
+
+async fn record_checkpoint_notice(
+    checkpoint_path: &std::path::Path,
+    translation_input: &str,
+    notice: &str,
+) {
     let Ok(vtt) = tokio::fs::read_to_string(checkpoint_path).await else {
         return;
     };
     let fallback_start = subtitles::parse_subtitles(translation_input)
         .ok()
         .and_then(|cues| cues.first().map(|cue| cue.start.clone()));
-    if let Some(updated) = vtt_with_incomplete_notice(&vtt, fallback_start.as_deref()) {
+    if let Some(updated) = vtt_with_notice(&vtt, fallback_start.as_deref(), notice) {
         let _ = tokio::fs::write(checkpoint_path, updated).await;
     }
+}
+
+async fn record_incomplete_notice(checkpoint_path: &std::path::Path, translation_input: &str) {
+    record_checkpoint_notice(
+        checkpoint_path,
+        translation_input,
+        BILINGUAL_INCOMPLETE_NOTICE,
+    )
+    .await;
+}
+
+async fn ensure_generating_notice(
+    checkpoint_path: &std::path::Path,
+    _translation_input: &str,
+    replace_failure: bool,
+) {
+    let vtt = tokio::fs::read_to_string(checkpoint_path)
+        .await
+        .unwrap_or_else(|_| "WEBVTT\n\n".to_owned());
+    let without_notices = vtt
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .split("\n\n")
+        .filter(|block| {
+            !block.contains(BILINGUAL_INCOMPLETE_NOTICE)
+                && !block.contains(BILINGUAL_GENERATING_NOTICE)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let has_failure_notice = vtt.contains(BILINGUAL_INCOMPLETE_NOTICE);
+    let has_generating_notice = vtt.contains(BILINGUAL_GENERATING_NOTICE);
+    if has_failure_notice && !replace_failure {
+        return;
+    }
+    if let Ok(cues) = subtitles::parse_subtitles(&without_notices) {
+        if !cues.is_empty() {
+            if has_generating_notice && !has_failure_notice {
+                return;
+            }
+            if let Some(updated) = vtt_with_generating_notice(&vtt, None) {
+                let _ = tokio::fs::write(checkpoint_path, updated).await;
+            }
+            return;
+        }
+    }
+    if has_generating_notice {
+        return;
+    }
+    if let Some(parent) = checkpoint_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::write(
+        checkpoint_path,
+        format!(
+            "WEBVTT\n\n00:00:00.000 --> 09:00:00.000\n{}\n",
+            BILINGUAL_GENERATING_NOTICE
+        ),
+    )
+    .await;
+}
+
+async fn ensure_generating_checkpoint_exists(
+    checkpoint_path: &std::path::Path,
+    translation_input: &str,
+    replace_failure: bool,
+) {
+    if tokio::fs::metadata(checkpoint_path).await.is_ok() {
+        ensure_generating_notice(checkpoint_path, translation_input, replace_failure).await;
+        return;
+    }
+    let vtt = format!(
+        "WEBVTT\n\n{} --> 09:00:00.000\n{}\n",
+        "00:00:00.000", BILINGUAL_GENERATING_NOTICE
+    );
+    if let Some(parent) = checkpoint_path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::write(checkpoint_path, vtt).await;
 }
 
 fn bilingual_checkpoint_path(
@@ -3051,6 +3175,12 @@ pub(crate) async fn spawn_bilingual_generation(
         return false;
     };
     let checkpoint = bilingual_checkpoint_path(state, media, first, second);
+    let translation_input = match format.as_str() {
+        "srt" | "vtt" => contents.clone(),
+        "ass" => ass_to_vtt(&contents),
+        _ => contents.clone(),
+    };
+    ensure_generating_checkpoint_exists(&checkpoint, &translation_input, true).await;
     let state = state.clone();
     let media = media.clone();
     let first = first.to_owned();
@@ -3087,14 +3217,6 @@ pub(crate) async fn spawn_bilingual_generation(
             ),
         }
     });
-    if explicit {
-        for _ in 0..100 {
-            if tokio::fs::metadata(&checkpoint).await.is_ok() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    }
     true
 }
 
@@ -3164,21 +3286,17 @@ pub(crate) async fn translated_subtitle_stream_response(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let staged = staged_bilingual_vtt(state, media, first, second).await;
-    let has_staged = staged.is_some();
-    let (content_type, body) = if let Some(staged) = staged {
-        let Some(response) = external_subtitle_content(&staged, "vtt", requested_format) else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        response
-    } else {
-        let Some(response) = external_subtitle_content(&contents, &source_format, requested_format)
-        else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        response
+    let translation_input = match source_format.as_str() {
+        "srt" | "vtt" => contents.clone(),
+        "ass" => ass_to_vtt(&contents),
+        _ => contents.clone(),
     };
-    if has_staged {
+    let checkpoint = bilingual_checkpoint_path(state, media, first, second);
+    ensure_generating_checkpoint_exists(&checkpoint, &translation_input, true).await;
+    let translated_stream_id = plex_translated_subtitle_id(media, first, second);
+    if stored_plex_stream_selection(state, media).and_then(|selection| selection.subtitle_stream_id)
+        == Some(translated_stream_id)
+    {
         let _ = spawn_bilingual_generation(
             state,
             media,
@@ -3191,6 +3309,13 @@ pub(crate) async fn translated_subtitle_stream_response(
         )
         .await;
     }
+    let staged = staged_bilingual_vtt(state, media, first, second)
+        .await
+        .unwrap_or_default();
+    let Some((content_type, body)) = external_subtitle_content(&staged, "vtt", requested_format)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     (
         [
             (header::CONTENT_TYPE, content_type),
@@ -3344,7 +3469,16 @@ pub(crate) fn selected_web_subtitle_stream_id(
             return stream_id;
         }
     }
-    let primary = effective_plex_language_settings(state).3;
+    let effective_primary = effective_plex_language_settings(state).3;
+    let primary = if effective_primary == "off" {
+        state
+            .config
+            .lock()
+            .map(|config| config.subtitle_language_primary.clone())
+            .unwrap_or(effective_primary)
+    } else {
+        effective_primary
+    };
     if primary == "off" {
         return 0;
     }
@@ -5409,6 +5543,7 @@ pub(crate) fn iso_639_2_bibliographic_alias(code: &str) -> Option<&'static str> 
 struct PlexBilingualStream {
     extension: &'static str,
     pending: bool,
+    generating: bool,
 }
 
 pub(crate) async fn add_plex_technical_metadata(
@@ -5419,8 +5554,22 @@ pub(crate) async fn add_plex_technical_metadata(
     let info = media_info_for(state, media)
         .await
         .unwrap_or_else(|| serde_json::json!({"media": {"track": []}}));
-    let (_, audio_language_primary, audio_language_secondary, _, _) =
-        effective_plex_language_settings(state);
+    let (
+        _bilingual_enabled,
+        audio_language_primary,
+        audio_language_secondary,
+        subtitle_language_primary,
+        _subtitle_language_secondary,
+    ) = effective_plex_language_settings(state);
+    let subtitle_default_language = if subtitle_language_primary == "off" {
+        state
+            .config
+            .lock()
+            .map(|config| config.subtitle_language_primary.clone())
+            .unwrap_or_else(|_| subtitle_language_primary.clone())
+    } else {
+        subtitle_language_primary
+    };
     let (enabled, language_primary, language_secondary) = configured_bilingual_languages(state);
     let external_subtitles = if enabled {
         if state
@@ -5454,11 +5603,22 @@ pub(crate) async fn add_plex_technical_metadata(
         )
         .is_file()
     });
+    let has_checkpoint =
+        bilingual_checkpoint_path(state, media, &language_primary, &language_secondary).is_file();
+    let selected_stream_id = stored_plex_stream_selection(state, media)
+        .and_then(|selection| selection.subtitle_stream_id);
+    let translated_stream_id =
+        plex_translated_subtitle_id(media, &language_primary, &language_secondary);
+    let selected_checkpoint = selected_stream_id == Some(translated_stream_id);
     let translation_stream =
         (enabled && language_primary != language_secondary && !has_requested_bilingual_file)
             .then_some(PlexBilingualStream {
                 extension: saved_translation_extension.unwrap_or("srt"),
-                pending: saved_translation_extension.is_none(),
+                pending: saved_translation_extension.is_none()
+                    && (!has_checkpoint || !selected_checkpoint),
+                generating: saved_translation_extension.is_none()
+                    && has_checkpoint
+                    && selected_checkpoint,
             });
     let selection = stored_plex_stream_selection(state, media);
     apply_plex_technical_metadata(
@@ -5471,6 +5631,7 @@ pub(crate) async fn add_plex_technical_metadata(
         audio_language_secondary.as_deref(),
         &language_primary,
         &language_secondary,
+        &subtitle_default_language,
         translation_stream,
     );
 }
@@ -5521,6 +5682,7 @@ fn apply_plex_technical_metadata(
     audio_language_secondary: Option<&str>,
     language_primary: &str,
     language_secondary: &str,
+    subtitle_default_language: &str,
     translation_stream: Option<PlexBilingualStream>,
 ) {
     let tracks = technical_tracks(info);
@@ -5744,12 +5906,19 @@ fn apply_plex_technical_metadata(
         let language = plex_language(language_primary);
         let display_title = if translation.pending {
             format!("{label} (generate)")
+        } else if translation.generating {
+            format!("{label} (generating…)")
         } else {
             label.clone()
         };
         let extra_info = if translation.pending {
             format!(
                 "{} External • Generate",
+                translation.extension.to_ascii_uppercase()
+            )
+        } else if translation.generating {
+            format!(
+                "{} External • Generating",
                 translation.extension.to_ascii_uppercase()
             )
         } else {
@@ -5765,6 +5934,7 @@ fn apply_plex_technical_metadata(
             "displayTitle": display_title, "extendedDisplayTitle": extra_info, "title": extra_info,
             "external": true, "key": format!("/library/streams/{id}"), "default": false,
             "selected": false, "pending": translation.pending, "bilingual": true,
+            "generating": translation.generating,
             "forced": false
         }));
     }
@@ -5780,7 +5950,7 @@ fn apply_plex_technical_metadata(
         {
             Some(stream_id)
         }
-        _ => plex_default_subtitle_stream_id(&plex_streams, &language_primary),
+        _ => plex_default_subtitle_stream_id(&plex_streams, subtitle_default_language),
     };
     for stream in &mut plex_streams {
         if plex_stream_is_subtitle(stream) {
@@ -7534,11 +7704,27 @@ async fn subtitle_tracks(
             let saved = ["srt", "vtt", "ass"].into_iter().any(|extension| {
                 configured_bilingual_subtitle_path(state, media, first, second, extension).is_file()
             });
+            let checkpoint = bilingual_checkpoint_path(state, media, first, second).is_file();
+            let selected_checkpoint = stored_plex_stream_selection(state, media)
+                .and_then(|selection| selection.subtitle_stream_id)
+                == Some(stream_id);
             let language_pair = format!("{} + {}", plex_language(first).1, plex_language(second).1);
-            let label = format!("Bilingual: {language_pair}");
             if saved {
                 tracks.push(SubtitleTrack {
-                    label,
+                    label: format!("Bilingual: {language_pair}"),
+                    url: format!(
+                        "/web/subtitle?{}path={}&bilingual=1",
+                        library_query,
+                        url_encode(&relative.to_string_lossy())
+                    ),
+                    stream_id,
+                    language: Some(first.clone()),
+                    bilingual: true,
+                    pending_bilingual: false,
+                });
+            } else if checkpoint && selected_checkpoint {
+                tracks.push(SubtitleTrack {
+                    label: format!("{language_pair} (generating…)"),
                     url: format!(
                         "/web/subtitle?{}path={}&bilingual=1",
                         library_query,
