@@ -9513,6 +9513,7 @@ async fn web_ui_pages_show_the_build_version_and_commit() {
         );
         assert!(page.contains(&expected), "{path} is missing {expected}");
         assert!(page.contains("position:fixed;left:.75rem;bottom:.65rem"));
+        assert!(page.contains("scrollbar-gutter:stable"));
         assert!(page.contains("box-sizing:border-box;width:100%;height:100%"));
     }
 }
