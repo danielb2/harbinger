@@ -4106,8 +4106,8 @@ pub(crate) async fn web_client(
     .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }}
     .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }}
     .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }}
-    .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }}
-    .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }}
+    .media-card-menu {{ position: absolute; right: 0; bottom: 0; z-index: 4; }}
+    .media-card-menu summary {{ display: grid; min-width: 1.5rem; padding: .2rem .4rem; place-items: center; border: 0; border-radius: .35rem 0 0 0; color: #fff; background: rgba(17,24,39,.8); font-size: .85rem; font-weight: 700; line-height: 1; list-style: none; cursor: pointer; }}
     .media-card-menu summary::-webkit-details-marker {{ display: none; }}
     .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }}
     .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }}
