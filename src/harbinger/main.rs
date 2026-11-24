@@ -3036,6 +3036,7 @@ fn vtt_with_notice(vtt: &str, fallback_start: Option<&str>, notice: &str) -> Opt
     Some(output)
 }
 
+#[cfg(test)]
 fn vtt_with_incomplete_notice(vtt: &str, fallback_start: Option<&str>) -> Option<String> {
     vtt_with_notice(vtt, fallback_start, BILINGUAL_INCOMPLETE_NOTICE)
 }
