@@ -1,0 +1,3 @@
+- no_the: don't sort using "the" when showing a library
+- search: we need to be able to search all media
+- no_doubles: don't show double episodes

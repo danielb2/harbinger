@@ -24,7 +24,8 @@ image:
         exit 1
     fi
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker buildx build --load --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbinger:latest .
+    git_commit="$(git rev-parse --short=7 HEAD)"
+    docker buildx build --load --build-arg "GIT_COMMIT=$git_commit" --build-arg "IMAGE_BUILD_DATE=$build_date" -t harbinger:latest .
 
 # build and publish docker image
 publish tag="latest":
@@ -41,8 +42,9 @@ publish tag="latest":
     arm64_image="${image}-arm64"
     gh auth token | docker login ghcr.io --username "$username" --password-stdin
     build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    docker buildx build --platform linux/amd64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$amd64_image" .
-    docker buildx build --platform linux/arm64 --push --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$arm64_image" .
+    git_commit="$(git rev-parse --short=7 HEAD)"
+    docker buildx build --platform linux/amd64 --push --build-arg "GIT_COMMIT=$git_commit" --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$amd64_image" .
+    docker buildx build --platform linux/arm64 --push --build-arg "GIT_COMMIT=$git_commit" --build-arg "IMAGE_BUILD_DATE=$build_date" -t "$arm64_image" .
     docker buildx imagetools create --tag "$image" "$amd64_image" "$arm64_image"
 
 # build and publish the non-stable nightly docker image

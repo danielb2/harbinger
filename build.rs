@@ -52,7 +52,7 @@ fn main() {
         .filter(|value| value.chars().all(|character| character.is_ascii_hexdigit()))
         .or_else(|| git_output(manifest_dir, &["rev-parse", "--short=12", "HEAD"]))
         .filter(|value| value.len() >= 7)
-        .map(|value| value.chars().take(12).collect::<String>())
+        .map(|value| value.chars().take(7).collect::<String>())
         .unwrap_or_else(|| "unknown".to_owned());
     println!("cargo:rustc-env=HARBINGER_GIT_COMMIT={commit}");
 }
