@@ -20,11 +20,10 @@ use super::{
     plex_webhook_event_for_transition, render_metadata_info_panel, render_season_description_panel,
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
-    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, web_title_sort_key, ConfigLibrary,
-    HeaderMap, HeaderValue, Media, PathBuf, PlexBilingualStream, PlexStreamSelection,
-    TvEpisodeInfo, Uri,
+    tv_metadata_with_season_details, tv_show_title, unwatched_episode_count, vtt_to_srt,
+    web_title_sort_key, ConfigLibrary, HeaderMap, HeaderValue, Media, PathBuf, PlexBilingualStream,
+    PlexStreamSelection, TvEpisodeInfo, Uri,
 };
-
 #[test]
 fn plex_request_token_reads_header_or_query_parameter() {
     let headers = HeaderMap::new();
@@ -632,6 +631,7 @@ fn missing_cover_markup_uses_a_readable_fallback() {
         None,
         None,
         0.0,
+        None,
         std::path::Path::new("Missing Show/Episode.mkv"),
         0,
         true,
@@ -1600,4 +1600,86 @@ fn generating_notice_is_replaced_by_rate_limit_notice() {
     assert!(result
         .trim_end()
         .ends_with("00:00:01.000 --> 09:00:00.000\nGoogle Translate rate limit reached. Wait a while and try again."));
+}
+
+fn unwatched_test_media(id: &str, path: &str) -> Media {
+    Media {
+        id: id.to_owned(),
+        title: id.to_owned(),
+        path: PathBuf::from(path),
+        size: 0,
+        container: "mkv".to_owned(),
+        mime: "video/x-matroska".to_owned(),
+        metadata_revision: 0,
+    }
+}
+
+#[test]
+fn unwatched_episode_count_deduplicates_episode_files_and_tracks_progress() {
+    let root = PathBuf::from("Library");
+    let episode_one_a =
+        unwatched_test_media("ep1a", "Library/Show/Season 01/Show S01E01 - Pilot.mkv");
+    let episode_one_b = unwatched_test_media(
+        "ep1b",
+        "Library/Show/Season 01/Show S01E01 - Pilot.720p.mkv",
+    );
+    let episode_two =
+        unwatched_test_media("ep2", "Library/Show/Season 01/Show S01E02 - Second.mkv");
+    let episodes = [&episode_one_a, &episode_one_b, &episode_two];
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "ep1a".to_owned(),
+        serde_json::json!({"mplex_view_count": 1}),
+    );
+    metadata.insert(
+        "ep1b".to_owned(),
+        serde_json::json!({"mplex_view_count": 0}),
+    );
+    metadata.insert(
+        "ep2".to_owned(),
+        serde_json::json!({"mplex_view_count": 0, "mplex_view_offset": 500}),
+    );
+
+    assert_eq!(
+        unwatched_episode_count(&episodes, &[root.clone()], &metadata),
+        1
+    );
+
+    metadata.insert("ep2".to_owned(), serde_json::json!({"mplex_view_count": 2}));
+    assert_eq!(unwatched_episode_count(&episodes, &[root], &metadata), 0);
+}
+
+#[test]
+fn tv_show_cover_badge_shows_unwatched_count_or_checkmark() {
+    let card = |unwatched| {
+        super::media_cover_card(
+            None,
+            "/web?library=0",
+            "Badge Show",
+            None,
+            None,
+            0.0,
+            Some(unwatched),
+            std::path::Path::new("Badge Show/Episode.mkv"),
+            0,
+            true,
+            true,
+            "show",
+            false,
+        )
+    };
+
+    let counted = card(3);
+    assert!(counted.contains("media-card-unwatched"));
+    assert!(counted.contains(">3</span>"));
+    assert!(counted.contains("3 unwatched episodes"));
+    assert!(counted.contains("right:0;top:0"));
+    assert!(counted.contains("background:rgba(17,24,39,.8)"));
+    assert!(counted.contains("color:#fff"));
+    assert!(!counted.contains("opacity:.8"));
+
+    let watched = card(0);
+    assert!(watched.contains(">✓</span>"));
+    assert!(watched.contains("No unwatched episodes"));
+    assert!(!watched.contains(">0</span>"));
 }

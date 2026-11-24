@@ -3559,6 +3559,7 @@ pub(crate) async fn web_client(
                 Some(&format!("{} episodes", episodes.len())),
                 None,
                 average_media_progress(episodes, &section_metadata),
+                None,
                 representative_path,
                 query.library.unwrap_or_default(),
                 false,
@@ -3597,6 +3598,7 @@ pub(crate) async fn web_client(
                 episode_number.as_deref(),
                 relative.file_name().and_then(|name| name.to_str()),
                 item_metadata.map(media_card_progress).unwrap_or_default(),
+                None,
                 episode_path,
                 query.library.unwrap_or_default(),
                 true,
@@ -3718,6 +3720,11 @@ pub(crate) async fn web_client(
                     };
 
                     let progress = average_media_progress(&show.episodes, &section_metadata);
+                    let unwatched = unwatched_episode_count(
+                        &show.episodes,
+                        &library.folders,
+                        &section_metadata,
+                    );
                     let season_count = show
                         .episodes
                         .iter()
@@ -3754,6 +3761,7 @@ pub(crate) async fn web_client(
                         Some(&season_label),
                         None,
                         progress,
+                        Some(unwatched),
                         representative_path,
                         library_index,
                         true,
@@ -3846,6 +3854,7 @@ pub(crate) async fn web_client(
                             Some(&format!("{episode_count} episodes")),
                             None,
                             progress,
+                            None,
                             representative
                                 .path
                                 .strip_prefix(&library_root)
@@ -3941,6 +3950,7 @@ pub(crate) async fn web_client(
                     episode_number.as_deref(),
                     show_title.as_deref(),
                     progress,
+                    None,
                     &child_relative,
                     library,
                     true,
@@ -6196,6 +6206,7 @@ pub(crate) fn media_card(
         subtitle.as_deref(),
         details.as_deref(),
         progress,
+        None,
         media_path,
         library,
         tv,
@@ -6667,6 +6678,29 @@ pub(crate) fn average_media_progress(
         })
         .sum::<f64>()
         / media.len() as f64
+}
+
+pub(crate) fn unwatched_episode_count(
+    episodes: &[&Media],
+    roots: &[PathBuf],
+    metadata: &HashMap<String, serde_json::Value>,
+) -> usize {
+    let mut groups = BTreeMap::<(u32, u32, String), bool>::new();
+    for media in episodes {
+        let key = roots
+            .iter()
+            .find(|root| media.path.starts_with(*root))
+            .and_then(|root| tv_episode_info(root, &media.path))
+            .map(|episode| (episode.season, episode.episode, String::new()))
+            .unwrap_or_else(|| (1, u32::MAX, media.id.clone()));
+        let watched = metadata
+            .get(&media.id)
+            .and_then(|item| item.get("mplex_view_count"))
+            .and_then(serde_json::Value::as_i64)
+            .is_some_and(|count| count > 0);
+        *groups.entry(key).or_insert(false) |= watched;
+    }
+    groups.values().filter(|watched| !**watched).count()
 }
 
 pub(crate) fn folder_card_with_badge(

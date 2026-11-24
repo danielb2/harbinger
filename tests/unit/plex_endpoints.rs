@@ -5579,6 +5579,7 @@ async fn web_tv_library_lists_and_navigates_shows_from_all_folders() {
     .unwrap();
     assert!(body.contains("Another Show"));
     assert!(body.contains("folder=1&amp;path=Another%20Show"));
+    assert!(body.contains("media-card-unwatched"));
 
     let response = send(
         &fixture.app,

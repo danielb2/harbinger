@@ -14,7 +14,7 @@ pub(crate) use api::{
     contains_hidden_component, media_card, media_card_action_script, ordered_continue_paths,
     render_metadata_info_panel, render_season_description_panel, render_toml_details,
     render_tv_show_metadata_details, sidebar_nav_with_library_links, sidebar_nav_with_settings,
-    web_title_sort_key,
+    unwatched_episode_count, web_title_sort_key,
 };
 
 pub(crate) use crate::plex::api::{
@@ -7918,6 +7918,7 @@ fn media_cover_card(
     subtitle: Option<&str>,
     details: Option<&str>,
     progress: f64,
+    unwatched: Option<usize>,
     media_path: &std::path::Path,
     library: usize,
     tv_card: bool,
@@ -7972,6 +7973,29 @@ fn media_cover_card(
     } else {
         "media-card"
     };
+    let unwatched_badge = unwatched
+        .map(|count| {
+            let (label, aria) = if count == 0 {
+                (
+                    "✓".to_owned(),
+                    "No unwatched episodes".to_owned(),
+                )
+            } else {
+                (
+                    count.to_string(),
+                    format!(
+                        "{count} unwatched episode{}",
+                        if count == 1 { "" } else { "s" }
+                    ),
+                )
+            };
+            format!(
+                r#"<span class="media-card-unwatched" aria-label="{}" style="position:absolute;right:0;top:0;z-index:2;min-width:1.5rem;padding:.2rem .4rem;border-radius:0 0 0 .35rem;color:#fff;background:rgba(17,24,39,.8);font-size:.85rem;font-weight:700;line-height:1;text-align:center">{}</span>"#,
+                html(&aria),
+                html(&label)
+            )
+        })
+        .unwrap_or_default();
     let card_style = "align-self:start;background:rgba(31,41,55,.3);padding:.7rem";
     let card_info_style = " style=\"box-sizing:border-box;height:4rem;padding-top:0;gap:0;grid-template-rows:1rem 1rem 1rem 1rem\"";
     let title_style = " style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\"";
@@ -8000,7 +8024,7 @@ fn media_cover_card(
         String::new()
     };
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
         path,
@@ -8010,6 +8034,7 @@ fn media_cover_card(
         watch_key,
         html(href),
         cover,
+        unwatched_badge,
         path,
         library,
         watch_scope,
