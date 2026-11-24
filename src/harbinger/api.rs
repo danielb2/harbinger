@@ -2944,7 +2944,7 @@ pub(crate) fn web_title_sort_key(title: &str) -> String {
 }
 
 fn global_search_top_style() -> &'static str {
-    r#"<style>.with-global-topbar{padding-top:0!important}.app-shell:has(.global-topbar) main{padding-top:0!important}.global-topbar{position:sticky;top:0;z-index:30;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;background:#0b1020}</style>"#
+    r#"<style>.with-global-topbar{padding-top:0!important}.app-shell:has(.global-topbar) main{padding-top:0!important}.global-topbar{position:sticky;top:0;z-index:30;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;background:transparent;border-bottom:0}</style>"#
 }
 
 pub(crate) async fn web_search(
@@ -4884,6 +4884,12 @@ pub(crate) async fn web_client(
         if (event.target instanceof HTMLVideoElement) window.__mplexSelectedVideo = event.target;
       }});
       document.addEventListener("keydown", event => {{
+      if (event.key === "Escape" && window.document.fullscreenElement) {{
+        event.preventDefault();
+        window.document.exitFullscreen().catch(() => {{}});
+        return;
+      }}
+      if (event.target instanceof Element && event.target.closest("input, textarea, select, [contenteditable='true']")) return;
       const fullscreen = event.key.toLowerCase() === "f";
       const theatre = event.key.toLowerCase() === "t";
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight" && event.code !== "Space" && !fullscreen && !theatre) return;
@@ -5983,7 +5989,7 @@ fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &
 }
 
 fn global_search_markup() -> &'static str {
-    r##"<style>.global-topbar{position:relative;display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;border-bottom:1px solid #263244}.global-topbar-form{position:relative;width:100%}.global-topbar-form input{box-sizing:border-box;width:100%;min-height:2.15rem;padding:.35rem .65rem;border:1px solid #374151;border-radius:.5rem;color:#fff;background:#111827}@media(max-width:700px){.global-topbar{margin-bottom:.5rem}}</style><header class="global-topbar"><form class="global-topbar-form" id="global-media-search-form" role="search" action="/" method="get"><input id="global-media-search" name="search" type="search" value="" placeholder="Search…" aria-label="Search all media" autocomplete="off"><div id="global-media-search-results" role="status" aria-live="polite" hidden style="position:absolute;top:calc(100% + .4rem);left:0;right:0;z-index:60;max-height:65vh;overflow:auto;padding:.55rem;border:1px solid #374151;border-radius:.55rem;background:#0b1020;box-shadow:0 12px 28px #0009"></div></form></header><script>
+    r##"<style>.global-topbar{position:relative;display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;border-bottom:0;background:transparent}.global-topbar-form{position:relative;width:100%}.global-topbar-form input{box-sizing:border-box;width:100%;min-height:2.15rem;padding:.35rem .65rem;border:1px solid #374151;border-radius:.5rem;color:#fff;background:rgba(17,24,39,.8)}@media(max-width:700px){.global-topbar{margin-bottom:.5rem}}</style><header class="global-topbar"><form class="global-topbar-form" id="global-media-search-form" role="search" action="/" method="get"><input id="global-media-search" name="search" type="search" value="" placeholder="Search…" aria-label="Search all media" autocomplete="off"><div id="global-media-search-results" role="status" aria-live="polite" hidden style="position:absolute;top:calc(100% + .4rem);left:0;right:0;z-index:60;max-height:65vh;overflow:auto;padding:.55rem;border:1px solid #374151;border-radius:.55rem;background:#0b1020;box-shadow:0 12px 28px #0009"></div></form></header><script>
 if (!window.__mplexGlobalSearchBound) {
   window.__mplexGlobalSearchBound = true;
   let searchTimer;

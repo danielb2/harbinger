@@ -6003,6 +6003,8 @@ async fn home_page_search_returns_matching_media_and_empty_state() {
     );
     assert!(body.contains(".global-topbar-form{position:relative;width:100%}"));
     assert!(body.contains("min-height:2.15rem"));
+    assert!(body.contains("background:transparent;border-bottom:0"));
+    assert!(body.contains("background:rgba(17,24,39,.8)"));
     assert!(body.contains(".with-global-topbar{padding-top:0!important}"));
     assert!(body.contains("/web/search?query="));
     assert!(!body.contains("id=\"media-search\""));
@@ -6279,6 +6281,10 @@ async fn tv_episode_view_uses_episode_description_in_the_shared_card_location() 
     assert!(body.contains("An episode description"));
     assert!(!body.contains("A season description"));
     assert!(!body.contains("A show description"));
+    assert!(body
+        .contains("event.target.closest(\"input, textarea, select, [contenteditable='true']\")"));
+    assert!(body.contains("event.key === \"Escape\" && window.document.fullscreenElement"));
+    assert!(body.contains("window.document.exitFullscreen().catch"));
 }
 
 #[tokio::test]
