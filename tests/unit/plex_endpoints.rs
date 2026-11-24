@@ -3199,6 +3199,45 @@ async fn marking_a_tv_episode_watched_shows_the_next_episode_in_continue_watchin
 }
 
 #[tokio::test]
+async fn plex_dashboard_shows_the_next_episode_after_an_episode_is_watched() {
+    let fixture = tv_fixture();
+    let watched = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/watch-action")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"path":"Example Show/Season 01/Example.Show.S01E01.Pilot.mkv","library":0,"action":"watched"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watched.status(), StatusCode::NO_CONTENT);
+
+    let dashboard = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(dashboard.status(), StatusCode::OK);
+    let dashboard: serde_json::Value =
+        serde_json::from_slice(&to_bytes(dashboard.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    let items = dashboard["MediaContainer"]["Hub"][0]["Metadata"]
+        .as_array()
+        .unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["index"], 2);
+    assert_eq!(items[0]["title"], "Episode 1");
+}
+
+#[tokio::test]
 async fn continue_watching_shows_only_the_first_unwatched_episode_per_show() {
     let fixture = tv_fixture();
     for (path, position_ms) in [
@@ -5938,6 +5977,94 @@ async fn home_page_renders_the_fix_match_dialog_for_home_card_actions() {
     assert!(body.contains("id=\"tv-fix-match-dialog\""));
     assert!(body.contains("id=\"tv-fix-match-search\""));
     assert!(body.contains("if (!fixMatchDialog || !fixMatchQuery"));
+}
+
+#[tokio::test]
+async fn home_page_search_returns_matching_media_and_empty_state() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/?search=Demo", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("Search all media"));
+    assert!(body.contains("id=\"global-media-search\""));
+    assert!(
+        body.find("<aside class=\"sidebar\">").unwrap()
+            < body.find("class=\"global-topbar\"").unwrap()
+    );
+    assert!(body.find("<main").unwrap() < body.find("class=\"global-topbar\"").unwrap());
+    assert!(
+        body.contains("position:sticky;top:0;z-index:30;width:100%;min-height:0;margin:0 0 .65rem")
+    );
+    assert!(body.contains(".global-topbar-form{position:relative;width:100%}"));
+    assert!(body.contains("min-height:2.15rem"));
+    assert!(body.contains(".with-global-topbar{padding-top:0!important}"));
+    assert!(body.contains("/web/search?query="));
+    assert!(!body.contains("id=\"media-search\""));
+    assert!(body.contains("<h2>Search results</h2>"));
+    assert!(body.contains("data-media-path=\"Demo.mkv\""));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/?search=not-a-real-title",
+        Body::empty(),
+    )
+    .await;
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("No matching media found"));
+}
+
+#[tokio::test]
+async fn web_search_endpoint_returns_results_for_live_search() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/search?query=Demo",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(body.contains("data-media-path=\"Demo.mkv\""));
+}
+
+#[tokio::test]
+async fn web_media_library_deduplicates_the_same_canonical_file() {
+    let fixture = fixture();
+    let mut media = fixture.state.media.read().unwrap().as_ref().clone();
+    media.push(media[0].clone());
+    *fixture.state.media.write().unwrap() = Arc::new(media);
+
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert_eq!(body.matches("data-media-path=\"Demo.mkv\"").count(), 1);
+    assert!(body.contains("id=\"global-media-search\""));
 }
 
 fn rendered_breadcrumb(body: &str) -> String {

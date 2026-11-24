@@ -13,6 +13,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/web/dashboard/stats", get(dashboard_stats))
+        .route("/web/search", get(web_search))
         .route("/web/stream", any(web_stream))
         .route("/web/index.html", get(web_index_redirect))
         .route("/web/", get(web_index_redirect))
@@ -1467,7 +1468,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 {dashboard_styles_html}
 .settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
 </style></head><body><div class="app-shell">{}
-<main><header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
+<main class="with-global-topbar">{}<header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbinger to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbinger.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata, artwork, and skip markers are written only to the selected location. Config mode never writes to media folders.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
@@ -1626,6 +1627,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
 }}
 </script>{dashboard_script_html}</body></html>"#,
         sidebar_nav_for_settings(&state),
+        format!("{}{}", global_search_markup(), global_search_top_style()),
         error,
         notice,
         settings_stack_style,
@@ -2646,7 +2648,7 @@ pub(crate) fn selected_library_folder_root(
         .unwrap_or_else(|| state.root.as_ref().clone())
 }
 
-pub(crate) async fn home_client(State(state): State<AppState>) -> Response {
+pub(crate) async fn home_client(State(state): State<AppState>, search: Option<String>) -> Response {
     let Ok(config) = state.config.lock().map(|config| config.clone()) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -2865,10 +2867,56 @@ pub(crate) async fn home_client(State(state): State<AppState>) -> Response {
     if recent.is_empty() {
         recent = "<p class=\"note empty-state\">No recently added media yet.</p>".to_owned();
     }
-    Html(add_build_info_footer(format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
-        POSTER_CARD_MIN_WIDTH, sidebar_nav_for(&state, std::path::Path::new(""), None), continue_watching, recent, libraries, fix_match_dialog_markup(), media_card_action_script(), spa_navigation_script()
-    ))).into_response()
+    let search_term = search.as_deref().unwrap_or_default().trim();
+    let search_section = if search_term.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<section class=\"section\"><h2>Search results</h2>{}</section>",
+            web_search_results_markup(
+                search_term,
+                &config.libraries,
+                &metadata_by_library,
+                &media_index,
+            )
+        )
+    };
+    let sidebar_markup = sidebar_nav_for(&state, std::path::Path::new(""), None);
+    let search_markup = format!("{}{}", global_search_markup(), global_search_top_style()).replace(
+        "name=\"search\" type=\"search\" value=\"\"",
+        &format!(
+            "name=\"search\" type=\"search\" value=\"{}\"",
+            html(search_term)
+        ),
+    );
+    let mut home_page = format!(
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><form class="section" method="get" action="/" role="search"><label for="media-search">Search all media</label><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="media-search" name="search" type="search" value="{}" style="flex:1;min-width:0;padding:.7rem;border:1px solid #374151;border-radius:.45rem;color:#fff;background:#0d1421" autocomplete="off"><button type="submit">Search</button></div></form>{}<section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        POSTER_CARD_MIN_WIDTH,
+        sidebar_markup,
+        html(search_term),
+        search_section,
+        continue_watching,
+        recent,
+        libraries,
+        fix_match_dialog_markup(),
+        media_card_action_script(),
+        spa_navigation_script()
+    );
+    if let Some(start) =
+        home_page.find("<form class=\"section\" method=\"get\" action=\"/\" role=\"search\">")
+    {
+        if let Some(end) = home_page[start..].find("</form>") {
+            home_page.replace_range(start..start + end + "</form>".len(), "");
+        }
+    }
+    home_page = home_page.replace(
+        "<main><h1>Home</h1>",
+        &format!(
+            "<main class=\"with-global-topbar\">{}<h1>Home</h1>",
+            search_markup
+        ),
+    );
+    Html(add_build_info_footer(home_page)).into_response()
 }
 
 pub(crate) fn ordered_continue_paths(mut candidates: Vec<(String, i64)>) -> Vec<String> {
@@ -2883,6 +2931,128 @@ pub(crate) fn ordered_continue_paths(mut candidates: Vec<(String, i64)>) -> Vec<
         .filter_map(|(path, _)| seen.insert(path.clone()).then_some(path))
         .take(12)
         .collect()
+}
+
+pub(crate) fn web_title_sort_key(title: &str) -> String {
+    let title = title.trim();
+    let sortable = title
+        .get(..4)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("the "))
+        .map(|_| &title[4..])
+        .unwrap_or(title);
+    sortable.to_lowercase()
+}
+
+fn global_search_top_style() -> &'static str {
+    r#"<style>.with-global-topbar{padding-top:0!important}.app-shell:has(.global-topbar) main{padding-top:0!important}.global-topbar{position:sticky;top:0;z-index:30;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;background:#0b1020}</style>"#
+}
+
+pub(crate) async fn web_search(
+    State(state): State<AppState>,
+    Query(query): Query<WebSearchQuery>,
+) -> Response {
+    let Ok(config) = state.config.lock().map(|config| config.clone()) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let metadata = config
+        .libraries
+        .iter()
+        .enumerate()
+        .map(|(index, _)| plex_section_metadata(&state, index + 1))
+        .collect::<Vec<_>>();
+    let media = media_snapshot(&state);
+    Html(web_search_results_markup(
+        query.query.as_deref().unwrap_or_default().trim(),
+        &config.libraries,
+        &metadata,
+        &media,
+    ))
+    .into_response()
+}
+
+fn web_search_results_markup(
+    query: &str,
+    libraries: &[ConfigLibrary],
+    metadata_by_library: &[HashMap<String, serde_json::Value>],
+    media_index: &[Media],
+) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let needle = query.to_lowercase();
+    let mut cards = String::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut seen_episodes = std::collections::HashSet::new();
+    let mut searchable_media = media_index.iter().collect::<Vec<_>>();
+    searchable_media.sort_by_key(|media| web_title_sort_key(&media.title));
+    for media in searchable_media {
+        let Some((library_index, library, root)) =
+            libraries.iter().enumerate().find_map(|(index, library)| {
+                let root = library
+                    .folders
+                    .iter()
+                    .find(|root| media.path.starts_with(*root))?;
+                media_in_library(media, library).then_some((index, library, root))
+            })
+        else {
+            continue;
+        };
+        let canonical_path =
+            std::fs::canonicalize(&media.path).unwrap_or_else(|_| media.path.clone());
+        if !seen_paths.insert(canonical_path) {
+            continue;
+        }
+        let metadata = metadata_by_library
+            .get(library_index)
+            .and_then(|items| items.get(&media.id));
+        let title = metadata
+            .and_then(|item| item.get("title").or_else(|| item.get("name")))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&media.title);
+        let original_title_matches = metadata
+            .and_then(|item| item.get("originalTitle"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|title| title.to_lowercase().contains(&needle));
+        if !title.to_lowercase().contains(&needle) && !original_title_matches {
+            continue;
+        }
+        if library.kind == "tv" {
+            if let Some(episode) = tv_episode_info(root, &media.path) {
+                let show = media
+                    .path
+                    .strip_prefix(root)
+                    .ok()
+                    .and_then(|path| path.components().next())
+                    .map(|part| part.as_os_str().to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !seen_episodes.insert((library_index, show, episode.season, episode.episode)) {
+                    continue;
+                }
+            }
+        }
+        let Some(relative_media) = media.path.strip_prefix(root).ok() else {
+            continue;
+        };
+        let relative_folder = relative_media.parent().unwrap_or(std::path::Path::new(""));
+        cards.push_str(&media_card(
+            media,
+            library,
+            metadata,
+            root,
+            relative_folder,
+            relative_media,
+            library_index,
+            false,
+        ));
+    }
+    if cards.is_empty() {
+        format!(
+            "<p class=\"note empty-state\" role=\"status\">No matching media found for “{}”.</p>",
+            html(query)
+        )
+    } else {
+        format!("<div class=\"global-search-results-list\" style=\"display:grid;grid-template-columns:repeat(auto-fill,minmax(8rem,1fr));gap:.5rem\">{cards}</div>")
+    }
 }
 
 pub(crate) async fn library_artwork(
@@ -3339,6 +3509,7 @@ pub(crate) async fn web_client(
         .map(|folder| format!("&folder={folder}"))
         .unwrap_or_default();
     if virtual_tv_view {
+        let mut seen_episodes = std::collections::HashSet::new();
         for media in media_index.iter() {
             if !media
                 .path
@@ -3348,6 +3519,12 @@ pub(crate) async fn web_client(
                 continue;
             }
             if let Some(season) = tv_season_number(&library_root, &media.path) {
+                let episode_key = tv_episode_info(&library_root, &media.path)
+                    .map(|episode| format!("{season}:{}", episode.episode))
+                    .unwrap_or_else(|| format!("{season}:{}", media.id));
+                if !seen_episodes.insert(episode_key) {
+                    continue;
+                }
                 virtual_seasons.entry(season).or_default().push(media);
             }
         }
@@ -3448,10 +3625,18 @@ pub(crate) async fn web_client(
     }
     if library_top_level && !files_view {
         if let (Some(library_index), Some(library)) = (query.library, library_config.as_ref()) {
-            let media = media_index
+            let mut media = media_index
                 .iter()
                 .filter(|item| media_in_library(item, library))
                 .collect::<Vec<_>>();
+            media.sort_by(|left, right| {
+                web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
+            });
+            let mut seen_paths = std::collections::HashSet::new();
+            media.retain(|item| {
+                let path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
+                seen_paths.insert(path)
+            });
             if is_audiobook_library(&library.kind) {
                 let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
                 if let Some(abs_library) = catalog
@@ -3499,9 +3684,12 @@ pub(crate) async fn web_client(
                     }
                 }
             } else if library.kind == "tv" {
-                for show in
-                    plex_tv_show_groups(library_index + 1, &library.folders, media.iter().copied())
-                {
+                let mut shows =
+                    plex_tv_show_groups(library_index + 1, &library.folders, media.iter().copied());
+                shows.sort_by(|left, right| {
+                    web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
+                });
+                for show in shows {
                     let Some(representative) = show.episodes.iter().max_by_key(|episode| {
                         section_metadata
                             .get(&episode.id)
@@ -3992,7 +4180,7 @@ pub(crate) async fn web_client(
 <body>
   <div class="app-shell">
     {}
-    <main{}>
+    <main{}>{}
     <h1>{}</h1>
     {}
     <section class="library">{}</section>
@@ -4761,6 +4949,7 @@ pub(crate) async fn web_client(
         POSTER_CARD_MIN_WIDTH,
         sidebar,
         pane_banner,
+        format!("{}{}", global_search_markup(), global_search_top_style()),
         page_heading,
         info_panel,
         items,
@@ -5768,7 +5957,7 @@ pub(crate) fn sidebar_nav_with_library_links(
 }
 
 fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &str) -> String {
-    format!(
+    let markup = format!(
         r#"<aside class="sidebar">
   <div class="sidebar-top">
     <a class="sidebar-brand" data-spa-link href="/">harbinger</a>
@@ -5778,7 +5967,7 @@ fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &
   <nav class="sidebar-nav" aria-label="Main navigation">
     <a class="sidebar-link {}" data-spa-link href="/"><span class="sidebar-icon">⌂</span>Home</a>
     {}
-    <a class="sidebar-link {}" href="/settings"><span class="sidebar-icon">⚙</span>Settings</a>
+    <a class="sidebar-link sidebar-settings {}" href="/settings" aria-label="Settings" title="Settings"><span class="sidebar-icon">⚙</span>Settings</a>
   </nav>
   <form method="post" action="/auth/logout" style="margin-top:1rem"><button type="submit" class="sidebar-link" style="width:100%;border:0;background:transparent;text-align:left;cursor:pointer"><span class="sidebar-icon">↪</span>Sign out</button></form>
 </aside>"#,
@@ -5789,7 +5978,48 @@ fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &
         },
         library_links,
         if settings_active { "active" } else { "" },
-    )
+    );
+    markup
+}
+
+fn global_search_markup() -> &'static str {
+    r##"<style>.global-topbar{position:relative;display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;border-bottom:1px solid #263244}.global-topbar-form{position:relative;width:100%}.global-topbar-form input{box-sizing:border-box;width:100%;min-height:2.15rem;padding:.35rem .65rem;border:1px solid #374151;border-radius:.5rem;color:#fff;background:#111827}@media(max-width:700px){.global-topbar{margin-bottom:.5rem}}</style><header class="global-topbar"><form class="global-topbar-form" id="global-media-search-form" role="search" action="/" method="get"><input id="global-media-search" name="search" type="search" value="" placeholder="Search…" aria-label="Search all media" autocomplete="off"><div id="global-media-search-results" role="status" aria-live="polite" hidden style="position:absolute;top:calc(100% + .4rem);left:0;right:0;z-index:60;max-height:65vh;overflow:auto;padding:.55rem;border:1px solid #374151;border-radius:.55rem;background:#0b1020;box-shadow:0 12px 28px #0009"></div></form></header><script>
+if (!window.__mplexGlobalSearchBound) {
+  window.__mplexGlobalSearchBound = true;
+  let searchTimer;
+  let searchRequest = 0;
+  document.addEventListener("input", event => {
+    const input = event.target.closest?.("#global-media-search");
+    if (!input) return;
+    const results = document.querySelector("#global-media-search-results");
+    if (!results) return;
+    const query = input.value.trim();
+    clearTimeout(searchTimer);
+    if (!query) { results.replaceChildren(); results.hidden = true; return; }
+    searchTimer = setTimeout(async () => {
+      const request = ++searchRequest;
+      results.hidden = false;
+      results.textContent = "Searching…";
+      try {
+        const response = await fetch(`/web/search?query=${encodeURIComponent(query)}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("Search failed.");
+        const markup = await response.text();
+        if (request !== searchRequest) return;
+        results.innerHTML = markup || '<p class="note">No matching media found.</p>';
+      } catch (_) {
+        if (request === searchRequest) results.textContent = "Search failed. Try again.";
+      }
+    }, 180);
+  });
+  document.addEventListener("focusout", event => {
+    if (event.target.closest?.("#global-media-search-form")) return;
+    document.querySelector("#global-media-search-results")?.setAttribute("hidden", "");
+  });
+  document.addEventListener("keydown", event => {
+    if (event.key === "Escape") document.querySelector("#global-media-search-results")?.setAttribute("hidden", "");
+  });
+}
+</script>"##
 }
 
 pub(crate) fn breadcrumb_nav(
@@ -6972,7 +7202,7 @@ pub(crate) async fn root_handler(
         {
             timed_web_client(s, query, uri.to_string()).await
         } else {
-            home_client(State(s)).await
+            home_client(State(s), query.search).await
         };
     }
     let is_plex_client = headers.contains_key("X-Plex-Product")
@@ -6991,7 +7221,7 @@ pub(crate) async fn root_handler(
     {
         timed_web_client(s, query, uri.to_string()).await
     } else {
-        home_client(State(s)).await
+        home_client(State(s), query.search).await
     }
 }
 

@@ -20,8 +20,9 @@ use super::{
     plex_webhook_event_for_transition, render_metadata_info_panel, render_season_description_panel,
     render_toml_details, render_tv_show_metadata_details, sidebar_nav_with_library_links,
     sidebar_nav_with_settings, srt_to_vtt, technical_duration_ms, technical_tracks,
-    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, ConfigLibrary, HeaderMap,
-    HeaderValue, Media, PathBuf, PlexBilingualStream, PlexStreamSelection, TvEpisodeInfo, Uri,
+    tv_metadata_with_season_details, tv_show_title, vtt_to_srt, web_title_sort_key, ConfigLibrary,
+    HeaderMap, HeaderValue, Media, PathBuf, PlexBilingualStream, PlexStreamSelection,
+    TvEpisodeInfo, Uri,
 };
 
 #[test]
@@ -846,6 +847,16 @@ fn continue_watching_orders_by_activity_and_deduplicates_paths() {
         ]
     );
 }
+
+#[test]
+fn web_library_title_sort_ignores_leading_the() {
+    assert_eq!(
+        web_title_sort_key("The Matrix"),
+        web_title_sort_key("Matrix")
+    );
+    assert!(web_title_sort_key("The Matrix") < web_title_sort_key("Zoolander"));
+    assert_eq!(web_title_sort_key("  THE Matrix "), "matrix");
+}
 #[test]
 fn extracts_plex_server_token() {
     assert_eq!(
@@ -962,6 +973,8 @@ fn sidebar_lists_libraries_directly_without_generic_library_item() {
     assert!(sidebar.contains("sidebar-toggle"));
     let settings = sidebar_nav_with_settings(true);
     assert!(settings.contains("href=\"/settings\""));
+    assert!(settings.contains("aria-label=\"Settings\" title=\"Settings\""));
+    assert!(settings.contains("<span class=\"sidebar-icon\">⚙</span>Settings</a>"));
     assert!(!settings.contains("<a class=\"sidebar-link active\" href=\"/\""));
 }
 #[test]

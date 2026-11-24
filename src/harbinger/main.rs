@@ -14,6 +14,7 @@ pub(crate) use api::{
     contains_hidden_component, media_card, media_card_action_script, ordered_continue_paths,
     render_metadata_info_panel, render_season_description_panel, render_toml_details,
     render_tv_show_metadata_details, sidebar_nav_with_library_links, sidebar_nav_with_settings,
+    web_title_sort_key,
 };
 
 pub(crate) use crate::plex::api::{
@@ -6659,6 +6660,7 @@ async fn ensure_tv_season_metadata(
 
 #[derive(Deserialize, Default)]
 pub(crate) struct WebPath {
+    pub(crate) search: Option<String>,
     pub(crate) path: Option<String>,
     pub(crate) library: Option<usize>,
     pub(crate) folder: Option<usize>,
@@ -6669,6 +6671,11 @@ pub(crate) struct WebPath {
     pub(crate) view: Option<String>,
     pub(crate) season: Option<u32>,
     pub(crate) bilingual: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct WebSearchQuery {
+    pub(crate) query: Option<String>,
 }
 
 pub(crate) fn next_tv_episode_paths(

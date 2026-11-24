@@ -3,6 +3,9 @@
 Project guidance for `harbinger`: the target is a 100% drop-in replacement for Plex's official Media Server. This includes documented PMS APIs and matching behavior in official Plex clients, including every client-visible capability and item menu. This is past the MVP stage; treat full compatibility as the goal, not a single-route or single-action milestone.
 
 ## Essential rules
+
+- Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, media logic, code architecture, and code-reuse. Home and Library presentation should share implementations where sensible. This way we minimize bugs from having a well-tested code path, not multiple.
+
 - Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
 - Read `FEATURES.md` before changing a user-facing feature covered there. Treat its user goals and acceptance conditions as requirements; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a feature contract, preserve the contract and find another implementation. Record regressions as regressions.
@@ -31,10 +34,10 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 - Whenever the project version is bumped, create a Git tag for that version after the version bump commit, using the `v` prefix (for example, `v0.1.1`).
 - Before work begins on a task refer to https://developer.plex.tv/pms and check offcial API for a solution rather than guessing or checking logs. also consolt implementations from https://github.com/debridmediamanager/rex, https://github.com/braedonsaunders/ether/, and https://github.com/edde746/plezy
 
-## rules/
-Rules are flat list with snake_case names. Rules refer to each other by name, so nothing needs numbering.
-
+## @rules/
+- Rules are flat list with snake_case names. Rules refer to each other by name, so nothing needs numbering.
 - Follow feature based rules in the rules folder and make sure those are adhered to
+- ask clarifying questions about rules you don't understand, and update them after
 
 ## Commands
 
@@ -51,11 +54,10 @@ Rules are flat list with snake_case names. Rules refer to each other by name, so
 - `src/plex_tls.rs`: Plex discovery, TLS, and HTTP/WebSocket serving.
 - `README.md`: user-facing project overview, setup, connection, playback, and current limitations.
 - `ROADMAP.md`: full PMS compatibility checklist and client validation status.
-- `CHANGELOG.md`: change history and short implementation reflections.
+- `CHANGELOG.md`: features and fixes from release to releast. shouldn't mirror a git commit history
 
 ## Documentation and UI rules
 - Keep `README.md` user-focused. Put detailed implementation notes, technical compatibility status, and technical reflections in `ROADMAP.md`.
 
 - Update `README.md` and `ROADMAP.md` only when preparing a requested commit. In `ROADMAP.md`, record a brief reflection with what changed, why, and the checks run. Do not update `CHANGELOG.md` unless explicitly requested.
 - Dialog close controls must stay fixed at the dialog's top-right corner, have an accessible label and tooltip, and close on Escape.
-- Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, and media logic. Home and Library presentation should share implementations where sensible. Filename-derived episode identity has one resolver (`tv_episode_marker` feeding `tv_episode_info`); UI, Plex, metadata, and marker detection must not parse episode filenames directly.
