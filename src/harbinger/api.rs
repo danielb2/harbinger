@@ -3882,12 +3882,14 @@ pub(crate) async fn web_client(
     files.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
 
     let mut items = String::new();
-    items.push_str(&breadcrumb_nav(
-        &relative,
-        &query,
-        selected_relative.as_deref(),
-        library_kind.as_deref(),
-    ));
+    if audiobook_detail_item.is_none() {
+        items.push_str(&breadcrumb_nav(
+            &relative,
+            &query,
+            selected_relative.as_deref(),
+            library_kind.as_deref(),
+        ));
+    }
     let view_library = query.library.unwrap_or_default();
     let view_path = url_encode(&relative.to_string_lossy());
     let media_view_href = format!("/?library={view_library}&path={view_path}");
@@ -3912,10 +3914,26 @@ pub(crate) async fn web_client(
             .and_then(|config| (!config.libraries.is_empty()).then_some(0))
     });
     let sidebar = sidebar_nav_for(&s, &relative, sidebar_library);
-    let page_heading = library_config
-        .as_ref()
-        .map(|library| html(&library.name))
-        .unwrap_or_else(|| "Home".to_owned());
+    let page_heading = if let Some(item) = audiobook_detail_item.as_ref() {
+        if item.metadata.title.is_some() {
+            if item.author.trim().is_empty() {
+                html(&item.title)
+            } else {
+                format!("{} - {}", html(&item.author), html(&item.title))
+            }
+        } else {
+            relative
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(html)
+                .unwrap_or_else(|| html(&item.title))
+        }
+    } else {
+        library_config
+            .as_ref()
+            .map(|library| html(&library.name))
+            .unwrap_or_else(|| "Home".to_owned())
+    };
     let mut folder_cards = String::new();
     let mut season_sections = String::new();
     let mut has_content = false;
@@ -4583,33 +4601,28 @@ pub(crate) async fn web_client(
     .metadata-panel-layout.metadata-panel-layout-no-cover > .metadata-panel {{ grid-column: 1; }}
     .metadata-panel-cover {{ display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border: 1px solid rgba(148,163,184,.28); border-radius: .8rem; background: linear-gradient(135deg, #1e3a8a, #312e81); box-shadow: 0 18px 36px rgba(2,6,23,.55); }}
     .audiobook-detail {{ grid-column: 1 / -1; width: 100%; max-width: 100%; overflow: visible; border: 0; background: transparent; box-shadow: none; }}
-    .audiobook-player-art {{ min-width: 0; align-self: start; }}
-    .audiobook-player-cover {{ position: relative; }}
+    .audiobook-player-shell {{ display: flex; flex-direction: column; align-items: center; box-sizing: border-box; width: min(100%, 34rem); margin: 1.25rem auto 0; padding: 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: radial-gradient(circle at 50% 0%, rgba(59,130,246,.18), transparent 55%), #131c2b; }}
+    .audiobook-player-cover {{ position: relative; width: min(100%, 18rem); }}
     .audiobook-player-cover img, .audiobook-cover-placeholder {{ display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border: 1px solid rgba(148,163,184,.25); border-radius: .9rem; background: linear-gradient(135deg, #1e3a8a, #312e81); box-shadow: 0 18px 36px rgba(2,6,23,.55); }}
     .audiobook-cover-placeholder {{ display: grid; place-items: center; padding: .75rem; color: #bfdbfe; font-size: .8rem; text-align: center; }}
     .audiobook-player-cover .audiobook-toggle-button {{ position: absolute; top: 50%; left: 50%; z-index: 2; display: grid; place-items: center; width: 3.75rem; height: 3.75rem; padding: 0; transform: translate(-50%, -50%); border: 1px solid rgba(255,255,255,.65); border-radius: 999px; color: #fff; background: rgba(37,99,235,.94); box-shadow: 0 10px 24px rgba(2,6,23,.65); font: inherit; font-size: 1.25rem; cursor: pointer; }}
     .audiobook-player-cover .audiobook-toggle-button:hover {{ background: #2563eb; }}
-    .audiobook-status {{ min-height: 1rem; margin: .6rem 0 0; color: #fca5a5; font-size: .8rem; text-align: center; }}
-    .audiobook-player-shell {{ display: grid; grid-template-columns: minmax(160px, 240px) minmax(0, 1fr) minmax(190px, 240px); gap: 1.5rem; margin-top: 1.25rem; padding: 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: radial-gradient(circle at 20% 20%, rgba(59,130,246,.18), transparent 55%), #131c2b; }}
-    .audiobook-player-main {{ min-width: 0; align-self: center; }}
-    .audiobook-player-heading {{ margin-bottom: 1rem; }}
+    .audiobook-player-main {{ width: 100%; min-width: 0; margin-top: 1.1rem; }}
+    .audiobook-player-heading {{ margin-bottom: .9rem; text-align: center; }}
     .audiobook-player-heading h3 {{ margin: .2rem 0 0; font-size: 1.25rem; line-height: 1.25; }}
     .audiobook-player-position {{ color: #93c5fd; font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }}
-    .audiobook-seek {{ width: 100%; accent-color: #60a5fa; }}
-    .audiobook-times {{ display: flex; justify-content: space-between; margin-top: .25rem; color: #9ca3af; font-size: .75rem; font-variant-numeric: tabular-nums; }}
-    .audiobook-transport {{ display: flex; flex-wrap: nowrap; justify-content: center; align-items: center; gap: .5rem; margin: .75rem 0 0; }}
+    .audiobook-transport {{ display: flex; flex-wrap: nowrap; justify-content: center; align-items: center; gap: .5rem; margin: 0 0 1rem; }}
     .audiobook-transport button {{ display: grid; place-items: center; min-width: 2.5rem; height: 2.5rem; padding: 0 .5rem; border: 1px solid rgba(148,163,184,.25); border-radius: 999px; color: #e5e7eb; background: #253247; font: inherit; font-weight: 700; cursor: pointer; }}
     .audiobook-transport button:disabled {{ opacity: .4; cursor: default; }}
-    .audiobook-player-options {{ display: flex; flex-wrap: nowrap; align-items: center; justify-content: center; gap: .9rem; color: #9ca3af; font-size: .8rem; }}
-    .audiobook-player-options select {{ margin-left: .3rem; padding: .3rem .45rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
-    .audiobook-volume {{ width: 6rem; accent-color: #60a5fa; }}
+    .audiobook-seek {{ width: 100%; accent-color: #60a5fa; }}
+    .audiobook-times {{ display: flex; justify-content: space-between; margin-top: .25rem; color: #9ca3af; font-size: .75rem; font-variant-numeric: tabular-nums; }}
+    .audiobook-player-options {{ display: flex; flex-wrap: nowrap; align-items: center; justify-content: center; gap: .75rem; margin-top: 1rem; color: #9ca3af; font-size: .8rem; }}
+    .audiobook-player-options label {{ display: inline-flex; align-items: center; gap: .3rem; min-width: 0; white-space: nowrap; }}
+    .audiobook-player-options select {{ min-width: 0; max-width: 8rem; padding: .3rem .45rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
+    .audiobook-chapter-select {{ max-width: 10rem; }}
+    .audiobook-volume {{ width: 5rem; accent-color: #60a5fa; }}
+    .audiobook-status {{ min-height: 1rem; margin: .75rem 0 0; color: #fca5a5; font-size: .8rem; text-align: center; }}
     .audiobook-audio {{ display: none; }}
-    .audiobook-chapters {{ min-width: 0; max-height: 22rem; overflow: auto; padding: .75rem; border: 1px solid rgba(148,163,184,.16); border-radius: .75rem; background: rgba(15,23,42,.6); }}
-    .audiobook-chapters h3 {{ margin: 0 0 .5rem; font-size: .85rem; }}
-    .audiobook-chapter {{ display: grid; grid-template-columns: 1.4rem minmax(0, 1fr) auto; gap: .45rem; width: 100%; padding: .45rem .5rem; border: 0; border-radius: .4rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }}
-    .audiobook-chapter:hover, .audiobook-chapter[data-active="true"] {{ background: #263244; }}
-    .audiobook-chapter-index, .audiobook-chapter-time {{ color: #9ca3af; font-size: .7rem; font-variant-numeric: tabular-nums; }}
-    .audiobook-chapter-title {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .audiobook-info {{ margin-top: 1.25rem; padding: 1.25rem 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: #1f2937; }}
     .audiobook-info h3 {{ margin: 0 0 .5rem; }}
     .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }}
@@ -4617,8 +4630,7 @@ pub(crate) async fn web_client(
     .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
     .audiobook-fact dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
     @media (max-width: 640px) {{ .metadata-panel-layout {{ grid-template-columns: minmax(84px, 26vw) minmax(0, 1fr); gap: .8rem; }} .metadata-panel {{ padding: 1rem; }} }}
-    @media (max-width: 900px) {{ .audiobook-player-shell {{ grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); padding: 1rem; }} .audiobook-chapters {{ grid-column: 1 / -1; max-height: 14rem; }} }}
-    @media (max-width: 600px) {{ .audiobook-player-shell {{ grid-template-columns: minmax(0, 1fr); }} .audiobook-player-cover {{ max-width: 220px; }} }}
+    @media (max-width: 600px) {{ .audiobook-player-shell {{ padding: 1rem; }} .audiobook-player-options {{ gap: .5rem; font-size: .75rem; }} .audiobook-player-options select {{ max-width: 6.5rem; }} .audiobook-volume {{ width: 4rem; }} }}
     .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
@@ -5349,7 +5361,7 @@ pub(crate) async fn web_client(
       const titleLabel = player.querySelector(".audiobook-current-title");
       const positionLabel = player.querySelector(".audiobook-player-position");
       const toggleButtons = [...player.querySelectorAll(".audiobook-toggle-button")];
-      const chapterButtons = [...player.querySelectorAll(".audiobook-chapter")];
+      const chapterSelect = player.querySelector(".audiobook-chapter-select");
       const resumeButton = player.querySelector(".audiobook-resume-button");
       const previousChapter = player.querySelector(".audiobook-previous-chapter");
       const nextChapter = player.querySelector(".audiobook-next-chapter");
@@ -5396,10 +5408,7 @@ pub(crate) async fn web_client(
         if (positionLabel) positionLabel.textContent = chapters.length
           ? `Chapter ${{chapters.indexOf(chapter) + 1}} of ${{chapters.length}}`
           : `Track ${{trackIndex + 1}} of ${{tracks.length}}`;
-        chapterButtons.forEach((button, index) => {{
-          const active = chapter ? chapters[index] === chapter : false;
-          button.dataset.active = String(active);
-        }});
+        if (chapterSelect) chapterSelect.value = String(chapter ? chapters.indexOf(chapter) : 0);
         if (previousChapter) previousChapter.disabled = !chapters.length || (chapter && chapters.indexOf(chapter) === 0 && time < chapter.start + 3);
         if (nextChapter) nextChapter.disabled = !chapters.length || !chapter || chapters.indexOf(chapter) === chapters.length - 1;
         toggleButtons.forEach(button => {{ button.textContent = audio.paused ? "▶" : "❚❚"; }});
@@ -5485,7 +5494,10 @@ pub(crate) async fn web_client(
       player.querySelector(".audiobook-skip-forward")?.addEventListener("click", () => seekTo(absoluteTime() + 30));
       previousChapter?.addEventListener("click", () => moveChapter(-1));
       nextChapter?.addEventListener("click", () => moveChapter(1));
-      chapterButtons.forEach(button => button.addEventListener("click", () => seekTo(Number(button.dataset.audiobookSeek || 0))));
+      chapterSelect?.addEventListener("change", event => {{
+        const option = event.target.selectedOptions[0];
+        if (option) seekTo(Number(option.dataset.audiobookSeek || 0));
+      }});
       resumeButton?.addEventListener("click", () => seekTo(Number(player.dataset.start || 0)));
       player.querySelector(".audiobook-speed")?.addEventListener("change", event => {{
         audio.playbackRate = Number(event.target.value) || 1;
@@ -7629,19 +7641,24 @@ fn audiobook_detail(
             .collect::<Vec<_>>(),
     )
     .unwrap_or_else(|_| "[]".to_owned());
-    let chapter_rows = chapters
-        .iter()
-        .enumerate()
-        .map(|(index, chapter)| {
-            format!(
-                r#"<button type="button" class="audiobook-chapter" data-audiobook-seek="{}"><span class="audiobook-chapter-index">{}</span><span class="audiobook-chapter-title">{}</span><span class="audiobook-chapter-time">{}</span></button>"#,
-                chapter.start,
-                index + 1,
-                html(&chapter.title),
-                html(&clock_duration(chapter.end - chapter.start)),
-            )
-        })
-        .collect::<String>();
+    let chapter_options = if chapters.is_empty() {
+        r#"<option value="0">No chapters</option>"#.to_owned()
+    } else {
+        chapters
+            .iter()
+            .enumerate()
+            .map(|(index, chapter)| {
+                format!(
+                    r#"<option value="{}" data-audiobook-seek="{}">{} · {} · {}</option>"#,
+                    index,
+                    chapter.start,
+                    index + 1,
+                    html(&chapter.title),
+                    html(&clock_duration(chapter.end - chapter.start)),
+                )
+            })
+            .collect::<String>()
+    };
     let mut facts = Vec::new();
     facts.push(("Title", item.title.clone()));
     if !book.subtitle.trim().is_empty() {
@@ -7722,31 +7739,29 @@ fn audiobook_detail(
     format!(
         r#"<article class="audiobook-detail" data-audiobook-player data-library="{library}" data-folder="{folder_index}" data-path="{path}" data-duration="{duration}" data-start="{saved_seconds}" data-tracks="{tracks}" data-chapters="{chapters}">
   <section class="audiobook-player-shell">
-    <div class="audiobook-player-art">
-      <div class="audiobook-player-cover">
-        {cover}
-        <button type="button" class="audiobook-toggle-button" title="Play or pause" aria-label="Play or pause">▶</button>
-      </div>
+    <div class="audiobook-player-cover">
+      {cover}
+      <button type="button" class="audiobook-toggle-button" title="Play or pause" aria-label="Play or pause">▶</button>
+    </div>
+    <div class="audiobook-player-main">
+      <div class="audiobook-player-heading"><span class="audiobook-player-position">Track 1 of {track_count}</span><h3 class="audiobook-current-title">{initial_title}</h3></div>
       <div class="audiobook-transport">
         <button type="button" class="audiobook-previous-chapter" title="Previous chapter" aria-label="Previous chapter">⏮</button>
         <button type="button" class="audiobook-skip-back" title="Back 15 seconds" aria-label="Back 15 seconds">↶ 15</button>
         <button type="button" class="audiobook-skip-forward" title="Forward 30 seconds" aria-label="Forward 30 seconds">30 ↷</button>
         <button type="button" class="audiobook-next-chapter" title="Next chapter" aria-label="Next chapter">⏭</button>
       </div>
-    </div>
-    <div class="audiobook-player-main">
-      <div class="audiobook-player-heading"><span class="audiobook-player-position">Track 1 of {track_count}</span><h3 class="audiobook-current-title">{initial_title}</h3></div>
       <input class="audiobook-seek" type="range" min="0" max="{duration}" value="0" step="0.1" aria-label="Seek through audiobook">
       <div class="audiobook-times"><span class="audiobook-current-time">0:00</span><span class="audiobook-total-time">{duration_label}</span></div>
       <div class="audiobook-player-options">
         <label>Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
         <label>Volume <input class="audiobook-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume"></label>
+        <label>Chapter <select class="audiobook-chapter-select" aria-label="Select chapter">{chapter_options}</select></label>
         <button type="button" class="audiobook-resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button>
       </div>
       <p class="audiobook-status" role="status" aria-live="polite"></p>
       <audio class="audiobook-audio" preload="metadata" src="{first_track}">Your browser does not support HTML audio.</audio>
     </div>
-    <aside class="audiobook-chapters"><h3>Chapters</h3>{chapter_rows}</aside>
   </section>
   <section class="audiobook-info">
     <h3>About this book</h3>
@@ -7766,7 +7781,7 @@ fn audiobook_detail(
         initial_title = html(initial_title),
         duration_label = html(&clock_duration(duration)),
         first_track = html(first_track),
-        chapter_rows = chapter_rows,
+        chapter_options = chapter_options,
         description = description,
         fact_markup = fact_markup,
     )
