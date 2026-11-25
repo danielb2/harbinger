@@ -7649,10 +7649,9 @@ fn audiobook_detail(
             .enumerate()
             .map(|(index, chapter)| {
                 format!(
-                    r#"<option value="{}" data-audiobook-seek="{}">{} · {} · {}</option>"#,
+                    r#"<option value="{}" data-audiobook-seek="{}">{} · {}</option>"#,
                     index,
                     chapter.start,
-                    index + 1,
                     html(&chapter.title),
                     html(&clock_duration(chapter.end - chapter.start)),
                 )
@@ -7747,14 +7746,14 @@ fn audiobook_detail(
       <div class="audiobook-player-heading"><span class="audiobook-player-position">Track 1 of {track_count}</span><h3 class="audiobook-current-title">{initial_title}</h3></div>
       <div class="audiobook-transport">
         <button type="button" class="audiobook-previous-chapter" title="Previous chapter" aria-label="Previous chapter">⏮</button>
-        <button type="button" class="audiobook-skip-back" title="Back 15 seconds" aria-label="Back 15 seconds">↶ 15</button>
-        <button type="button" class="audiobook-skip-forward" title="Forward 30 seconds" aria-label="Forward 30 seconds">30 ↷</button>
+        <button type="button" class="audiobook-skip-back" title="Back 15 seconds" aria-label="Back 15 seconds">↺ 15</button>
+        <button type="button" class="audiobook-skip-forward" title="Forward 30 seconds" aria-label="Forward 30 seconds">↻ 30</button>
         <button type="button" class="audiobook-next-chapter" title="Next chapter" aria-label="Next chapter">⏭</button>
       </div>
       <input class="audiobook-seek" type="range" min="0" max="{duration}" value="0" step="0.1" aria-label="Seek through audiobook">
       <div class="audiobook-times"><span class="audiobook-current-time">0:00</span><span class="audiobook-total-time">{duration_label}</span></div>
       <div class="audiobook-player-options">
-        <label>Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+        <label>Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.1">1.1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option><option value="2.5">2.5×</option><option value="3">3×</option></select></label>
         <label>Volume <input class="audiobook-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume"></label>
         <label>Chapter <select class="audiobook-chapter-select" aria-label="Select chapter">{chapter_options}</select></label>
         <button type="button" class="audiobook-resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button>

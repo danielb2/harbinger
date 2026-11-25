@@ -2662,6 +2662,10 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     assert!(transport_markup.contains("audiobook-previous-chapter"));
     assert!(transport_markup.contains("audiobook-next-chapter"));
     assert!(!transport_markup.contains("audiobook-toggle-button"));
+    assert!(transport_markup.contains(">↺ 15</button>"));
+    assert!(transport_markup.contains(">↻ 30</button>"));
+    assert!(body.contains(r#"<option value="0.5">0.5×</option>"#));
+    assert!(body.contains(r#"<option value="3">3×</option>"#));
     assert!(body.contains(".audiobook-player-options { display: flex; flex-wrap: nowrap;"));
     assert!(body.contains(r#"<h1>Nora Vale - The Silent Harbor</h1>"#));
     assert!(!body.contains(r#"class="breadcrumb""#));
@@ -2681,10 +2685,11 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     assert!(
         body.contains(r#"<select class="audiobook-chapter-select" aria-label="Select chapter">"#)
     );
-    assert!(body
-        .contains(r#"<option value="0" data-audiobook-seek="0">1 · The Arrival · 0:13</option>"#));
+    assert!(
+        body.contains(r#"<option value="0" data-audiobook-seek="0">The Arrival · 0:13</option>"#)
+    );
     assert!(body.contains(
-        r#"<option value="1" data-audiobook-seek="12.5">2 · The Lighthouse · 0:13</option>"#
+        r#"<option value="1" data-audiobook-seek="12.5">The Lighthouse · 0:13</option>"#
     ));
     assert!(!body.contains("audiobook-chapter-index"));
     assert!(!body.contains(r#"<aside class="audiobook-chapters""#));
