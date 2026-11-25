@@ -53,3 +53,6 @@ nightly: (publish "nightly")
 # restart local server
 restart:
     kill -HUP (pgrep -x harbinger)
+
+install:
+    brew install hl
