@@ -5,3 +5,4 @@
     - https://github.com/edde746/plezy - a plex client
     - https://github.com/braedonsaunders/ether/ - a plex server for non-stored content
     - https://github.com/debridmediamanager/rex - like ether but in rust
+    - https://github.com/Silo-Server
