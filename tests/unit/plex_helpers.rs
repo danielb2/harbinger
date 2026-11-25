@@ -973,9 +973,14 @@ fn sidebar_lists_libraries_directly_without_generic_library_item() {
     assert!(home.contains("<a class=\"sidebar-link active\" data-spa-link href=\"/\""));
     assert!(sidebar.contains("sidebar-toggle"));
     let settings = sidebar_nav_with_settings(true);
-    assert!(settings.contains("href=\"/settings\""));
+    assert!(settings.contains("class=\"sidebar-settings-group\" open"));
     assert!(settings.contains("aria-label=\"Settings\" title=\"Settings\""));
-    assert!(settings.contains("<span class=\"sidebar-icon\">⚙</span>Settings</a>"));
+    assert!(settings.contains(
+        "<span class=\"sidebar-icon\">⚙</span><span class=\"sidebar-settings-label\">Settings</span>"
+    ));
+    assert!(settings.contains("class=\"sidebar-sublink active\" href=\"/settings\""));
+    assert!(settings.contains("href=\"/settings?tab=logs\""));
+    assert!(settings.contains("href=\"/settings#plex-heading\""));
     assert!(!settings.contains("<a class=\"sidebar-link active\" href=\"/\""));
 }
 #[test]

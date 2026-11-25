@@ -1132,7 +1132,9 @@ async fn settings_logs_tab_displays_recent_events() {
     let (_, log_snapshot) = super::recent_log_snapshot();
     assert!(log_snapshot.contains(&"event=http_request method=GET path=/settings".to_owned()));
     assert!(log_snapshot.contains(&"event=tmdb search finished".to_owned()));
-    assert!(body.contains("class=\"active\" href=\"/settings?tab=logs\""));
+    assert!(body.contains("class=\"sidebar-settings-group\" open"));
+    assert!(body.contains("class=\"sidebar-sublink active\" href=\"/settings?tab=logs\""));
+    assert!(!body.contains("class=\"settings-tabs\""));
 }
 
 #[tokio::test]
@@ -1209,7 +1211,8 @@ async fn settings_can_rename_a_library() {
     );
     assert!(body.contains("flex-wrap:nowrap"));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
-    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
+    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
     assert!(body.contains("input, select, textarea { font-size: 16px; }"));
     assert!(body
         .contains("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>"));
@@ -2609,7 +2612,8 @@ async fn web_library_book_folder_renders_audiobook_player() {
     assert!(body.contains("<h1>Book One</h1>"));
     assert!(!body.contains(r#"class="breadcrumb""#));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
-    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
+    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
     assert!(body
         .contains(".audiobook-player-options { flex-wrap: wrap; gap: .5rem; font-size: .75rem; }"));
     assert!(body.contains(".audiobook-chapter-control { flex-basis: 100%; }"));
@@ -6315,7 +6319,8 @@ async fn home_page_search_returns_matching_media_and_empty_state() {
     assert!(body.contains("id=\"global-media-search\""));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
     assert!(body.contains(".sidebar-toggle { display: none; } .sidebar-label { display: none; }"));
-    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
+    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
     assert!(body.contains(".media-card-menu-items { right: 0; min-width: 9rem;"));
     assert!(body.contains(".continue-grid > .empty-state { grid-column: 1 / -1; }"));
     assert!(body.contains("input, select, textarea { font-size: 16px; }"));
@@ -9743,7 +9748,7 @@ async fn dashboard_settings_tab_shows_live_charts_without_entering_browse_naviga
     let page = String::from_utf8(page.to_vec()).unwrap();
     for needle in [
         "<h2 id=\"dashboard-heading\">Server dashboard</h2>",
-        "class=\"active\" href=\"/settings?tab=dashboard\"",
+        "class=\"sidebar-sublink active\" href=\"/settings?tab=dashboard\"",
         "id=\"dashboard-cpu-chart\"",
         "id=\"dashboard-memory-chart\"",
         "id=\"dashboard-network-chart\"",
@@ -9760,7 +9765,7 @@ async fn dashboard_settings_tab_shows_live_charts_without_entering_browse_naviga
     }
     let sidebar = sidebar_nav_with_settings(false);
     assert!(!sidebar.contains("href=\"/dashboard\""));
-    assert!(!sidebar.contains(">Dashboard<"));
+    assert!(sidebar.contains("href=\"/settings?tab=dashboard\">Dashboard</a>"));
 }
 
 #[tokio::test]
