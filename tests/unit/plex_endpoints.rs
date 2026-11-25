@@ -2638,6 +2638,29 @@ async fn web_library_book_folder_renders_audiobook_player() {
 }
 
 #[tokio::test]
+async fn web_single_file_audiobook_renders_player() {
+    let fixture = audiobook_web_fixture("audiobooks-web-single-file");
+    let root = fixture.root.join("audiobooks-web-single-file");
+    std::fs::write(root.join("Ender's Game.m4b"), b"0123456789abcdef").unwrap();
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+
+    let home = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(home.status(), StatusCode::OK);
+    let home = body_string(home).await;
+    assert!(home.contains("Ender&#39;s Game"));
+    assert!(home.contains(&format!("path={}", super::url_encode("Ender's Game.m4b"))));
+
+    let uri = format!("/?library=0&path={}", super::url_encode("Ender's Game.m4b"));
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("data-audiobook-player"));
+    assert!(body.contains("class=\"audiobook-detail\""));
+    assert!(body.contains("Ender&#39;s Game"));
+    assert!(body.contains("/web/stream?library=0&amp;folder=0&amp;path=Ender%27s%20Game.m4b"));
+}
+
+#[tokio::test]
 async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     let fixture = audiobook_web_fixture_with_metadata(
         "audiobooks-web-metadata-player",

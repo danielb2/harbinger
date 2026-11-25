@@ -1,3 +1,4 @@
+use super::scanner::{self, BookFiles, ParsedBookPath};
 use crate::harbinger::{is_audiobook_library, is_hidden_path, AppState};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -22,6 +23,8 @@ pub(crate) struct AudioFile {
     pub(crate) size: u64,
     pub(crate) modified_ms: i64,
     pub(crate) duration: f64,
+    pub(crate) track_number: Option<u32>,
+    pub(crate) disc_number: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +63,7 @@ pub(crate) struct Item {
     pub(crate) folder_id: String,
     pub(crate) path: PathBuf,
     pub(crate) rel_path: String,
+    pub(crate) is_file: bool,
     pub(crate) title: String,
     pub(crate) author: String,
     pub(crate) description: String,
@@ -249,17 +253,9 @@ fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalo
                 .unwrap_or_else(|| stable_id("fol", &id));
             let mut items = Vec::new();
             for (folder_index, root) in roots.iter().enumerate() {
-                let mut directories = Vec::new();
-                collect_directories(root, &mut directories);
-                directories.insert(0, root.clone());
-                let mut seen = BTreeSet::new();
-                for directory in directories {
-                    if !seen.insert(directory.clone()) {
-                        continue;
-                    }
+                for book in scanner::scan_library(root) {
                     if let Some(item) = build_item(
-                        &directory,
-                        root,
+                        book,
                         &id,
                         folders
                             .get(folder_index)
@@ -270,6 +266,8 @@ fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalo
                     }
                 }
             }
+            let mut seen_paths = BTreeSet::new();
+            items.retain(|item| seen_paths.insert(item.path.clone()));
             items.sort_by(|left, right| {
                 left.title
                     .cmp(&right.title)
@@ -287,85 +285,101 @@ fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalo
     Catalog { libraries }
 }
 
-fn build_item(
-    directory: &Path,
-    library_root: &Path,
-    library_id: &str,
-    folder_id: &str,
-) -> Option<Item> {
-    let mut audio_files = Vec::new();
-    let mut cover_path = None;
-    for entry in fs::read_dir(directory).ok()?.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
+fn build_item(book: BookFiles, library_id: &str, folder_id: &str) -> Option<Item> {
+    if book.audio_files.is_empty() {
+        return None;
+    }
+    let parsed = if book.is_file {
+        ParsedBookPath {
+            title: Some(scanner::file_stem(&book.path)),
+            ..Default::default()
         }
-        if let Some(mime) = audio_mime(&path) {
-            let metadata = fs::metadata(&path).ok()?;
-            let title = path
-                .file_stem()
-                .and_then(|name| name.to_str())
-                .unwrap_or("Audio")
-                .to_owned();
-            let rel_path = path
-                .strip_prefix(library_root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-            let index = audio_files.len() + 1;
-            audio_files.push(AudioFile {
-                index,
-                path: path.clone(),
-                rel_path,
-                title,
+    } else {
+        scanner::parse_book_path(&book.rel_path, false)
+    };
+    let mut audio_files = book
+        .audio_files
+        .iter()
+        .map(|file| {
+            let mime = audio_mime(&file.path)?;
+            let metadata = fs::metadata(&file.path).ok()?;
+            let (track_number, disc_number) = scanner::filename_track_numbers(&parsed, file);
+            Some(AudioFile {
+                index: 0,
+                path: file.path.clone(),
+                rel_path: file.rel_path.clone(),
+                title: scanner::file_stem(&file.path),
                 mime: mime.to_owned(),
                 size: metadata.len(),
                 modified_ms: timestamp_ms(metadata.modified().ok()),
-                duration: sidecar_duration(&path).unwrap_or(0.0),
-            });
-        } else if cover_path.is_none() && is_cover(&path) {
-            cover_path = Some(path);
-        }
-    }
-    if audio_files.is_empty() {
-        return None;
-    }
-    if cover_path.is_none() {
-        cover_path = [".hbgr/cover.jpg", ".hbgr/cover.jpeg", ".hbgr/cover.png"]
-            .iter()
-            .map(|name| directory.join(name))
-            .find(|path| path.is_file());
-    }
-    audio_files.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
-    for (index, file) in audio_files.iter_mut().enumerate() {
-        file.index = index + 1;
-    }
-    let directory_name = directory
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Audiobook")
-        .to_owned();
-    let metadata = read_book_metadata(&directory.join("metadata.json"));
-    let fallback_title = if directory == library_root {
-        audio_files[0].title.clone()
+                duration: sidecar_duration(&file.path).unwrap_or(0.0),
+                track_number,
+                disc_number,
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    sort_audio_files(&mut audio_files);
+
+    let mut metadata = if book.is_file {
+        BookMetadata::default()
     } else {
-        directory_name
+        read_book_metadata(&book.path.join("metadata.json"))
     };
-    let title = metadata.title.clone().unwrap_or(fallback_title);
-    let fallback_author = if directory == library_root {
-        "Unknown".to_owned()
+    let fallback_title = if book.is_file {
+        scanner::file_stem(&book.path)
     } else {
-        directory
-            .parent()
-            .and_then(|parent| parent.file_name())
+        book.path
+            .file_name()
             .and_then(|name| name.to_str())
-            .unwrap_or("Unknown")
+            .unwrap_or("Audiobook")
             .to_owned()
     };
+    let folder_title = parsed.title.clone().unwrap_or(fallback_title);
+    if metadata
+        .title
+        .as_deref()
+        .is_some_and(|title| title.trim().is_empty())
+    {
+        metadata.title = None;
+    }
+    if metadata.authors.is_empty() {
+        metadata.authors = parsed.authors.clone();
+    }
+    if metadata.narrators.is_empty() && !book.is_file {
+        metadata.narrators = read_reader_txt(&book.path);
+    }
+    if metadata.narrators.is_empty() {
+        metadata.narrators = parsed.narrators.clone();
+    }
+    if metadata.series.is_empty() {
+        if let Some(series) = parsed.series.as_deref() {
+            metadata.series = vec![scanner::series_label(series, parsed.sequence.as_deref())];
+        }
+    }
+    if metadata.published_year.is_empty() {
+        metadata.published_year = parsed.published_year.clone().unwrap_or_default();
+    }
+    if metadata.asin.is_empty() {
+        metadata.asin = parsed.asin.clone().unwrap_or_default();
+    }
+    if metadata.description.is_empty() && !book.is_file {
+        metadata.description = read_desc_txt(&book.path);
+    }
+    let title = metadata.title.clone().unwrap_or(folder_title);
     let author = if metadata.authors.is_empty() {
-        fallback_author
+        "Unknown".to_owned()
     } else {
         metadata.authors.join(", ")
+    };
+    let cover_path = if book.is_file {
+        None
+    } else {
+        scanner::choose_cover(&book.path).or_else(|| {
+            [".hbgr/cover.jpg", ".hbgr/cover.jpeg", ".hbgr/cover.png"]
+                .iter()
+                .map(|name| book.path.join(name))
+                .find(|path| path.is_file())
+        })
     };
     let duration = audio_files.iter().map(|file| file.duration).sum();
     let size = audio_files.iter().map(|file| file.size).sum();
@@ -379,17 +393,14 @@ fn build_item(
         .map(|file| file.modified_ms)
         .max()
         .unwrap_or_default();
-    let id = stable_id("li", &format!("{}|{}", library_id, directory.display()));
+    let id = stable_id("li", &format!("{}|{}", library_id, book.path.display()));
     Some(Item {
         id,
         library_id: library_id.to_owned(),
         folder_id: folder_id.to_owned(),
-        path: directory.to_path_buf(),
-        rel_path: directory
-            .strip_prefix(library_root)
-            .unwrap_or(directory)
-            .to_string_lossy()
-            .into_owned(),
+        path: book.path,
+        rel_path: book.rel_path,
+        is_file: book.is_file,
         title,
         author,
         description: metadata.description.clone(),
@@ -401,6 +412,60 @@ fn build_item(
         updated_ms,
         metadata,
     })
+}
+
+fn sort_audio_files(audio_files: &mut [AudioFile]) {
+    let all_discs =
+        !audio_files.is_empty() && audio_files.iter().all(|file| file.disc_number.is_some());
+    let disc_order = if all_discs {
+        let mut discs = audio_files
+            .iter()
+            .filter_map(|file| file.disc_number)
+            .collect::<Vec<_>>();
+        discs.sort_unstable();
+        discs.windows(2).all(|window| window[1] - window[0] <= 1)
+    } else {
+        false
+    };
+    if disc_order {
+        audio_files.sort_by(|left, right| {
+            left.disc_number
+                .unwrap_or_default()
+                .cmp(&right.disc_number.unwrap_or_default())
+                .then_with(|| {
+                    left.track_number
+                        .unwrap_or_default()
+                        .cmp(&right.track_number.unwrap_or_default())
+                })
+                .then_with(|| left.rel_path.cmp(&right.rel_path))
+        });
+    } else {
+        audio_files.sort_by(|left, right| {
+            left.track_number
+                .unwrap_or_default()
+                .cmp(&right.track_number.unwrap_or_default())
+                .then_with(|| left.rel_path.cmp(&right.rel_path))
+        });
+    }
+    for (index, file) in audio_files.iter_mut().enumerate() {
+        file.index = index + 1;
+    }
+}
+
+fn read_desc_txt(directory: &Path) -> String {
+    fs::read_to_string(directory.join("desc.txt"))
+        .map(|description| description.trim().to_owned())
+        .unwrap_or_default()
+}
+
+fn read_reader_txt(directory: &Path) -> Vec<String> {
+    let Ok(raw) = fs::read_to_string(directory.join("reader.txt")) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .next()
+        .map(scanner::parse_names)
+        .unwrap_or_default()
 }
 
 fn read_book_metadata(path: &Path) -> BookMetadata {
@@ -569,20 +634,6 @@ pub(crate) fn image_content_type(path: &Path) -> &'static str {
         "webp" => "image/webp",
         _ => "image/jpeg",
     }
-}
-
-fn is_cover(path: &Path) -> bool {
-    matches!(
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("cover.jpg")
-            | Some("cover.jpeg")
-            | Some("cover.png")
-            | Some("folder.jpg")
-            | Some("folder.png")
-    )
 }
 
 fn sidecar_duration(path: &Path) -> Option<f64> {

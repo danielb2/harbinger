@@ -4,6 +4,8 @@ pub(crate) mod api;
 pub(crate) mod catalog;
 #[path = "dto.rs"]
 pub(crate) mod dto;
+#[path = "scanner.rs"]
+pub(crate) mod scanner;
 
 pub(crate) use api::router;
 

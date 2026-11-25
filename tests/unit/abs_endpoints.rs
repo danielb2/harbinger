@@ -663,6 +663,181 @@ async fn metadata_json_populates_abs_item_and_filter_data() {
 }
 
 #[tokio::test]
+async fn folder_structure_scan_matches_abs_book_layout() {
+    let fixture = fixture();
+    let library = fixture.root.join("library");
+    let files = [
+        (
+            "Terry Goodkind/Sword of Truth/Vol 1 - 1994 - Wizards First Rule {Sam Tsoutsouvas}/Audio Track 1.mp3",
+            b"track-one".as_slice(),
+        ),
+        (
+            "Terry Goodkind/Sword of Truth/Vol 1 - 1994 - Wizards First Rule {Sam Tsoutsouvas}/Audio Track 2.mp3",
+            b"track-two".as_slice(),
+        ),
+        (
+            "Terry Goodkind/Sword of Truth/Vol 2 - 1995 - Stone of Tears/Audiobook.m4b",
+            b"stone".as_slice(),
+        ),
+        (
+            "Terry Goodkind/Heart of Black Ice - Sister of Darkness/Audio File.m4a",
+            b"heart".as_slice(),
+        ),
+        (
+            "Steven Levy/Hackers - Heroes of the Computer Revolution {Mike Chamberlain}/Audio File.m4a",
+            b"hackers".as_slice(),
+        ),
+        ("1945 - Animal Farm/Audiobook.mp3", b"farm".as_slice()),
+        ("Ender's Game.m4b", b"ender".as_slice()),
+        ("Only Author/Only Author.m4a", b"author".as_slice()),
+        ("Lee Child/No Metadata Book/Chapter 01.mp3", b"chapter".as_slice()),
+        (
+            "Lee Child/No Metadata Book/desc.txt",
+            b"Description from desc.txt".as_slice(),
+        ),
+        (
+            "Lee Child/No Metadata Book/reader.txt",
+            b"Dick Hill\nIgnored second line".as_slice(),
+        ),
+        ("Disc Book/Disc 1/01.mp3", b"disc-one".as_slice()),
+        ("Disc Book/Disc 2/01.mp3", b"disc-two".as_slice()),
+        ("Disc Book/cover.jpg", b"disc-cover".as_slice()),
+        ("Disc Book/art.jpg", b"wrong-cover".as_slice()),
+    ];
+    for (relative, contents) in files {
+        let path = library.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+    Catalog::clear_cache();
+
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?limit=100&minified=1"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let results = value["results"].as_array().unwrap();
+    let find = |title: &str| {
+        results
+            .iter()
+            .find(|item| item["media"]["metadata"]["title"] == title)
+            .unwrap_or_else(|| panic!("missing item {title}"))
+    };
+
+    let wizards = find("Wizards First Rule");
+    assert_eq!(wizards["media"]["metadata"]["authorName"], "Terry Goodkind");
+    assert_eq!(
+        wizards["media"]["metadata"]["seriesName"],
+        "Sword of Truth #1"
+    );
+    assert_eq!(wizards["media"]["metadata"]["publishedYear"], "1994");
+    assert_eq!(
+        wizards["media"]["metadata"]["narratorName"],
+        "Sam Tsoutsouvas"
+    );
+    assert_eq!(wizards["media"]["numAudioFiles"], 2);
+    assert_eq!(wizards["isFile"], false);
+
+    let stone = find("Stone of Tears");
+    assert_eq!(
+        stone["media"]["metadata"]["seriesName"],
+        "Sword of Truth #2"
+    );
+    assert_eq!(stone["media"]["metadata"]["publishedYear"], "1995");
+
+    let hackers = find("Hackers - Heroes of the Computer Revolution");
+    assert_eq!(hackers["media"]["metadata"]["authorName"], "Steven Levy");
+    assert_eq!(
+        hackers["media"]["metadata"]["narratorName"],
+        "Mike Chamberlain"
+    );
+    assert_eq!(hackers["media"]["metadata"]["seriesName"], "");
+
+    let animal_farm = find("Animal Farm");
+    assert_eq!(animal_farm["media"]["metadata"]["publishedYear"], "1945");
+    assert_eq!(animal_farm["media"]["metadata"]["authorName"], "Unknown");
+
+    let author_only = find("Only Author");
+    assert_eq!(author_only["media"]["metadata"]["authorName"], "Unknown");
+
+    let text_metadata = find("No Metadata Book");
+    assert_eq!(
+        text_metadata["media"]["metadata"]["authorName"],
+        "Lee Child"
+    );
+    assert_eq!(
+        text_metadata["media"]["metadata"]["narratorName"],
+        "Dick Hill"
+    );
+    let text_metadata_id = text_metadata["id"].as_str().unwrap();
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/items/{text_metadata_id}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        detail["media"]["metadata"]["description"],
+        "Description from desc.txt"
+    );
+
+    let ender = find("Ender's Game");
+    assert_eq!(ender["isFile"], true);
+    assert_eq!(ender["media"]["numAudioFiles"], 1);
+
+    let disc_book = find("Disc Book");
+    assert_eq!(disc_book["media"]["numAudioFiles"], 2);
+    let disc_id = disc_book["id"].as_str().unwrap();
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/items/{disc_id}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    let audio_files = detail["media"]["audioFiles"].as_array().unwrap();
+    assert!(audio_files[0]["metadata"]["relPath"]
+        .as_str()
+        .unwrap()
+        .contains("Disc 1"));
+    assert!(audio_files[1]["metadata"]["relPath"]
+        .as_str()
+        .unwrap()
+        .contains("Disc 2"));
+    assert_eq!(audio_files[0]["discNumFromFilename"], 1);
+    assert_eq!(audio_files[1]["discNumFromFilename"], 2);
+
+    let (status, cover, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/items/{disc_id}/cover"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cover, b"disc-cover");
+}
+
+#[tokio::test]
 async fn playback_streams_ranges_and_syncs_progress() {
     let fixture = fixture();
     let token = login(&fixture).await;

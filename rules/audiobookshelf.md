@@ -2,3 +2,4 @@
 - check_references: consult the official Audiobookshelf implementation to match API behavior
     - https://github.com/advplyr/audiobookshelf
 - The ABS-compatible API in `src/audiobookshelf/` serves audiobook libraries and items as books, including library browsing, item detail, covers, and playback/progress. Use the reference implementation above when adding or changing ABS endpoints.
+- Book library scanning follows the ABS directory structure: https://audiobookshelf.org/docs/documentation/libraries/book-library/directory-structure. Items are `{Author}/{Series}/{Book}`, `{Author}/{Book}`, or a book folder at the library root; standalone audio files at the root are single-file books; `Disc`/`CD`/`Disk` subfolders belong to the parent book. Folder names populate title, author, series sequence, publish year, narrator, and ASIN. `src/audiobookshelf/scanner.rs` owns this grouping and parsing.

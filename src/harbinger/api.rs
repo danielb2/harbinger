@@ -3609,27 +3609,35 @@ pub(crate) async fn web_client(
     });
     let library_top_level =
         relative.as_os_str().is_empty() && query.play.is_none() && query.episode.is_none();
-    let directory = match web_path(&s, &library_root, &relative).await {
-        Ok(path) if path.is_dir() => path,
-        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+    let requested_path = match web_path(&s, &library_root, &relative).await {
+        Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    let audiobook_detail_item = if query.play.is_none()
+    let audiobook_request = query.play.is_none()
         && query.episode.is_none()
-        && library_kind.as_deref().is_some_and(is_audiobook_library)
-    {
+        && library_kind.as_deref().is_some_and(is_audiobook_library);
+    let directory = if requested_path.is_dir() {
+        requested_path.clone()
+    } else if requested_path.is_file() && audiobook_request {
+        requested_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| library_root.clone())
+    } else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let audiobook_detail_item = if audiobook_request {
         let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+        let requested_canonical =
+            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
         catalog
             .libraries
             .iter()
             .find(|entry| Some(entry.source_index) == query.library)
             .and_then(|library| {
                 library.items.iter().find(|item| {
-                    let item_path =
-                        std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
-                    let directory_path =
-                        std::fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone());
-                    item_path == directory_path
+                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+                        == requested_canonical
                 })
             })
             .cloned()
