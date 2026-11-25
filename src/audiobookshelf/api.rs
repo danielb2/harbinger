@@ -1006,7 +1006,7 @@ fn revoke_token(state: &crate::harbinger::AppState, token: &str) {
 fn password_valid(state: &crate::harbinger::AppState, password: &str) -> bool {
     let hash = state.db.lock().ok().and_then(|db| {
         db.query_row(
-            "SELECT password_hash FROM web_admin WHERE id = 1",
+            "SELECT password_hash FROM users WHERE password_hash IS NOT NULL LIMIT 1",
             [],
             |row| row.get::<_, String>(0),
         )

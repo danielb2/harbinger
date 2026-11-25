@@ -63,6 +63,12 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/settings/scan", post(scan_all_libraries))
         .route("/settings/preferences", post(update_preferences))
         .route("/settings/server-name", post(update_server_name))
+        .route(
+            "/settings/users",
+            get(users_settings_page).post(create_user),
+        )
+        .route("/settings/users/:id/update", post(update_user))
+        .route("/settings/users/:id/password", post(update_user_password))
         .route("/settings/plex/start", get(start_plex_auth))
         .route("/settings/plex/status", get(plex_auth_status))
         .route("/settings/plex/callback", get(plex_auth_callback))
@@ -74,6 +80,341 @@ pub(crate) fn web_routes() -> Router<AppState> {
         )
         .route("/settings/media/scan", post(scan_media_metadata))
         .route("/settings/browse", get(settings_browse))
+}
+
+pub(crate) async fn users_settings_page() -> Response {
+    Redirect::to("/settings?tab=users").into_response()
+}
+
+fn users_settings_markup(state: &AppState, query: &SettingsQuery) -> String {
+    let rows = state
+        .db
+        .lock()
+        .ok()
+        .map(|db| {
+            db.prepare(
+                "SELECT id, username, user_type, is_active FROM users
+                 ORDER BY user_type = 'admin' DESC, username COLLATE NOCASE",
+            )
+            .ok()
+            .map(|mut stmt| {
+                stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })
+                .ok()
+                .map(|rows| rows.flatten().collect::<Vec<_>>())
+                .unwrap_or_default()
+            })
+            .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let user_count = rows.len();
+    let count_label = if user_count == 1 { "user" } else { "users" };
+    let mut body = String::from(
+        r#"<style>
+.users-panel .user-count { display:inline-flex; align-items:center; justify-content:center; min-width:1.8rem; padding:.2rem .55rem; border:1px solid #354a68; border-radius:999px; color:#c6d8ef; background:#152238; font-size:.75rem; font-weight:700; }
+.user-list { display:grid; gap:.8rem; margin-top:1.15rem; }
+.user-card { overflow:hidden; border:1px solid #2c3a50; border-radius:.85rem; background:rgba(10,17,30,.46); transition:border-color .15s, background .15s; }
+.user-card:hover { border-color:#3a4d69; }
+.user-card[open] { border-color:#3d5577; background:rgba(13,22,38,.72); }
+.user-summary { display:grid; grid-template-columns:auto minmax(0,1fr) auto; align-items:center; gap:.9rem; width:100%; padding:.95rem 1rem; border:0; border-radius:0; color:inherit; background:transparent; cursor:pointer; list-style:none; }
+.user-summary::before { content:none !important; }
+.user-summary::-webkit-details-marker { display:none; }
+.user-avatar { display:grid; place-items:center; width:2.7rem; height:2.7rem; border:1px solid #3d5577; border-radius:.8rem; color:#dbeafe; background:linear-gradient(145deg, #244a80, #16243a); font-size:1.05rem; font-weight:800; text-transform:uppercase; }
+.user-identity { display:grid; gap:.28rem; min-width:0; }
+.user-name-line { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
+.user-name-line strong { color:#f1f5fb; overflow-wrap:anywhere; }
+.user-meta { color:#91a0b6; font-size:.8rem; }
+.user-summary-action { display:flex; align-items:center; gap:.55rem; color:#9db7d8; font-size:.82rem; font-weight:650; white-space:nowrap; }
+.user-summary-action::after { content:"⌄"; color:#8fa9c9; font-size:1rem; transition:transform .15s; }
+.user-card[open] .user-summary-action::after { transform:rotate(180deg); }
+.user-editor { display:grid; gap:1.15rem; padding:0 1rem 1rem; }
+.user-editor .settings-form { padding-top:1rem; border-top:1px solid #26354a; }
+.user-editor h3 { margin:0; color:#e8eef8; font-size:.95rem; }
+.user-editor .action-row { margin-top:0; }
+.user-create { margin-top:1rem; }
+.type-pill.user-role-admin { border-color:#4f6f9d; color:#d5e6ff; background:#1a3152; }
+.type-pill.user-role-guest { border-color:#3f536e; color:#c3d2e6; background:#17243a; }
+.type-pill.user-state-disabled { border-color:#6b4a52; color:#f3c7ce; background:#35202a; }
+.users-panel .empty-note { margin:1.15rem 0 0; padding:1rem; border:1px dashed #33445c; border-radius:.75rem; color:#98a6bb; text-align:center; }
+@media (max-width: 560px) { .user-summary { grid-template-columns:auto minmax(0,1fr); } .user-summary-action { grid-column:2; justify-self:start; } }
+</style>"#,
+    );
+    body.push_str(&format!(
+        r#"<section class="settings-card users-panel" aria-labelledby="users-heading"><div class="section-heading"><div><h2 id="users-heading">Users</h2><p class="section-description">People who can sign in to Harbinger and compatible apps. Change names, roles, access, and passwords below.</p></div><span class="user-count" aria-label="{} {}">{}</span></div>"#,
+        user_count, count_label, user_count,
+    ));
+    if let Some(error) = query.user_error.as_deref() {
+        body.push_str(&format!(
+            "<div class=\"flash-error\" role=\"alert\">{}</div>",
+            html(error)
+        ));
+    }
+    if let Some(status) = query.user_status.as_deref() {
+        body.push_str(&format!(
+            "<div class=\"flash-notice\" role=\"status\">{}</div>",
+            html(status)
+        ));
+    }
+    if rows.is_empty() {
+        body.push_str(r#"<p class="empty-note">No users yet. Add the first account below.</p>"#);
+    } else {
+        body.push_str("<div class=\"user-list\">");
+        for (id, username, user_type, is_active) in rows {
+            let display_name = username.unwrap_or_else(|| id.clone());
+            let initial = display_name
+                .chars()
+                .next()
+                .map(|character| character.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            let role_label = if user_type == "admin" {
+                "Administrator"
+            } else {
+                "Guest"
+            };
+            let state_label = if is_active != 0 { "Active" } else { "Disabled" };
+            let state_pill = if is_active != 0 {
+                ""
+            } else {
+                "<span class=\"type-pill user-state-disabled\">Disabled</span>"
+            };
+            let admin_selected = if user_type == "admin" {
+                " selected"
+            } else {
+                ""
+            };
+            let guest_selected = if user_type == "admin" {
+                ""
+            } else {
+                " selected"
+            };
+            let active_checked = if is_active != 0 { " checked" } else { "" };
+            let id_path = url_encode(&id);
+            let name = html(&display_name);
+            body.push_str(&format!(
+                r#"<details class="user-card" data-user-id="{}"><summary class="user-summary"><span class="user-avatar" aria-hidden="true">{}</span><span class="user-identity"><span class="user-name-line"><strong>{}</strong><span class="type-pill user-role-{}">{}</span>{}</span><span class="user-meta">{} user</span></span><span class="user-summary-action">Manage</span></summary><div class="user-editor"><form method="post" action="/settings/users/{}/update" class="settings-form"><h3>Profile and access</h3><div class="form-grid"><label class="field"><span>Username</span><input name="username" type="text" value="{}" maxlength="64" required autocomplete="username"></label><label class="field"><span>Role</span><select name="user_type"><option value="admin"{}>Administrator</option><option value="guest"{}>Guest</option></select></label></div><label class="settings-toggle"><input type="checkbox" name="is_active" value="true"{}> Account is active</label><div class="action-row"><button type="submit">Save changes</button></div></form><form method="post" action="/settings/users/{}/password" class="settings-form"><h3>Change password</h3><div class="form-grid"><label class="field"><span>New password</span><input name="password" type="password" minlength="8" required autocomplete="new-password"></label><label class="field"><span>Confirm new password</span><input name="confirm_password" type="password" minlength="8" required autocomplete="new-password"></label></div><small class="note">Use at least 8 characters. Changing the administrator password also updates the web sign-in password.</small><div class="action-row"><button type="submit" class="button-secondary">Update password</button></div></form></div></details>"#,
+                html(&id),
+                html(&initial),
+                name,
+                if user_type == "admin" { "admin" } else { "guest" },
+                role_label,
+                state_pill,
+                state_label.to_lowercase(),
+                id_path,
+                name,
+                admin_selected,
+                guest_selected,
+                active_checked,
+                id_path,
+            ));
+        }
+        body.push_str("</div>");
+    }
+    body.push_str(
+        r#"<details class="add-library user-create"><summary>Add user</summary><form method="post" action="/settings/users" class="settings-form"><div class="form-grid"><label class="field"><span>Username</span><input name="username" type="text" maxlength="64" required autocomplete="off"></label><label class="field"><span>Password</span><input name="password" type="password" minlength="8" required autocomplete="new-password"></label></div><label class="field"><span>Role</span><select name="user_type"><option value="guest">Guest</option><option value="admin">Administrator</option></select></label><small class="note">Guests can use the account in compatible apps. Administrators can also manage Harbinger's settings.</small><div class="action-row"><button type="submit">Create user</button></div></form></details></section>"#,
+    );
+    body
+}
+
+fn users_redirect(status: Option<&str>, error: Option<&str>) -> Response {
+    let mut url = String::from("/settings?tab=users");
+    if let Some(status) = status {
+        url.push_str("&user_status=");
+        url.push_str(&url_encode(status));
+    }
+    if let Some(error) = error {
+        url.push_str("&user_error=");
+        url.push_str(&url_encode(error));
+    }
+    Redirect::to(&url).into_response()
+}
+
+fn normalize_user_type(value: &str) -> Option<&'static str> {
+    match value {
+        "admin" => Some("admin"),
+        "guest" => Some("guest"),
+        _ => None,
+    }
+}
+
+pub(crate) async fn create_user(
+    State(state): State<AppState>,
+    Form(form): Form<UserCreateForm>,
+) -> Response {
+    let username = form.username.trim();
+    if username.is_empty() || username.chars().count() > 64 {
+        return users_redirect(None, Some("Enter a username between 1 and 64 characters."));
+    }
+    if form.password.len() < 8 {
+        return users_redirect(None, Some("Password must be at least 8 characters."));
+    }
+    let Some(user_type) = normalize_user_type(&form.user_type) else {
+        return users_redirect(None, Some("Choose a valid role."));
+    };
+    let salt = SaltString::generate(&mut OsRng);
+    let Ok(hash) = Argon2::default().hash_password(form.password.as_bytes(), &salt) else {
+        return users_redirect(None, Some("Could not create the user. Try again."));
+    };
+    let Ok(db) = state.db.lock() else {
+        return users_redirect(None, Some("Could not access the user database. Try again."));
+    };
+    let exists = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE id = ?1 OR username = ?2)",
+            params![username, username],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if exists {
+        return users_redirect(None, Some("That username is already taken."));
+    }
+    if db
+        .execute(
+            "INSERT INTO users (id, name, username, password_hash, user_type) VALUES (?1, ?2, ?2, ?3, ?4)",
+            params![username, username, hash.to_string(), user_type],
+        )
+        .is_err()
+    {
+        return users_redirect(None, Some("Could not create the user. Try again."));
+    }
+    users_redirect(Some("User created."), None)
+}
+
+pub(crate) async fn update_user(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<UserUpdateForm>,
+) -> Response {
+    let username = form.username.trim();
+    if username.is_empty() || username.chars().count() > 64 {
+        return users_redirect(None, Some("Enter a username between 1 and 64 characters."));
+    }
+    let Some(user_type) = normalize_user_type(&form.user_type) else {
+        return users_redirect(None, Some("Choose a valid role."));
+    };
+    let Ok(db) = state.db.lock() else {
+        return users_redirect(None, Some("Could not access the user database. Try again."));
+    };
+    let current = db.query_row(
+        "SELECT user_type, is_active FROM users WHERE id = ?1",
+        [&id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+    );
+    let Ok((current_type, current_active)) = current else {
+        return users_redirect(None, Some("That user no longer exists."));
+    };
+    let taken = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM users WHERE username = ?1 AND id <> ?2)",
+            params![username, id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    if taken {
+        return users_redirect(None, Some("That username is already taken."));
+    }
+    let remains_admin = current_type == "admin" && current_active != 0;
+    if remains_admin && (user_type != "admin" || !form.is_active) {
+        let other_admins = db
+            .query_row(
+                "SELECT COUNT(*) FROM users WHERE user_type = 'admin' AND is_active = 1 AND id <> ?1",
+                [&id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        if other_admins == 0 {
+            return users_redirect(
+                None,
+                Some("Keep at least one active administrator before changing this account."),
+            );
+        }
+    }
+    if db
+        .execute(
+            "UPDATE users SET name = ?1, username = ?1, user_type = ?2, is_active = ?3 WHERE id = ?4",
+            params![username, user_type, i64::from(form.is_active), id],
+        )
+        .is_err()
+    {
+        return users_redirect(None, Some("Could not save the user. Try again."));
+    }
+    users_redirect(Some("User updated."), None)
+}
+
+pub(crate) async fn update_user_password(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Form(form): Form<UserPasswordForm>,
+) -> Response {
+    if form.password.len() < 8 {
+        return users_redirect(None, Some("Password must be at least 8 characters."));
+    }
+    if form.password != form.confirm_password {
+        return users_redirect(None, Some("The new passwords do not match."));
+    }
+    let salt = SaltString::generate(&mut OsRng);
+    let Ok(hash) = Argon2::default().hash_password(form.password.as_bytes(), &salt) else {
+        return users_redirect(None, Some("Could not update the password. Try again."));
+    };
+    let Ok(db) = state.db.lock() else {
+        return users_redirect(None, Some("Could not access the user database. Try again."));
+    };
+    match db.execute(
+        "UPDATE users SET password_hash = ?1 WHERE id = ?2",
+        params![hash.to_string(), id],
+    ) {
+        Ok(0) => return users_redirect(None, Some("That user no longer exists.")),
+        Ok(_) => {}
+        Err(_) => return users_redirect(None, Some("Could not update the password. Try again.")),
+    }
+    if id == "admin"
+        && db
+            .execute(
+                "INSERT INTO web_admin (id, password_hash) VALUES (1, ?1)
+                 ON CONFLICT(id) DO UPDATE SET password_hash = excluded.password_hash",
+                [hash.to_string()],
+            )
+            .is_err()
+    {
+        return users_redirect(
+            Some("User password updated, but the web sign-in password could not be synchronized."),
+            None,
+        );
+    }
+    users_redirect(Some("Password updated."), None)
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserCreateForm {
+    username: String,
+    password: String,
+    #[serde(default = "default_guest")]
+    user_type: String,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserUpdateForm {
+    username: String,
+    #[serde(default = "default_guest")]
+    user_type: String,
+    #[serde(default)]
+    is_active: bool,
+}
+
+#[derive(serde::Deserialize)]
+pub(crate) struct UserPasswordForm {
+    password: String,
+    #[serde(default)]
+    confirm_password: String,
+}
+
+fn default_guest() -> String {
+    "guest".to_owned()
 }
 
 pub(crate) async fn favicon_handler() -> Response {
@@ -1227,7 +1568,8 @@ pub(crate) async fn settings_page(
         .unwrap_or_default();
     let logs_active = query.tab.as_deref() == Some("logs");
     let dashboard_active = query.tab.as_deref() == Some("dashboard");
-    let settings_stack_style = if logs_active || dashboard_active {
+    let users_active = query.tab.as_deref() == Some("users");
+    let settings_stack_style = if logs_active || dashboard_active || users_active {
         " style=\"display:none\""
     } else {
         ""
@@ -1254,10 +1596,16 @@ pub(crate) async fn settings_page(
     } else {
         ""
     };
+    let users_content_html = if users_active {
+        users_settings_markup(&state, &query)
+    } else {
+        String::new()
+    };
     let notice = format!(
-        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=dashboard\">Dashboard</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{}<dialog id=\"folder-picker\" aria-labelledby=\"folder-picker-title\" style=\"position:relative;width:min(48rem,calc(100vw - 2rem));height:min(38rem,calc(100vh - 2rem));padding:3.5rem 0 0;border:1px solid #394a63;border-radius:1rem;color:#e5eaf4;background:#101a2b\"><header style=\"position:absolute;top:.65rem;left:1rem;right:1rem;display:flex;align-items:center;justify-content:space-between\"><h2 id=\"folder-picker-title\">Choose a media folder</h2><button id=\"folder-picker-close\" type=\"button\" aria-label=\"Close folder picker\" title=\"Close folder picker\">×</button></header><iframe id=\"folder-picker-frame\" title=\"Media folder browser\" src=\"/settings/browse\" style=\"width:100%;height:calc(100% - 1rem);border:0;border-radius:0 0 1rem 1rem\"></iframe></dialog><script>document.addEventListener('DOMContentLoaded',()=>{{const params=new URLSearchParams(location.search);if(params.get('add_library')==='true')document.querySelector('.add-library')?.setAttribute('open','');const openLibrary=Number(params.get('library_open'));if(Number.isInteger(openLibrary)&&openLibrary>=0)document.querySelectorAll('.library-list details.library-card')[openLibrary]?.setAttribute('open','');}});</script>",
-        if logs_active || dashboard_active { "" } else { "active" },
+        "<nav class=\"settings-tabs\" aria-label=\"Settings sections\"><a class=\"{}\" href=\"/settings\">Libraries</a><a class=\"{}\" href=\"/settings?tab=dashboard\">Dashboard</a><a class=\"{}\" href=\"/settings?tab=users\">Users</a><a class=\"{}\" href=\"/settings?tab=logs\">Logs</a></nav>{}<dialog id=\"folder-picker\" aria-labelledby=\"folder-picker-title\" style=\"position:relative;width:min(48rem,calc(100vw - 2rem));height:min(38rem,calc(100vh - 2rem));padding:3.5rem 0 0;border:1px solid #394a63;border-radius:1rem;color:#e5eaf4;background:#101a2b\"><header style=\"position:absolute;top:.65rem;left:1rem;right:1rem;display:flex;align-items:center;justify-content:space-between\"><h2 id=\"folder-picker-title\">Choose a media folder</h2><button id=\"folder-picker-close\" type=\"button\" aria-label=\"Close folder picker\" title=\"Close folder picker\">×</button></header><iframe id=\"folder-picker-frame\" title=\"Media folder browser\" src=\"/settings/browse\" style=\"width:100%;height:calc(100% - 1rem);border:0;border-radius:0 0 1rem 1rem\"></iframe></dialog><script>document.addEventListener('DOMContentLoaded',()=>{{const params=new URLSearchParams(location.search);if(params.get('add_library')==='true')document.querySelector('.add-library')?.setAttribute('open','');const openLibrary=Number(params.get('library_open'));if(Number.isInteger(openLibrary)&&openLibrary>=0)document.querySelectorAll('.library-list details.library-card')[openLibrary]?.setAttribute('open','');}});</script>",
+        if logs_active || dashboard_active || users_active { "" } else { "active" },
         if dashboard_active { "active" } else { "" },
+        if users_active { "active" } else { "" },
         if logs_active { "active" } else { "" },
         notice
     );
@@ -1468,7 +1816,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 {dashboard_styles_html}
 .settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
 </style></head><body><div class="app-shell">{}
-<main class="with-global-topbar">{}<header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
+<main class="with-global-topbar">{}<header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, users, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbinger to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbinger.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata, artwork, and skip markers are written only to the selected location. Config mode never writes to media folders.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
@@ -1476,7 +1824,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 <section class="settings-card" aria-labelledby="libraries-heading"><div class="section-heading"><div><h2 id="libraries-heading">Libraries</h2><p class="section-description">A library groups media of one type from one or more monitored folders. Add a folder to an existing library when the same collection spans multiple locations.</p></div></div><details class="add-library"><summary>Add a library</summary><form method="post" action="/settings/libraries" class="settings-form"><div class="form-grid"><label class="field"><span>Library name</span><input name="name" type="text" placeholder="e.g. Films" required></label><label class="field"><span>Content type</span><select name="kind"><option value="movie">Movies</option><option value="tv">TV Shows</option><option value="audiobooks">Audiobooks</option><option value="other">Other</option></select></label></div><div class="field"><span>Media folders</span><div class="path-list" id="new-library-paths"><div class="path-row"><label class="sr-only" for="new-path-0">Folder path</label><input id="new-path-0" name="path[]" type="text" placeholder="/path/to/folder" value="{}" required><a class="button-link button-secondary" href="/settings/browse">Browse</a><button type="button" class="button-quiet remove-path" aria-label="Remove folder path" title="Remove folder path" disabled>−</button></div></div></div><div class="action-row path-actions"><button type="button" class="button-secondary" id="add-path" aria-label="Add another folder path" title="Add another folder path">＋ Add folder</button><button type="submit">Create library</button></div></form></details>
 <div class="library-list">{}</div></section>
 </div>{}{dashboard_content_html}
- </main></div><script>
+{users_content_html} </main></div><script>
 const shell = document.querySelector('.app-shell'); const toggle = document.querySelector('.sidebar-toggle');
 if (localStorage.getItem('mplex-sidebar-collapsed') === 'true') shell.classList.add('sidebar-collapsed');
 toggle?.addEventListener('click', () => {{ const collapsed = shell.classList.toggle('sidebar-collapsed'); localStorage.setItem('mplex-sidebar-collapsed', collapsed ? 'true' : 'false'); }});
@@ -7265,6 +7613,7 @@ pub(crate) async fn root_handler(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn web_admin_exists(state: &AppState) -> bool {
     state
         .db
@@ -7273,6 +7622,22 @@ pub(crate) fn web_admin_exists(state: &AppState) -> bool {
         .and_then(|db| {
             db.query_row(
                 "SELECT EXISTS(SELECT 1 FROM web_admin WHERE id = 1)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn users_exist(state: &AppState) -> bool {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE password_hash IS NOT NULL)",
                 [],
                 |row| row.get::<_, bool>(0),
             )
@@ -7337,14 +7702,14 @@ pub(crate) async fn web_auth_gate(
     if !web_page || (path == "/" && plex_client) || path.starts_with("/auth") {
         return next.run(request).await;
     }
-    if !web_admin_exists(&state) || !web_session_valid(&state, request.headers()) {
+    if users_exist(&state) && !web_session_valid(&state, request.headers()) {
         return Redirect::to("/auth").into_response();
     }
     next.run(request).await
 }
 
 pub(crate) async fn auth_page(State(state): State<AppState>) -> Response {
-    let setup = !web_admin_exists(&state);
+    let setup = !users_exist(&state);
     let (title, description, button) = if setup {
         (
             "Create administrator login",
@@ -7379,8 +7744,7 @@ pub(crate) async fn auth_setup(
     State(state): State<AppState>,
     Form(form): Form<AdminLoginForm>,
 ) -> Response {
-    if form.password.len() < 8 || form.password != form.confirm_password || web_admin_exists(&state)
-    {
+    if form.password.len() < 8 || form.password != form.confirm_password || users_exist(&state) {
         return (
             StatusCode::BAD_REQUEST,
             "Setup is unavailable, passwords do not match, or the password is too short",
@@ -7394,8 +7758,12 @@ pub(crate) async fn auth_setup(
     let Ok(db) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    match db.execute(
+    let _ = db.execute(
         "INSERT OR IGNORE INTO web_admin (id, password_hash) VALUES (1, ?1)",
+        [hash.to_string()],
+    );
+    match db.execute(
+        "INSERT OR IGNORE INTO users (id, name, username, password_hash, user_type) VALUES ('admin', 'Administrator', 'admin', ?1, 'admin')",
         [hash.to_string()],
     ) {
         Ok(1) => {}

@@ -2042,7 +2042,15 @@ fn open_database(
          CREATE TABLE IF NOT EXISTS users (
              id TEXT PRIMARY KEY,
              plex_user_id TEXT UNIQUE,
-             name TEXT NOT NULL
+             name TEXT NOT NULL,
+             username TEXT UNIQUE,
+             password_hash TEXT,
+             user_type TEXT NOT NULL DEFAULT 'guest',
+             is_active INTEGER NOT NULL DEFAULT 1,
+             created_at INTEGER NOT NULL DEFAULT 0,
+             last_seen INTEGER NOT NULL DEFAULT 0,
+             permissions TEXT NOT NULL DEFAULT '{}',
+             libraries TEXT NOT NULL DEFAULT '[]'
          );
          CREATE TABLE IF NOT EXISTS web_admin (
              id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -2166,6 +2174,39 @@ fn open_database(
     );
     let _ = connection.execute(
         "ALTER TABLE library_groups ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute("ALTER TABLE users ADD COLUMN username TEXT", []);
+    let _ = connection.execute("ALTER TABLE users ADD COLUMN password_hash TEXT", []);
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN user_type TEXT NOT NULL DEFAULT 'guest'",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE users ADD COLUMN libraries TEXT NOT NULL DEFAULT '[]'",
+        [],
+    );
+    let _ = connection.execute(
+        "INSERT OR IGNORE INTO users (id, name, username, password_hash, user_type)
+         SELECT 'admin', 'Administrator', 'admin', password_hash, 'admin'
+         FROM web_admin WHERE id = 1
+           AND NOT EXISTS (SELECT 1 FROM users WHERE password_hash IS NOT NULL)",
         [],
     );
     connection.execute(
@@ -2331,8 +2372,9 @@ pub(crate) struct SettingsQuery {
     pub(crate) tab: Option<String>,
     pub(crate) library_renamed: Option<bool>,
     pub(crate) library_saved: Option<bool>,
-
     pub(crate) library_created: Option<bool>,
+    pub(crate) user_status: Option<String>,
+    pub(crate) user_error: Option<String>,
 }
 
 #[derive(Deserialize, Default)]

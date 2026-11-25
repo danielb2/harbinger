@@ -4,6 +4,7 @@ use super::{
     plex_part_id, plex_remux_audio_mode, sidebar_nav_with_settings, sync_config_libraries,
     sync_marker_sidecars, AppState, Config, ConfigLibrary, Media, PlexTls, SkipMode,
 };
+use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 use axum::{
     body::{to_bytes, Body},
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode},
@@ -544,6 +545,12 @@ async fn send_async_form(
 #[tokio::test]
 async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
     let fixture = fixture();
+    if let Ok(db) = fixture.state.db.lock() {
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO users (id, name, username, password_hash, user_type) VALUES ('admin', 'Administrator', 'admin', 'test-hash', 'admin')",
+            [],
+        );
+    }
     let app = build_app(fixture.state.clone());
     for path in [
         "/",
@@ -588,6 +595,12 @@ async fn web_ui_requires_admin_session_while_plex_api_remains_available() {
 #[tokio::test]
 async fn web_and_plex_listener_surfaces_are_separated() {
     let fixture = fixture();
+    if let Ok(db) = fixture.state.db.lock() {
+        let _ = db.execute(
+            "INSERT OR IGNORE INTO users (id, name, username, password_hash, user_type) VALUES ('admin', 'Administrator', 'admin', 'test-hash', 'admin')",
+            [],
+        );
+    }
     let web = build_web_listener_app(fixture.state.clone());
     let plex = build_plex_listener_app(fixture.state.clone());
 
@@ -10175,4 +10188,165 @@ async fn web_player_receives_markers_and_independent_skip_modes() {
     assert!(page.contains("function formatMarkerTime"));
     assert!(page.contains("addInfoRow(infoContent, \"Markers\", \"None detected\")"));
     assert!(page.contains("? \"Credits\" : \"Introduction\""));
+}
+
+#[tokio::test]
+async fn settings_users_edits_accounts_and_resets_passwords() {
+    let fixture = fixture();
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/users",
+        "username=alice&password=alice-password&user_type=guest",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(location.starts_with("/settings?tab=users"));
+    assert!(location.contains("user_status=User%20created"));
+
+    {
+        let db = fixture.db.lock().unwrap();
+        let (user_type, is_active): (String, i64) = db
+            .query_row(
+                "SELECT user_type, is_active FROM users WHERE username = 'alice'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(user_type, "guest");
+        assert_eq!(is_active, 1);
+    }
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/users/alice/update",
+        "username=alice&user_type=admin&is_active=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    {
+        let db = fixture.db.lock().unwrap();
+        let user_type: String = db
+            .query_row(
+                "SELECT user_type FROM users WHERE username = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(user_type, "admin");
+    }
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/users/alice/password",
+        "password=new-alice-password&confirm_password=new-alice-password",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    {
+        let db = fixture.db.lock().unwrap();
+        let hash: String = db
+            .query_row(
+                "SELECT password_hash FROM users WHERE username = 'alice'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let parsed = PasswordHash::new(&hash).unwrap();
+        assert!(Argon2::default()
+            .verify_password(b"new-alice-password", &parsed)
+            .is_ok());
+    }
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?tab=users",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let page = String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(page.contains("action=\"/settings/users/alice/update\""));
+    assert!(page.contains("action=\"/settings/users/alice/password\""));
+    assert!(page.contains("Profile and access"));
+    assert!(page.contains("Change password"));
+    assert!(page.contains("Administrator"));
+}
+
+#[tokio::test]
+async fn settings_users_keeps_at_least_one_active_administrator() {
+    let fixture = fixture();
+    {
+        let db = fixture.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO users (id, name, username, password_hash, user_type) VALUES ('admin', 'Administrator', 'admin', 'test-hash', 'admin')",
+            [],
+        )
+        .unwrap();
+    }
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/users/admin/update",
+        "username=admin&user_type=guest&is_active=true",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let location = response.headers()[header::LOCATION].to_str().unwrap();
+    assert!(
+        location.contains("user_error=Keep%20at%20least%20one%20active%20administrator"),
+        "location: {location}"
+    );
+    let db = fixture.db.lock().unwrap();
+    let user_type: String = db
+        .query_row(
+            "SELECT user_type FROM users WHERE id = 'admin'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(user_type, "admin");
+}
+
+#[tokio::test]
+async fn settings_user_password_change_syncs_the_web_sign_in() {
+    let fixture = fixture();
+    {
+        let db = fixture.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO users (id, name, username, password_hash, user_type) VALUES ('admin', 'Administrator', 'admin', 'test-hash', 'admin')",
+            [],
+        )
+        .unwrap();
+    }
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/users/admin/password",
+        "password=admin-new-password&confirm_password=admin-new-password",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let db = fixture.db.lock().unwrap();
+    let hash: String = db
+        .query_row(
+            "SELECT password_hash FROM web_admin WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let parsed = PasswordHash::new(&hash).unwrap();
+    assert!(Argon2::default()
+        .verify_password(b"admin-new-password", &parsed)
+        .is_ok());
 }

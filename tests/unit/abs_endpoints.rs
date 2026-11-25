@@ -54,9 +54,17 @@ fn fixture() -> Fixture {
 
     let db = rusqlite::Connection::open(config_dir.join("state.sqlite")).unwrap();
     db.execute_batch(
-        "CREATE TABLE web_admin (
-             id INTEGER PRIMARY KEY CHECK (id = 1),
-             password_hash TEXT NOT NULL
+        "CREATE TABLE users (
+             id TEXT PRIMARY KEY,
+             name TEXT NOT NULL,
+             username TEXT UNIQUE,
+             password_hash TEXT,
+             user_type TEXT NOT NULL DEFAULT 'admin',
+             is_active INTEGER NOT NULL DEFAULT 1,
+             created_at INTEGER NOT NULL DEFAULT 0,
+             last_seen INTEGER NOT NULL DEFAULT 0,
+             permissions TEXT NOT NULL DEFAULT '{}',
+             libraries TEXT NOT NULL DEFAULT '[]'
          );
          CREATE TABLE web_sessions (
              token_hash TEXT PRIMARY KEY,
@@ -79,8 +87,8 @@ fn fixture() -> Fixture {
         .hash_password(PASSWORD.as_bytes(), &salt)
         .unwrap();
     db.execute(
-        "INSERT INTO web_admin (id, password_hash) VALUES (1, ?1)",
-        [hash.to_string()],
+        "INSERT INTO users (id, name, username, password_hash, user_type) VALUES (?1, 'root', 'root', ?2, 'admin')",
+        ["abs-test-user", &hash.to_string()],
     )
     .unwrap();
     let config = Config {
