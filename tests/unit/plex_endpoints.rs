@@ -2485,7 +2485,7 @@ fn audiobook_web_fixture(name: &str) -> Fixture {
     fixture
 }
 
-fn audiobook_web_fixture_with_metadata(name: &str) -> Fixture {
+fn audiobook_web_fixture_with_metadata(name: &str, description: &str) -> Fixture {
     let fixture = audiobook_web_fixture(name);
     let book_dir = fixture.root.join(name).join("Author One").join("Book One");
     std::fs::write(
@@ -2499,7 +2499,7 @@ fn audiobook_web_fixture_with_metadata(name: &str) -> Fixture {
             "genres": ["Mystery", "Audio Drama"],
             "publishedYear": "2024",
             "publisher": "Northwind Audio",
-            "description": "A harbor town keeps a dangerous secret.",
+            "description": description,
             "chapters": [
                 {"id": 1, "title": "The Arrival", "start": 0.0, "end": 12.5},
                 {"id": 2, "title": "The Lighthouse", "start": 12.5, "end": 25.0}
@@ -2613,7 +2613,10 @@ async fn web_library_book_folder_renders_audiobook_player() {
 
 #[tokio::test]
 async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
-    let fixture = audiobook_web_fixture_with_metadata("audiobooks-web-metadata-player");
+    let fixture = audiobook_web_fixture_with_metadata(
+        "audiobooks-web-metadata-player",
+        "A harbor town keeps a dangerous secret.",
+    );
     let item_id = crate::audiobookshelf::catalog::Catalog::load(&fixture.state).libraries[0].items
         [0]
     .id
@@ -2718,6 +2721,50 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     let resumed = body_string(send(&fixture.app, Method::GET, &uri, Body::empty()).await).await;
     assert!(resumed.contains("data-start=\"12.5\""));
     assert!(resumed.contains("↪ Resume"));
+}
+
+#[tokio::test]
+async fn web_audiobook_description_renders_sanitized_html() {
+    let description = r#"<p><strong>Safe</strong> harbor <em>secret</em>.</p><ul><li>One</li><li>Two</li></ul><script>alert('xss')</script><a href="javascript:alert(1)" onclick="alert(2)">bad link</a><a href="https://example.com" title="safe">good link</a><img src="https://example.com/cover.png"><div onclick="alert(3)">Trick <span>text</span></div><p>unclosed"#;
+    let fixture =
+        audiobook_web_fixture_with_metadata("audiobooks-web-html-description", description);
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/?library=0&path={}",
+            super::url_encode("Author One/Book One")
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+
+    assert!(body.contains("data-audiobook-player"));
+    assert!(body.contains("audiobook-player-shell"));
+    assert!(body.contains("</article>"));
+    let description_start = body
+        .find(r#"<div class="audiobook-description">"#)
+        .expect("audiobook description is rendered");
+    let description_end = description_start
+        + body[description_start..]
+            .find("</article>")
+            .expect("audiobook article closes");
+    let description_markup = &body[description_start..description_end];
+    assert!(description_markup.contains(
+        r#"<div class="audiobook-description"><p><strong>Safe</strong> harbor <em>secret</em>.</p><ul><li>One</li><li>Two</li></ul>"#
+    ));
+    assert!(description_markup.contains("good link"));
+    assert!(description_markup.contains("href=\"https://example.com\""));
+    assert!(description_markup.contains("rel=\"noopener noreferrer\""));
+    assert!(description_markup.contains("Trick <span>text</span>"));
+    assert!(description_markup.contains("unclosed</p>"));
+    assert!(!description_markup.contains("<script"));
+    assert!(!description_markup.contains("alert("));
+    assert!(!description_markup.contains("javascript:"));
+    assert!(!description_markup.contains("onclick="));
+    assert!(!description_markup.contains("<img"));
 }
 
 #[tokio::test]

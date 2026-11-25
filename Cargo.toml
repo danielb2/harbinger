@@ -51,6 +51,7 @@ rusty_aac = { version = "=2.0.1", default-features = false }
 rust_h265 = "=0.4.1"
 rusty_h264-common = "=0.16.1"
 rusty_h264-encoder = "=0.16.1"
+ammonia = "4.2.5"
 
 [profile.dev]
 opt-level = 3

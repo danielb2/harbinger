@@ -4609,7 +4609,7 @@ pub(crate) async fn web_client(
     .audiobook-chapter-title {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     .audiobook-info {{ margin-top: 1.25rem; padding: 1.25rem 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: #1f2937; }}
     .audiobook-info h3 {{ margin: 0 0 .5rem; }}
-    .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; white-space: pre-wrap; }}
+    .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }}
     .audiobook-facts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem 1rem; margin: 1rem 0 0; padding-top: .85rem; border-top: 1px solid rgba(148,163,184,.18); }}
     .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
     .audiobook-fact dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
@@ -7508,6 +7508,46 @@ fn audiobook_media_card(
     )
 }
 
+fn audiobook_description_html(value: &str) -> String {
+    let mut sanitizer = ammonia::Builder::new();
+    sanitizer
+        .tags(std::collections::HashSet::from([
+            "a",
+            "b",
+            "blockquote",
+            "br",
+            "div",
+            "em",
+            "h3",
+            "h4",
+            "h5",
+            "h6",
+            "i",
+            "li",
+            "ol",
+            "p",
+            "s",
+            "span",
+            "strong",
+            "u",
+            "ul",
+        ]))
+        .tag_attributes(std::collections::HashMap::from([(
+            "a",
+            std::collections::HashSet::from(["href", "title"]),
+        )]))
+        .generic_attributes(std::collections::HashSet::new())
+        .url_schemes(std::collections::HashSet::from(["http", "https", "mailto"]))
+        .link_rel(Some("noopener noreferrer"))
+        .clean_content_tags(std::collections::HashSet::from([
+            "audio", "base", "button", "embed", "form", "iframe", "img", "input", "link", "math",
+            "meta", "noscript", "object", "script", "select", "style", "svg", "template",
+            "textarea", "video",
+        ]))
+        .strip_comments(true);
+    sanitizer.clean(value).to_string()
+}
+
 fn audiobook_detail(
     state: &AppState,
     item: &crate::audiobookshelf::catalog::Item,
@@ -7661,11 +7701,12 @@ fn audiobook_detail(
             )
         })
         .collect::<String>();
-    let description = if item.description.trim().is_empty() {
-        "No book description is available in metadata.json.".to_owned()
+    let description_source = if item.description.trim().is_empty() {
+        "No book description is available in metadata.json."
     } else {
-        item.description.clone()
+        &item.description
     };
+    let description = audiobook_description_html(description_source);
     let first_track = tracks
         .first()
         .and_then(|track| track["url"].as_str())
@@ -7702,7 +7743,7 @@ fn audiobook_detail(
   </section>
   <section class="audiobook-info">
     <h3>About this book</h3>
-    <p class="audiobook-description">{description}</p>
+    <div class="audiobook-description">{description}</div>
     <dl class="audiobook-facts">{fact_markup}</dl>
   </section>
 </article>"#,
@@ -7719,7 +7760,7 @@ fn audiobook_detail(
         duration_label = html(&clock_duration(duration)),
         first_track = html(first_track),
         chapter_rows = chapter_rows,
-        description = html(&description),
+        description = description,
         fact_markup = fact_markup,
     )
 }
