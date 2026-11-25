@@ -1763,8 +1763,9 @@ fn log_events_are_formatted_as_logfmt_with_tags() {
     let line = String::from_utf8(output.lock().unwrap().clone()).unwrap();
 
     assert!(line.contains("ts=\""), "{line}");
-    assert!(line.contains("tag=info,abs"), "{line}");
-    assert!(!line.contains("level="), "{line}");
+    assert!(line.contains("level=info"), "{line}");
+    assert!(line.contains("tag=abs"), "{line}");
+    assert!(!line.contains("tag=info,abs"), "{line}");
     assert!(line.contains("event=http_request"), "{line}");
     assert!(line.contains("method=GET"), "{line}");
     assert!(line.contains("path=\"/api/libraries/a b\""), "{line}");

@@ -1947,7 +1947,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
   const isAtBottom = () => logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight <= 4;
   const scrollToLatest = () => {{ logOutput.scrollTop = logOutput.scrollHeight; }};
   const updateFollowButton = () => {{ logFollowButton.hidden = isAtBottom(); }};
-  const logTimestampPattern = /^(ts="[^"]*")(\s+)tag=(TRACE|DEBUG|INFO|WARN|ERROR),([^\s]+)(\s+)(.*)$/i;
+  const logTimestampPattern = /^(ts="[^"]*")(\s+)level=(TRACE|DEBUG|INFO|WARN|ERROR)(\s+)tag=([^\s]+)(\s*)(.*)$/i;
   const appendLogSpan = (parent, className, text) => {{
     const span = document.createElement('span');
     span.className = className;
@@ -1979,11 +1979,14 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
       const styledLine = document.createElement('span');
       appendLogSpan(styledLine, 'log-timestamp', parts[1]);
       styledLine.append(document.createTextNode(parts[2]));
-      appendLogSpan(styledLine, 'log-key', 'tag=');
+      appendLogSpan(styledLine, 'log-key', 'level=');
       appendLogSpan(styledLine, 'log-level-' + parts[3].toLowerCase(), parts[3]);
-      appendLogSpan(styledLine, 'log-tag-source', `,${{parts[4]}}`);
-      styledLine.append(document.createTextNode(parts[5]));
-      appendLogMessage(styledLine, parts[6]);
+      styledLine.append(document.createTextNode(parts[4]));
+      appendLogSpan(styledLine, 'log-key', 'tag=');
+      appendLogSpan(styledLine, 'log-tag-source', parts[5]);
+      if (parts[6]) styledLine.append(document.createTextNode(parts[6]));
+      else if (parts[7]) styledLine.append(document.createTextNode(' '));
+      appendLogMessage(styledLine, parts[7]);
       logOutput.append(styledLine);
     }});
   }};

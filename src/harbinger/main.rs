@@ -711,11 +711,8 @@ where
         let level = event.metadata().level().as_str().to_ascii_lowercase();
         let source =
             source_tag.unwrap_or_else(|| default_log_tag(event.metadata().target()).to_owned());
-        write!(
-            writer,
-            " tag={}",
-            logfmt_value(&format!("{level},{source}"))
-        )?;
+        write!(writer, " level={}", logfmt_value(&level))?;
+        write!(writer, " tag={}", logfmt_value(&source))?;
         for (name, value) in fields {
             write!(writer, " {}={}", name, logfmt_value(&value))?;
         }
