@@ -836,47 +836,82 @@ pub(crate) async fn web_watch_action(
         return StatusCode::NOT_FOUND.into_response();
     }
     let root = selected_library_folder_root(&state, update.library, update.folder);
-    let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
-        warn!(path = %relative.display(), library = ?update.library, action = %update.action, "Web watch action could not find media");
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let Ok(media_key) = media.path.strip_prefix(&root) else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    let media_key = media_key.to_string_lossy().into_owned();
-    let media_keys = if update.scope.as_deref() == Some("show") {
-        let library_config = update.library.and_then(|index| {
+    let audiobook_media_key = if update
+        .library
+        .and_then(|index| {
             state
                 .config
                 .lock()
                 .ok()
                 .and_then(|config| config.libraries.get(index).cloned())
-        });
-        if let Some(library_config) = library_config.filter(|library| library.kind == "tv") {
-            let show_folder = relative
-                .components()
-                .next()
-                .map(|component| PathBuf::from(component.as_os_str()));
-            show_folder
-                .map(|show_folder| {
-                    media_snapshot(&state)
-                        .iter()
-                        .filter(|item| media_in_library(item, &library_config))
-                        .filter_map(|item| {
-                            let relative = item.path.strip_prefix(&root).ok()?;
-                            relative
-                                .starts_with(&show_folder)
-                                .then(|| relative.to_string_lossy().into_owned())
+        })
+        .is_some_and(|library| is_audiobook_library(&library.kind))
+    {
+        web_path(&state, &root, &relative)
+            .await
+            .ok()
+            .and_then(|path| {
+                let catalog = crate::audiobookshelf::catalog::Catalog::load(&state);
+                catalog
+                    .libraries
+                    .iter()
+                    .find(|library| library.source_index == update.library.unwrap_or_default())
+                    .and_then(|library| {
+                        library.items.iter().find_map(|item| {
+                            let item_path = std::fs::canonicalize(&item.path)
+                                .unwrap_or_else(|_| item.path.clone());
+                            (item_path == path).then(|| item.id.clone())
                         })
-                        .collect::<Vec<_>>()
-                })
-                .filter(|keys| !keys.is_empty())
-                .unwrap_or_else(|| vec![media_key.clone()])
-        } else {
-            vec![media_key.clone()]
-        }
+                    })
+            })
     } else {
-        vec![media_key.clone()]
+        None
+    };
+    let media_keys = if let Some(media_key) = audiobook_media_key {
+        vec![media_key]
+    } else {
+        let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
+            warn!(path = %relative.display(), library = ?update.library, action = %update.action, "Web watch action could not find media");
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Ok(media_key) = media.path.strip_prefix(&root) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let media_key = media_key.to_string_lossy().into_owned();
+        if update.scope.as_deref() == Some("show") {
+            let library_config = update.library.and_then(|index| {
+                state
+                    .config
+                    .lock()
+                    .ok()
+                    .and_then(|config| config.libraries.get(index).cloned())
+            });
+            if let Some(library_config) = library_config.filter(|library| library.kind == "tv") {
+                let show_folder = relative
+                    .components()
+                    .next()
+                    .map(|component| PathBuf::from(component.as_os_str()));
+                show_folder
+                    .map(|show_folder| {
+                        media_snapshot(&state)
+                            .iter()
+                            .filter(|item| media_in_library(item, &library_config))
+                            .filter_map(|item| {
+                                let relative = item.path.strip_prefix(&root).ok()?;
+                                relative
+                                    .starts_with(&show_folder)
+                                    .then(|| relative.to_string_lossy().into_owned())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .filter(|keys| !keys.is_empty())
+                    .unwrap_or_else(|| vec![media_key.clone()])
+            } else {
+                vec![media_key]
+            }
+        } else {
+            vec![media_key]
+        }
     };
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -891,7 +926,7 @@ pub(crate) async fn web_watch_action(
         "remove_from_continue" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 0, 1, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET hidden_from_continue = 1, updated_at = excluded.updated_at",
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
-    for media_key in media_keys {
+    for media_key in &media_keys {
         if let Err(error) = connection.execute(sql, (USER_ID, media_key, updated_at)) {
             warn!(action = %update.action, error = %error, "Web watch action database update failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -901,7 +936,7 @@ pub(crate) async fn web_watch_action(
         action = %update.action,
         scope = ?update.scope,
         library = ?update.library,
-        path = %media_key,
+        media_keys = ?media_keys,
         "Web watch action saved"
     );
     StatusCode::NO_CONTENT.into_response()
@@ -4016,22 +4051,12 @@ pub(crate) async fn web_client(
                             .path
                             .strip_prefix(&source_root)
                             .unwrap_or(std::path::Path::new(&item.rel_path));
-                        let details = format!(
-                            "{} track{}",
-                            item.audio_files.len(),
-                            if item.audio_files.len() == 1 { "" } else { "s" }
-                        );
-                        folder_cards.push_str(&folder_card_with_badge(
-                            &item.title,
-                            item_relative,
-                            Some(library_index),
+                        folder_cards.push_str(&audiobook_media_card(
+                            &s,
+                            item,
+                            &item_relative,
+                            library_index,
                             (folder_index > 0).then_some(folder_index),
-                            None,
-                            item.cover_path.is_some(),
-                            false,
-                            None,
-                            Some(&details),
-                            Some(&item.author),
                         ));
                     }
                 }
@@ -7140,6 +7165,73 @@ pub(crate) fn folder_card_with_badge(
         html(name),
         subtitle_markup,
         progress_markup,
+    )
+}
+
+fn audiobook_media_card(
+    state: &AppState,
+    item: &crate::audiobookshelf::catalog::Item,
+    relative: &std::path::Path,
+    library: usize,
+    folder: Option<usize>,
+) -> String {
+    let folder_query = folder
+        .map(|index| format!("folder={index}&"))
+        .unwrap_or_default();
+    let href = format!(
+        "/?library={library}&{folder_query}path={}",
+        url_encode(&relative.to_string_lossy())
+    );
+    let details = format!(
+        "{} track{}",
+        item.audio_files.len(),
+        if item.audio_files.len() == 1 { "" } else { "s" }
+    );
+    let cover_url = item
+        .cover_path
+        .as_ref()
+        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+    let progress = state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT watched, position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+                params![USER_ID, item.id],
+                |row| {
+                    if row.get::<_, bool>(0)? {
+                        return Ok(1.0);
+                    }
+                    let position = row.get::<_, i64>(1)?;
+                    let duration = row.get::<_, Option<i64>>(2)?;
+                    Ok(match duration {
+                        Some(duration) if duration > 0 => {
+                            (position as f64 / duration as f64).clamp(0.0, 1.0)
+                        }
+                        _ => 0.0,
+                    })
+                },
+            )
+            .ok()
+        })
+        .unwrap_or_default();
+    media_card_with_options(
+        None,
+        &href,
+        &item.title,
+        Some(&item.author),
+        Some(&details),
+        progress,
+        None,
+        relative,
+        library,
+        false,
+        false,
+        "audiobook",
+        false,
+        cover_url.as_deref(),
+        Some(&item.id),
     )
 }
 

@@ -2503,8 +2503,63 @@ async fn web_library_root_shows_audiobook_cards() {
         "path={}",
         super::url_encode("Author One/Book One")
     )));
-    assert!(body.contains("/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover"));
+    assert!(
+        body.contains("/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover")
+    );
+    assert!(body.contains("<div class=\"media-card\""));
+    assert!(body.contains("</details></div><a class=\"media-card-info\""));
+    assert_eq!(body.matches("<div class=\"media-card\"").count(), 1);
+    assert!(body.contains("data-watch-action=\"watched\""));
+    assert!(body.contains("data-watch-action=\"unwatched\""));
+    assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
+}
+
+#[tokio::test]
+async fn web_watch_action_marks_audiobook_with_catalog_item_key() {
+    let fixture = audiobook_web_fixture("audiobooks-web-watch-action");
+    let catalog = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+    let item = &catalog.libraries[0].items[0];
+
+    let watched = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/watch-action")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "Author One/Book One",
+                        "library": 0,
+                        "action": "watched",
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(watched.status(), StatusCode::NO_CONTENT);
+
+    let saved = fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+            rusqlite::params![crate::harbinger::USER_ID, &item.id],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap();
+    assert!(saved);
+
+    let home = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let home = body_string(home).await;
+    assert!(home.contains(&format!("data-watch-key=\"{}\"", item.id)));
+    assert!(home.contains("aria-valuenow=\"100\""));
 }
 
 #[tokio::test]

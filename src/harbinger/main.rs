@@ -8143,6 +8143,42 @@ fn media_cover_card(
     watch_scope: &str,
     show_remove_from_continue: bool,
 ) -> String {
+    media_card_with_options(
+        media_id,
+        href,
+        title,
+        subtitle,
+        details,
+        progress,
+        unwatched,
+        media_path,
+        library,
+        tv_card,
+        allow_metadata_actions,
+        watch_scope,
+        show_remove_from_continue,
+        None,
+        None,
+    )
+}
+
+pub(crate) fn media_card_with_options(
+    media_id: Option<&str>,
+    href: &str,
+    title: &str,
+    subtitle: Option<&str>,
+    details: Option<&str>,
+    progress: f64,
+    unwatched: Option<usize>,
+    media_path: &std::path::Path,
+    library: usize,
+    tv_card: bool,
+    allow_metadata_actions: bool,
+    watch_scope: &str,
+    show_remove_from_continue: bool,
+    cover_url: Option<&str>,
+    watch_key: Option<&str>,
+) -> String {
     let subtitle = subtitle
         .map(|value| format!("<span class=\"media-card-subtitle\">{}</span>", html(value)))
         .unwrap_or_default();
@@ -8150,39 +8186,45 @@ fn media_cover_card(
         .map(|value| format!("<span class=\"media-card-details\">{}</span>", html(value)))
         .unwrap_or_default();
     let episode_card = href.contains("&episode=");
-    let cover = media_id
-        .map(|id| {
-            format!(
-                r#"<img src="{}" alt="Cover for {}" loading="lazy">"#,
-                html(&if episode_card {
-                    format!("/web/episode-artwork/{}", url_encode(id))
-                } else {
-                    media_cover_url(id)
-                }),
-                html(title)
-            )
-        })
-        .unwrap_or_else(|| {
-            format!(
-                r#"<div class="media-cover-placeholder" role="img" aria-label="Cover unavailable for {}">No cover available</div>"#,
-                html(title)
-            )
-        });
+    let cover = if let Some(url) = cover_url {
+        format!(
+            r#"<img src="{}" alt="Cover for {}" loading="lazy">"#,
+            html(url),
+            html(title)
+        )
+    } else if let Some(id) = media_id {
+        format!(
+            r#"<img src="{}" alt="Cover for {}" loading="lazy">"#,
+            html(&if episode_card {
+                format!("/web/episode-artwork/{}", url_encode(id))
+            } else {
+                media_cover_url(id)
+            }),
+            html(title)
+        )
+    } else {
+        format!(
+            r#"<div class="media-cover-placeholder" role="img" aria-label="Cover unavailable for {}">No cover available</div>"#,
+            html(title)
+        )
+    };
     let path = html(&media_path.to_string_lossy());
     let folder_index = href
         .split('&')
         .find_map(|part| part.strip_prefix("folder="))
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_default();
-    let watch_key = if watch_scope == "show" {
-        media_path
-            .components()
-            .next()
-            .map(|component| html(&component.as_os_str().to_string_lossy()))
-            .unwrap_or_else(|| path.clone())
-    } else {
-        path.clone()
-    };
+    let watch_key = watch_key.map(html).unwrap_or_else(|| {
+        if watch_scope == "show" {
+            media_path
+                .components()
+                .next()
+                .map(|component| html(&component.as_os_str().to_string_lossy()))
+                .unwrap_or_else(|| path.clone())
+        } else {
+            path.clone()
+        }
+    });
     let card_class = if episode_card {
         "media-card media-card-tv media-card-episode"
     } else if tv_card {
@@ -8240,8 +8282,11 @@ fn media_cover_card(
     } else {
         String::new()
     };
+    let menu = format!(
+        r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">Mark as unwatched</button>{remove_action}{fix_match_action}</div></details>"#
+    );
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a><details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Mark as unwatched</button><button type="button" data-watch-action="remove_from_continue" data-path="{}" data-library="{}" data-watch-scope="{}" data-watch-key="{}">Remove from Continue Watching</button>{}</div></details></div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a>{}</div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
         path,
@@ -8252,15 +8297,7 @@ fn media_cover_card(
         html(href),
         cover,
         unwatched_badge,
-        path,
-        library,
-        watch_scope,
-        watch_key,
-        path,
-        library,
-        watch_scope,
-        watch_key,
-        fix_match_action,
+        menu,
         html(href),
         card_info_style,
         html(title),
