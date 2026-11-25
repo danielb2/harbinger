@@ -1208,6 +1208,9 @@ async fn settings_can_rename_a_library() {
         body.contains("name=\"name\" type=\"text\" form=\"library-settings-0\" value=\"My Films\"")
     );
     assert!(body.contains("flex-wrap:nowrap"));
+    assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
+    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body.contains("input, select, textarea { font-size: 16px; }"));
     assert!(body
         .contains("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>"));
 }
@@ -2605,6 +2608,13 @@ async fn web_library_book_folder_renders_audiobook_player() {
     assert!(body.contains("class=\"audiobook-audio\""));
     assert!(body.contains("<h1>Book One</h1>"));
     assert!(!body.contains(r#"class="breadcrumb""#));
+    assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
+    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body
+        .contains(".audiobook-player-options { flex-wrap: wrap; gap: .5rem; font-size: .75rem; }"));
+    assert!(body.contains(".audiobook-chapter-control { flex-basis: 100%; }"));
+    assert!(body.contains(".audiobook-transport button { min-width: 2.75rem; height: 2.75rem;"));
+    assert!(body.contains("input, select, textarea { font-size: 16px; }"));
     assert!(body.contains("About this book"));
     assert!(body.contains("Chapter 01"));
     assert!(body.contains(
@@ -2682,9 +2692,9 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     assert!(body.contains("A harbor town keeps a dangerous secret."));
     assert!(body.contains("The Arrival"));
     assert!(body.contains("The Lighthouse"));
-    assert!(
-        body.contains(r#"<select class="audiobook-chapter-select" aria-label="Select chapter">"#)
-    );
+    assert!(body.contains(
+        r#"<label class="audiobook-chapter-control">Chapter <select class="audiobook-chapter-select" aria-label="Select chapter">"#
+    ));
     assert!(
         body.contains(r#"<option value="0" data-audiobook-seek="0">The Arrival · 0:13</option>"#)
     );
@@ -2765,7 +2775,11 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
 
     let resumed = body_string(send(&fixture.app, Method::GET, &uri, Body::empty()).await).await;
     assert!(resumed.contains("data-start=\"12.5\""));
-    assert!(resumed.contains("↪ Resume"));
+    assert!(!resumed.contains("audiobook-resume-button"));
+    assert!(!resumed.contains("↪ Resume"));
+    assert!(resumed.contains(r#"window.addEventListener("pagehide", flushProgress)"#));
+    assert!(resumed.contains("keepalive: true"));
+    assert!(resumed.contains("if (hasStarted && !pageClosing) save(false)"));
 }
 
 #[tokio::test]
@@ -6299,6 +6313,13 @@ async fn home_page_search_returns_matching_media_and_empty_state() {
     .unwrap();
     assert!(body.contains("Search all media"));
     assert!(body.contains("id=\"global-media-search\""));
+    assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
+    assert!(body.contains(".sidebar-toggle { display: none; } .sidebar-label { display: none; }"));
+    assert!(body.contains(".sidebar-nav::-webkit-scrollbar { display: none; }"));
+    assert!(body.contains(".media-card-menu-items { right: 0; min-width: 9rem;"));
+    assert!(body.contains(".continue-grid > .empty-state { grid-column: 1 / -1; }"));
+    assert!(body.contains("input, select, textarea { font-size: 16px; }"));
+    assert!(body.contains("@media(max-width:700px){.harbinger-build-info{display:none}}"));
     assert!(
         body.find("<aside class=\"sidebar\">").unwrap()
             < body.find("class=\"global-topbar\"").unwrap()

@@ -1850,7 +1850,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 .metadata-options {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .8rem; }} .metadata-option {{ display: flex; min-height: 9rem; align-items: flex-start; gap: .8rem; padding: 1rem; border: 1px solid #35445b; border-radius: .75rem; background: rgba(12, 21, 36, .68); cursor: pointer; transition: border-color .15s, background .15s; }} .metadata-option:has(input:checked) {{ border-color: #4e8cec; background: rgba(28, 65, 120, .22); }} .metadata-option input {{ flex: 0 0 auto; width: 1.05rem; height: 1.05rem; margin: .14rem 0 0; accent-color: #4389f5; }} .option-copy {{ display: grid; gap: .55rem; }} .option-copy strong {{ color: #e7edf7; }} .option-copy .note {{ margin: 0; font-size: .84rem; }} code {{ color: #c5dcff; font: .88em ui-monospace, SFMono-Regular, Menlo, monospace; }}
 .library-list {{ display: grid; gap: .85rem; margin: 1.2rem 0 0; padding: 0; list-style: none; }} .library-card {{ min-width: 0; padding: 1.05rem; border: 1px solid #2c3a50; border-radius: .8rem; background: rgba(10, 17, 30, .46); }} .library-heading {{ display: flex; align-items: center; justify-content: space-between; gap: 1rem; }} .library-heading > div {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .type-pill {{ padding: .28rem .55rem; border: 1px solid #354a68; border-radius: 999px; color: #b9cee9; background: #17243a; font-size: .72rem; font-weight: 700; }} .library-folders {{ margin-top: 1.15rem; }} .library-folders ul {{ display: grid; gap: .45rem; margin: 0; padding: 0; list-style: none; }} .library-folders li {{ min-width: 0; margin: 0; padding: .6rem .7rem; overflow-wrap: anywhere; border-radius: .48rem; background: #0d1727; }} .library-folders code {{ overflow-wrap: anywhere; }} .library-add-folder, .add-library {{ margin-top: .8rem; }} .add-library {{ margin: 0; }} .add-library .settings-form {{ margin-top: 1rem; }} summary {{ display: inline-flex; align-items: center; gap: .5rem; padding: .48rem .68rem; border: 1px solid #394a63; border-radius: .55rem; color: #bfcee2; background: #172337; font-size: .82rem; font-weight: 650; cursor: pointer; list-style: none; }} summary::before {{ content: "+"; color: #83b4ff; font-size: 1rem; }} details[open] summary::before {{ content: "−"; }} summary::-webkit-details-marker {{ display: none; }} .inline-form {{ display: flex; flex-wrap: wrap; align-items: end; gap: .55rem; margin-top: .75rem; }} .inline-form input:not([type="hidden"]) {{ flex: 1 1 18rem; }} .path-list {{ display: grid; gap: .55rem; }} .path-row {{ display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }} .path-row input {{ flex: 1 1 18rem; }} .path-row .button-link {{ flex: 0 0 auto; }} .library-tools {{ display: grid; grid-template-columns: minmax(0, auto) minmax(0, 1fr); align-items: start; gap: 1rem; margin-top: 1.1rem; padding-top: 1rem; border-top: 1px solid #26354a; }} .library-tools > .inline-form {{ margin: 0; }} .library-display fieldset {{ display: flex; flex-wrap: wrap; align-items: center; gap: .6rem 1rem; min-width: 0; margin: 0; padding: 0; border: 0; }} .library-display legend {{ width: 100%; margin-bottom: .55rem; color: #91a0b6; font-size: .72rem; font-weight: 750; letter-spacing: .09em; text-transform: uppercase; }} .library-display label {{ display: inline-flex; align-items: center; gap: .4rem; color: #c6d0df; font-size: .82rem; }} input[type="checkbox"] {{ width: 1rem; height: 1rem; margin: 0; accent-color: #4389f5; }} .library-display button {{ min-height: 2.3rem; padding: .48rem .7rem; font-size: .78rem; }} .empty-state {{ margin: 0; padding: 1rem; border: 1px dashed #35445b; border-radius: .7rem; color: #9aa8bf; text-align: center; }} .sr-only {{ position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }}
 .library-card {{ padding: 0; overflow: hidden; }} .library-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; gap: .8rem; padding: 1rem 1.05rem; border: 0; border-radius: 0; color: #e8eef8; background: transparent; font-size: .95rem; text-align: left; }} .library-summary::before {{ content: none !important; }} .library-summary::after {{ content: "⌄"; margin-left: auto; color: #91a8c7; transition: transform .15s; }} .library-card[open] > .library-summary::after {{ transform: rotate(180deg); }} .library-summary-title {{ display: flex; flex-wrap: wrap; align-items: center; gap: .65rem; }} .folder-count {{ flex: 0 0 auto; color: #91a0b6; font-size: .78rem; font-weight: 500; }} .library-content {{ padding: 0 1.05rem 1.05rem; }} .library-tools {{ grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto; }} .library-delete {{ display: flex; justify-content: flex-end; }} .button-danger {{ border-color: #713841; color: #ffd3d7; background: #3a202a; }} .button-danger:hover {{ border-color: #9d4b55; background: #512630; }}
-@media (max-width: 820px) {{ .library-tools {{ grid-template-columns: 1fr; }} .library-delete {{ justify-content: flex-start; }} }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} main {{ padding: 1.35rem 1rem 2.5rem; }} }} @media (max-width: 560px) {{ .metadata-options, .form-grid {{ grid-template-columns: 1fr; }} .metadata-option {{ min-height: auto; }} .section-heading {{ display: block; }} .library-tools .inline-form > * {{ flex: 1 1 auto; }} .library-display fieldset {{ align-items: flex-start; }} .action-row > form, .action-row button {{ width: 100%; }} .action-row > form {{ flex: 1 1 100%; }} }}
+@media (max-width: 820px) {{ .library-tools {{ grid-template-columns: 1fr; }} .library-delete {{ justify-content: flex-start; }} }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ justify-content: flex-start; padding-bottom: .35rem; }} .sidebar-brand {{ padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-collapsed .sidebar-top {{ justify-content: flex-start; }} .sidebar-collapsed .sidebar-brand {{ font-size: 1.25rem; }} .sidebar-collapsed .sidebar-link {{ justify-content: flex-start; padding-left: .7rem; padding-right: .7rem; font-size: 1rem; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }} .sidebar-nav {{ display: flex; gap: .35rem; padding-bottom: .2rem; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; -webkit-overflow-scrolling: touch; }} .sidebar-nav::-webkit-scrollbar {{ display: none; }} .sidebar-link {{ min-height: 2.75rem; white-space: nowrap; }} main {{ padding: 1.35rem 1rem max(2.5rem, calc(1.35rem + env(safe-area-inset-bottom, 0px))); }} input, select, textarea {{ font-size: 16px; }} }} @media (max-width: 560px) {{ .metadata-options, .form-grid {{ grid-template-columns: 1fr; }} .metadata-option {{ min-height: auto; }} .section-heading {{ display: block; }} .library-tools .inline-form > * {{ flex: 1 1 auto; }} .library-display fieldset {{ align-items: flex-start; }} .action-row > form, .action-row button {{ width: 100%; }} .action-row > form {{ flex: 1 1 100%; }} }}
 .library-scan-settings {{ display: flex; grid-column: 1 / -1; flex-wrap: wrap; align-items: center; gap: .4rem; padding-top: .9rem; border-top: 1px solid #26354a; }} .library-scan-settings > strong {{ margin-right: .25rem; }} .library-scan-settings label {{ display: flex; align-items: center; gap: .4rem; color: #c9d4e4; font-size: .84rem; }} .library-scan-settings input[type="number"] {{ width: 5.5rem; }} .library-scan-settings select {{ width: auto; }}
 
 .library-add-folder[open] > summary::before {{ content: "+"; }}
@@ -3285,7 +3285,7 @@ pub(crate) async fn home_client(State(state): State<AppState>, search: Option<St
         ),
     );
     let mut home_page = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; }} .sidebar-nav {{ display: flex; overflow-x: auto; }} .sidebar-link {{ white-space: nowrap; }} .sidebar-label {{ display: none; }} .sidebar-toggle {{ display: none; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><form class="section" method="get" action="/" role="search"><label for="media-search">Search all media</label><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="media-search" name="search" type="search" value="{}" style="flex:1;min-width:0;padding:.7rem;border:1px solid #374151;border-radius:.45rem;color:#fff;background:#0d1421" autocomplete="off"><button type="submit">Search</button></div></form>{}<section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} .continue-grid > .empty-state {{ grid-column: 1 / -1; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ justify-content: flex-start; padding-bottom: .35rem; }} .sidebar-brand {{ display: inline-block; padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-collapsed .sidebar-top {{ justify-content: flex-start; }} .sidebar-collapsed .sidebar-brand {{ font-size: 1.25rem; }} .sidebar-collapsed .sidebar-link {{ justify-content: flex-start; padding-left: .7rem; padding-right: .7rem; font-size: 1rem; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }} .sidebar-nav {{ display: flex; gap: .35rem; padding-bottom: .2rem; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; -webkit-overflow-scrolling: touch; }} .sidebar-nav::-webkit-scrollbar {{ display: none; }} .sidebar-link {{ min-height: 2.75rem; white-space: nowrap; }} main {{ padding: 1rem .9rem max(2rem, calc(1.25rem + env(safe-area-inset-bottom, 0px))); }} h1 {{ font-size: clamp(1.65rem, 7vw, 2rem); line-height: 1.15; overflow-wrap: anywhere; }} .library-grid, .recent-grid, .continue-grid {{ gap: .7rem; }} .media-card {{ padding: .55rem; }} .media-card-menu summary {{ min-width: 2.5rem; min-height: 2.5rem; padding: .45rem; }} .media-card-menu-items {{ right: 0; min-width: 9rem; max-width: calc(100vw - 2rem); }} .media-card-menu-items button {{ min-height: 2.5rem; }} input, select, textarea {{ font-size: 16px; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><form class="section" method="get" action="/" role="search"><label for="media-search">Search all media</label><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="media-search" name="search" type="search" value="{}" style="flex:1;min-width:0;padding:.7rem;border:1px solid #374151;border-radius:.45rem;color:#fff;background:#0d1421" autocomplete="off"><button type="submit">Search</button></div></form>{}<section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
         POSTER_CARD_MIN_WIDTH,
         sidebar_markup,
         html(search_term),
@@ -4507,7 +4507,10 @@ pub(crate) async fn web_client(
   <title>harbinger</title>
   <style>
     :root {{ color-scheme: dark; font-family: system-ui, sans-serif; }}
+    html {{ -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }}
     body {{ margin: 0; background: #111827; color: #f9fafb; }}
+    a, button, summary, select {{ touch-action: manipulation; }}
+    img, video {{ max-width: 100%; }}
     .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns .2s ease; }}
     .app-shell.sidebar-collapsed {{ grid-template-columns: 68px minmax(0, 1fr); }}
     .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }}
@@ -4529,7 +4532,7 @@ pub(crate) async fn web_client(
     .sidebar-collapsed .sidebar-link {{ justify-content: center; padding-left: 0; padding-right: 0; }}
     .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }}
     main {{ min-width: 0; max-width: 1100px; width: 100%; box-sizing: border-box; margin: 0 auto; padding: 2rem 1rem; }}
-    h1 {{ margin-top: 0; }}
+    h1 {{ margin-top: 0; overflow-wrap: anywhere; }}
     .brand {{ color: inherit; text-decoration: none; }}
     .library {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); align-items: start; gap: 1rem; }}
     .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
@@ -4630,7 +4633,20 @@ pub(crate) async fn web_client(
     .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
     .audiobook-fact dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
     @media (max-width: 640px) {{ .metadata-panel-layout {{ grid-template-columns: minmax(84px, 26vw) minmax(0, 1fr); gap: .8rem; }} .metadata-panel {{ padding: 1rem; }} }}
-    @media (max-width: 600px) {{ .audiobook-player-shell {{ padding: 1rem; }} .audiobook-player-options {{ gap: .5rem; font-size: .75rem; }} .audiobook-player-options select {{ max-width: 6.5rem; }} .audiobook-volume {{ width: 4rem; }} }}
+    @media (max-width: 600px) {{
+      .audiobook-player-shell {{ padding: 1rem; }}
+      .audiobook-player-options {{ flex-wrap: wrap; gap: .5rem; font-size: .75rem; }}
+      .audiobook-player-options select {{ max-width: 6.5rem; }}
+      .audiobook-chapter-control {{ flex-basis: 100%; }}
+      .audiobook-chapter-control select {{ width: 100%; max-width: none; }}
+      .audiobook-volume {{ width: 4rem; }}
+      .audiobook-transport {{ gap: .4rem; }}
+      .audiobook-transport button {{ min-width: 2.75rem; height: 2.75rem; padding: 0 .45rem; }}
+      .audiobook-seek {{ height: 2rem; }}
+      .audiobook-player-heading h3 {{ font-size: 1.1rem; }}
+      .audiobook-info {{ padding: 1rem; }}
+    }}
+    @media (max-width: 480px) {{ .metadata-panel-layout {{ grid-template-columns: 72px minmax(0, 1fr); gap: .65rem; }} .metadata-panel {{ padding: .85rem; }} }}
     .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
@@ -4644,13 +4660,30 @@ pub(crate) async fn web_client(
     @media (max-width: 700px) {{
       .app-shell {{ display: block; }}
       .sidebar {{ position: static; height: auto; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }}
-      .sidebar-top {{ padding-bottom: .35rem; }}
+      .sidebar-top {{ justify-content: flex-start; padding-bottom: .35rem; }}
       .sidebar-brand {{ display: inline-block; padding: .35rem .55rem; }}
       .sidebar-toggle {{ display: none; }}
       .sidebar-label {{ display: none; }}
-      .sidebar-nav {{ display: flex; overflow-x: auto; }}
-      .sidebar-link {{ white-space: nowrap; }}
-      main {{ padding-top: 1.25rem; }}
+      .sidebar-collapsed .sidebar-top {{ justify-content: flex-start; }}
+      .sidebar-collapsed .sidebar-brand {{ font-size: 1.25rem; }}
+      .sidebar-collapsed .sidebar-link {{ justify-content: flex-start; padding-left: .7rem; padding-right: .7rem; font-size: 1rem; }}
+      .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }}
+      .sidebar-nav {{ display: flex; gap: .35rem; padding-bottom: .2rem; overflow-x: auto; overscroll-behavior-x: contain; scrollbar-width: none; -webkit-overflow-scrolling: touch; }}
+      .sidebar-nav::-webkit-scrollbar {{ display: none; }}
+      .sidebar-link {{ min-height: 2.75rem; white-space: nowrap; }}
+      main {{ padding: 1rem .9rem max(2rem, calc(1.25rem + env(safe-area-inset-bottom, 0px))); }}
+      h1 {{ font-size: clamp(1.65rem, 7vw, 2rem); line-height: 1.15; }}
+      .library {{ gap: .7rem; }}
+      .breadcrumb a {{ display: inline-flex; min-height: 2.5rem; align-items: center; padding: .45rem .6rem; }}
+      .media-card {{ padding: .55rem; }}
+      .media-card-menu summary {{ min-width: 2.5rem; min-height: 2.5rem; padding: .45rem; border-radius: .45rem 0 0 0; }}
+      .media-card-menu-items {{ right: 0; min-width: 9rem; max-width: calc(100vw - 2rem); }}
+      .media-card-menu-items button {{ min-height: 2.5rem; }}
+      .info-row {{ grid-template-columns: minmax(0, 1fr); gap: .15rem; }}
+      dialog {{ max-height: calc(100vh - 2rem); overflow: auto; }}
+      dialog form button {{ min-width: 2.75rem; min-height: 2.75rem; }}
+      .play-actions button, .subtitle-picker select, .audio-picker select, .match-form button, .skip-controls button {{ min-height: 2.75rem; }}
+      input, select, textarea {{ font-size: 16px; }}
       article {{ grid-column: 1 / -1; }}
     }}
   </style>
@@ -5362,7 +5395,6 @@ pub(crate) async fn web_client(
       const positionLabel = player.querySelector(".audiobook-player-position");
       const toggleButtons = [...player.querySelectorAll(".audiobook-toggle-button")];
       const chapterSelect = player.querySelector(".audiobook-chapter-select");
-      const resumeButton = player.querySelector(".audiobook-resume-button");
       const previousChapter = player.querySelector(".audiobook-previous-chapter");
       const nextChapter = player.querySelector(".audiobook-next-chapter");
       if (!audio || !seek) return;
@@ -5380,6 +5412,8 @@ pub(crate) async fn web_client(
       let trackIndex = 0;
       let pendingSeek = null;
       let resumed = false;
+      let hasStarted = false;
+      let pageClosing = false;
       let saveTimer = null;
       let lastSave = 0;
       const trackStart = index => durations.slice(0, index).reduce((sum, value) => sum + value, 0);
@@ -5450,7 +5484,7 @@ pub(crate) async fn web_client(
       const sendProgress = watched => {{
         const positionMs = Math.round(Math.min(absoluteTime(), duration || absoluteTime()) * 1000);
         fetch("/web/progress", {{
-          method: "POST", headers: {{ "content-type": "application/json" }},
+          method: "POST", headers: {{ "content-type": "application/json" }}, keepalive: true,
           body: JSON.stringify({{
             path: player.dataset.path,
             library: Number(player.dataset.library),
@@ -5461,7 +5495,6 @@ pub(crate) async fn web_client(
           }})
         }}).catch(() => {{}});
         lastSave = Date.now();
-        if (resumeButton && positionMs > 2000) resumeButton.hidden = false;
       }};
       const save = watched => {{
         if (watched || audio.paused) {{
@@ -5474,6 +5507,16 @@ pub(crate) async fn web_client(
         const delay = Math.max(0, 5000 - (Date.now() - lastSave));
         saveTimer = setTimeout(() => {{ saveTimer = null; if (!audio.paused) sendProgress(false); }}, delay);
       }};
+      const flushProgress = () => {{
+        if (pageClosing || !hasStarted) return;
+        pageClosing = true;
+        sendProgress(false);
+      }};
+      window.addEventListener("pagehide", flushProgress);
+      document.addEventListener("visibilitychange", () => {{
+        if (document.visibilityState === "hidden") flushProgress();
+        else pageClosing = false;
+      }});
       const togglePlayback = () => {{
         if (!audio.paused) {{ audio.pause(); return; }}
         if (status) status.textContent = "";
@@ -5498,7 +5541,6 @@ pub(crate) async fn web_client(
         const option = event.target.selectedOptions[0];
         if (option) seekTo(Number(option.dataset.audiobookSeek || 0));
       }});
-      resumeButton?.addEventListener("click", () => seekTo(Number(player.dataset.start || 0)));
       player.querySelector(".audiobook-speed")?.addEventListener("change", event => {{
         audio.playbackRate = Number(event.target.value) || 1;
       }});
@@ -5513,13 +5555,12 @@ pub(crate) async fn web_client(
         if (!resumed && Number(player.dataset.start || 0) > 2) {{
           resumed = true;
           seekTo(Number(player.dataset.start));
-          if (resumeButton) resumeButton.hidden = false;
         }}
         update();
       }});
       audio.addEventListener("timeupdate", () => {{ update(); if (!audio.paused) save(false); }});
-      audio.addEventListener("play", update);
-      audio.addEventListener("pause", () => {{ update(); save(false); }});
+      audio.addEventListener("play", () => {{ hasStarted = true; update(); }});
+      audio.addEventListener("pause", () => {{ update(); if (hasStarted && !pageClosing) save(false); }});
       audio.addEventListener("error", () => {{
         if (status) status.textContent = "This audio file could not be played. Try another track or check the server log.";
       }});
@@ -6647,7 +6688,7 @@ fn sidebar_nav_markup(home_active: bool, settings_active: bool, library_links: &
 }
 
 fn global_search_markup() -> &'static str {
-    r##"<style>.global-topbar{position:relative;display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;border-bottom:0;background:transparent}.global-topbar-form{position:relative;width:100%}.global-topbar-form input{box-sizing:border-box;width:100%;min-height:2.15rem;padding:.35rem .65rem;border:1px solid #374151;border-radius:.5rem;color:#fff;background:rgba(17,24,39,.8)}@media(max-width:700px){.global-topbar{margin-bottom:.5rem}}</style><header class="global-topbar"><form class="global-topbar-form" id="global-media-search-form" role="search" action="/" method="get"><input id="global-media-search" name="search" type="search" value="" placeholder="Search…" aria-label="Search all media" autocomplete="off"><div id="global-media-search-results" role="status" aria-live="polite" hidden style="position:absolute;top:calc(100% + .4rem);left:0;right:0;z-index:60;max-height:65vh;overflow:auto;padding:.55rem;border:1px solid #374151;border-radius:.55rem;background:#0b1020;box-shadow:0 12px 28px #0009"></div></form></header><script>
+    r##"<style>.global-topbar{position:relative;display:flex;align-items:center;justify-content:flex-start;width:100%;min-height:0;margin:0 0 .65rem;padding:.2rem 0;border-bottom:0;background:transparent}.global-topbar-form{position:relative;width:100%}.global-topbar-form input{box-sizing:border-box;width:100%;min-height:2.15rem;padding:.35rem .65rem;border:1px solid #374151;border-radius:.5rem;color:#fff;background:rgba(17,24,39,.8)}@media(max-width:700px){.global-topbar{margin-bottom:.5rem}.global-topbar-form input{min-height:2.75rem;font-size:16px}}</style><header class="global-topbar"><form class="global-topbar-form" id="global-media-search-form" role="search" action="/" method="get"><input id="global-media-search" name="search" type="search" value="" placeholder="Search…" aria-label="Search all media" autocomplete="off"><div id="global-media-search-results" role="status" aria-live="polite" hidden style="position:absolute;top:calc(100% + .4rem);left:0;right:0;z-index:60;max-height:65vh;overflow:auto;padding:.55rem;border:1px solid #374151;border-radius:.55rem;background:#0b1020;box-shadow:0 12px 28px #0009"></div></form></header><script>
 if (!window.__mplexGlobalSearchBound) {
   window.__mplexGlobalSearchBound = true;
   let searchTimer;
@@ -7753,10 +7794,9 @@ fn audiobook_detail(
       <input class="audiobook-seek" type="range" min="0" max="{duration}" value="0" step="0.1" aria-label="Seek through audiobook">
       <div class="audiobook-times"><span class="audiobook-current-time">0:00</span><span class="audiobook-total-time">{duration_label}</span></div>
       <div class="audiobook-player-options">
-        <label>Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.1">1.1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option><option value="2.5">2.5×</option><option value="3">3×</option></select></label>
-        <label>Volume <input class="audiobook-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume"></label>
-        <label>Chapter <select class="audiobook-chapter-select" aria-label="Select chapter">{chapter_options}</select></label>
-        <button type="button" class="audiobook-resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button>
+        <label class="audiobook-speed-control">Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.5">0.5×</option><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.1">1.1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="1.75">1.75×</option><option value="2">2×</option><option value="2.5">2.5×</option><option value="3">3×</option></select></label>
+        <label class="audiobook-volume-control">Volume <input class="audiobook-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume"></label>
+        <label class="audiobook-chapter-control">Chapter <select class="audiobook-chapter-select" aria-label="Select chapter">{chapter_options}</select></label>
       </div>
       <p class="audiobook-status" role="status" aria-live="polite"></p>
       <audio class="audiobook-audio" preload="metadata" src="{first_track}">Your browser does not support HTML audio.</audio>
