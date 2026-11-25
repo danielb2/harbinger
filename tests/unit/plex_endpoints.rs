@@ -2485,6 +2485,33 @@ fn audiobook_web_fixture(name: &str) -> Fixture {
     fixture
 }
 
+fn audiobook_web_fixture_with_metadata(name: &str) -> Fixture {
+    let fixture = audiobook_web_fixture(name);
+    let book_dir = fixture.root.join(name).join("Author One").join("Book One");
+    std::fs::write(
+        book_dir.join("metadata.json"),
+        serde_json::json!({
+            "title": "The Silent Harbor",
+            "subtitle": "A Stormbound Mystery",
+            "authors": ["Nora Vale"],
+            "narrators": ["Iris Quinn"],
+            "series": ["Stormbound #2"],
+            "genres": ["Mystery", "Audio Drama"],
+            "publishedYear": "2024",
+            "publisher": "Northwind Audio",
+            "description": "A harbor town keeps a dangerous secret.",
+            "chapters": [
+                {"id": 1, "title": "The Arrival", "start": 0.0, "end": 12.5},
+                {"id": 2, "title": "The Lighthouse", "start": 12.5, "end": 25.0}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    fixture
+}
+
 async fn body_string(response: axum::response::Response) -> String {
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
@@ -2563,7 +2590,7 @@ async fn web_watch_action_marks_audiobook_with_catalog_item_key() {
 }
 
 #[tokio::test]
-async fn web_library_book_folder_renders_audio_player() {
+async fn web_library_book_folder_renders_audiobook_player() {
     let fixture = audiobook_web_fixture("audiobooks-web-player");
     let uri = format!(
         "/?library=0&path={}",
@@ -2572,11 +2599,125 @@ async fn web_library_book_folder_renders_audio_player() {
     let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
-    assert!(body.contains("<audio"));
-    assert!(body.contains("Chapter 01.m4b"));
-    assert!(body
-        .contains("/web/stream?library=0&amp;path=Author%20One%2FBook%20One%2FChapter%2001.m4b"));
+    assert!(body.contains("data-audiobook-player"));
+    assert!(body.contains("class=\"audiobook-detail\""));
+    assert!(body.contains("class=\"audiobook-player-shell\""));
+    assert!(body.contains("class=\"audiobook-audio\""));
+    assert!(body.contains("About this book"));
+    assert!(body.contains("Chapter 01"));
+    assert!(body.contains(
+        "/web/stream?library=0&amp;folder=0&amp;path=Author%20One%2FBook%20One%2FChapter%2001.m4b"
+    ));
     assert!(!body.contains("No supported media or subfolders here."));
+}
+
+#[tokio::test]
+async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
+    let fixture = audiobook_web_fixture_with_metadata("audiobooks-web-metadata-player");
+    let item_id = crate::audiobookshelf::catalog::Catalog::load(&fixture.state).libraries[0].items
+        [0]
+    .id
+    .clone();
+    let uri = format!(
+        "/?library=0&path={}",
+        super::url_encode("Author One/Book One")
+    );
+    let response = send(&fixture.app, Method::GET, &uri, Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("data-audiobook-player"));
+    assert!(body.contains("The Silent Harbor"));
+    assert!(body.contains("A Stormbound Mystery"));
+    assert!(body.contains("Nora Vale"));
+    assert!(body.contains("Iris Quinn"));
+    assert!(!body.contains("audiobook-detail-hero"));
+    assert!(!body.contains("audiobook-listen-button"));
+    assert!(!body.contains("audiobook-restart-button"));
+    assert!(body.contains("Stormbound #2"));
+    assert!(body.contains("Northwind Audio"));
+    assert!(body.contains("Mystery"));
+    assert!(body.contains("A harbor town keeps a dangerous secret."));
+    assert!(body.contains("The Arrival"));
+    assert!(body.contains("The Lighthouse"));
+    assert!(body.contains(
+        r#"<span class="audiobook-chapter-index">1</span><span class="audiobook-chapter-title">The Arrival"#
+    ));
+    assert!(body.contains(
+        r#"<span class="audiobook-chapter-index">2</span><span class="audiobook-chapter-title">The Lighthouse"#
+    ));
+    assert!(body.contains("&quot;title&quot;:&quot;The Arrival&quot;"));
+    assert!(body.contains("data-duration=\"25\""));
+    assert!(body.contains("data-start=\"0\""));
+    assert!(body.contains(
+        "/web/stream?library=0&amp;folder=0&amp;path=Author%20One%2FBook%20One%2FChapter%2001.m4b"
+    ));
+
+    let update = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/progress")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "Author One/Book One",
+                        "library": 0,
+                        "position_ms": 12500,
+                        "duration_ms": 25000,
+                        "watched": false,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(update.status(), StatusCode::NO_CONTENT);
+
+    let saved = fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT position_ms, duration_ms, watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+            rusqlite::params![crate::harbinger::USER_ID, &item_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(saved, (12500, Some(25000), false));
+
+    let progress_response = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/web/progress?library=0&path={}",
+            super::url_encode("Author One/Book One")
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(progress_response.status(), StatusCode::OK);
+    let progress: serde_json::Value = serde_json::from_slice(
+        &to_bytes(progress_response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(progress["positionMs"], 12500);
+    assert_eq!(progress["durationMs"], 25000);
+
+    let resumed = body_string(send(&fixture.app, Method::GET, &uri, Body::empty()).await).await;
+    assert!(resumed.contains("data-start=\"12.5\""));
+    assert!(resumed.contains("↪ Resume"));
 }
 
 #[tokio::test]
@@ -3695,8 +3836,9 @@ async fn web_and_plex_clients_share_subtitle_selection() {
     assert!(web_player.contains("new WebSocket(subtitleSocketUrl)"));
     assert!(!web_player.contains("setInterval(syncSubtitleSelection, 3000)"));
     assert!(web_player.contains(
-        "const hasPlayer = Boolean(current?.querySelector(\"video[data-progress-path]\"))"
+        "const hasPlayer = Boolean(current?.querySelector(\"video[data-progress-path], [data-audiobook-player]\"))"
     ));
+    assert!(web_player.contains("const hasAudiobookPlayback ="));
 
     let plex_selection = send(
         &fixture.app,

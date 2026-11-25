@@ -25,6 +25,35 @@ pub(crate) struct AudioFile {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct BookChapter {
+    pub(crate) id: usize,
+    pub(crate) title: String,
+    pub(crate) start: f64,
+    pub(crate) end: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct BookMetadata {
+    pub(crate) title: Option<String>,
+    pub(crate) subtitle: String,
+    pub(crate) authors: Vec<String>,
+    pub(crate) narrators: Vec<String>,
+    pub(crate) series: Vec<String>,
+    pub(crate) genres: Vec<String>,
+    pub(crate) tags: Vec<String>,
+    pub(crate) published_year: String,
+    pub(crate) published_date: String,
+    pub(crate) publisher: String,
+    pub(crate) description: String,
+    pub(crate) isbn: String,
+    pub(crate) asin: String,
+    pub(crate) language: String,
+    pub(crate) explicit: bool,
+    pub(crate) abridged: bool,
+    pub(crate) chapters: Vec<BookChapter>,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Item {
     pub(crate) id: String,
     pub(crate) library_id: String,
@@ -40,6 +69,30 @@ pub(crate) struct Item {
     pub(crate) size: u64,
     pub(crate) added_ms: i64,
     pub(crate) updated_ms: i64,
+    pub(crate) metadata: BookMetadata,
+}
+
+impl Item {
+    pub(crate) fn chapters(&self) -> Vec<BookChapter> {
+        if !self.metadata.chapters.is_empty() {
+            return self.metadata.chapters.clone();
+        }
+        let mut start = 0.0;
+        self.audio_files
+            .iter()
+            .enumerate()
+            .map(|(id, file)| {
+                let chapter = BookChapter {
+                    id,
+                    title: file.title.clone(),
+                    start,
+                    end: start + file.duration,
+                };
+                start += file.duration;
+                chapter
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -292,12 +345,14 @@ fn build_item(
         .and_then(|name| name.to_str())
         .unwrap_or("Audiobook")
         .to_owned();
-    let title = if directory == library_root {
+    let metadata = read_book_metadata(&directory.join("metadata.json"));
+    let fallback_title = if directory == library_root {
         audio_files[0].title.clone()
     } else {
         directory_name
     };
-    let author = if directory == library_root {
+    let title = metadata.title.clone().unwrap_or(fallback_title);
+    let fallback_author = if directory == library_root {
         "Unknown".to_owned()
     } else {
         directory
@@ -306,6 +361,11 @@ fn build_item(
             .and_then(|name| name.to_str())
             .unwrap_or("Unknown")
             .to_owned()
+    };
+    let author = if metadata.authors.is_empty() {
+        fallback_author
+    } else {
+        metadata.authors.join(", ")
     };
     let duration = audio_files.iter().map(|file| file.duration).sum();
     let size = audio_files.iter().map(|file| file.size).sum();
@@ -332,14 +392,121 @@ fn build_item(
             .into_owned(),
         title,
         author,
-        description: String::new(),
+        description: metadata.description.clone(),
         cover_path,
         audio_files,
         duration,
         size,
         added_ms,
         updated_ms,
+        metadata,
     })
+}
+
+fn read_book_metadata(path: &Path) -> BookMetadata {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return BookMetadata::default();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return BookMetadata::default();
+    };
+    let mut merged = parsed.clone();
+    if let Some(legacy) = parsed.get("metadata").and_then(Value::as_object) {
+        if let Some(target) = merged.as_object_mut() {
+            for (key, value) in legacy {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    let string = |key: &str| -> String {
+        match merged.get(key) {
+            Some(Value::String(value)) => value.clone(),
+            Some(Value::Number(value)) => value.to_string(),
+            _ => String::new(),
+        }
+    };
+    let string_array = |key: &str| -> Vec<String> {
+        merged
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let boolean = |key: &str| -> bool {
+        merged
+            .get(key)
+            .and_then(|value| match value {
+                Value::Bool(value) => Some(*value),
+                Value::String(value) => match value.to_ascii_lowercase().as_str() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .unwrap_or(false)
+    };
+    let chapters = merged
+        .get("chapters")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .enumerate()
+                .filter_map(|(index, value)| {
+                    let title = value.get("title")?.as_str()?.to_owned();
+                    let start = number_value(value.get("start"))?;
+                    let end = number_value(value.get("end"))?;
+                    let id = number_value(value.get("id"))
+                        .map(|id| id.round().max(0.0) as usize)
+                        .unwrap_or(index);
+                    Some(BookChapter {
+                        id,
+                        title,
+                        start,
+                        end,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    BookMetadata {
+        title: {
+            let title = string("title");
+            (!title.trim().is_empty()).then_some(title)
+        },
+        subtitle: string("subtitle"),
+        authors: string_array("authors"),
+        narrators: string_array("narrators"),
+        series: string_array("series"),
+        genres: string_array("genres"),
+        tags: string_array("tags"),
+        published_year: string("publishedYear"),
+        published_date: string("publishedDate"),
+        publisher: string("publisher"),
+        description: string("description"),
+        isbn: string("isbn"),
+        asin: string("asin"),
+        language: string("language"),
+        explicit: boolean("explicit"),
+        abridged: boolean("abridged"),
+        chapters,
+    }
+}
+
+fn number_value(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 fn collect_directories(root: &Path, result: &mut Vec<PathBuf>) {
@@ -454,4 +621,65 @@ fn stable_id(prefix: &str, value: &str) -> String {
     let digest = Sha256::digest(value.as_bytes());
     let encoded = format!("{digest:x}");
     format!("{prefix}_{}", &encoded[..24])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_metadata_json_falls_back_to_defaults() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mplex-invalid-book-metadata-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(&path, "{ not valid json").unwrap();
+        let metadata = read_book_metadata(&path);
+        fs::remove_file(&path).unwrap();
+
+        assert!(metadata.title.is_none());
+        assert!(metadata.authors.is_empty());
+        assert!(metadata.narrators.is_empty());
+        assert!(metadata.chapters.is_empty());
+        assert!(metadata.description.is_empty());
+    }
+
+    #[test]
+    fn metadata_json_accepts_legacy_nested_metadata() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mplex-nested-book-metadata-{}-{nonce}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            serde_json::json!({
+                "metadata": {
+                    "title": "Nested Title",
+                    "authors": ["Nested Author"],
+                    "publishedYear": 2022,
+                    "chapters": [{"id": 7, "title": "Opening", "start": 0.0, "end": 10.0}]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let metadata = read_book_metadata(&path);
+        fs::remove_file(&path).unwrap();
+
+        assert_eq!(metadata.title.as_deref(), Some("Nested Title"));
+        assert_eq!(
+            metadata.authors.first().map(String::as_str),
+            Some("Nested Author")
+        );
+        assert_eq!(metadata.published_year, "2022");
+        assert_eq!(metadata.chapters[0].id, 7);
+    }
 }

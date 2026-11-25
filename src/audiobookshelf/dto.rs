@@ -1,4 +1,4 @@
-use super::catalog::{AudioFile, Item, Library, SERVER_VERSION};
+use super::catalog::{AudioFile, BookChapter, Item, Library, SERVER_VERSION};
 use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
@@ -152,70 +152,186 @@ pub(crate) fn library_detail_json(library: &Library) -> Value {
     json!({
         "library": library_json(library),
         "filterdata": {
-            "authors": [],
-            "genres": [],
-            "tags": [],
-            "series": [],
-            "narrators": [],
-            "languages": [],
-            "publishers": [],
-            "publishedDecades": []
+            "authors": unique_strings(
+                library.items.iter().flat_map(|item| item.metadata.authors.iter().cloned())
+            ).into_iter().map(|name| author_json(&name, &library.id)).collect::<Vec<_>>(),
+            "genres": unique_strings(
+                library.items.iter().flat_map(|item| item.metadata.genres.iter().cloned())
+            ),
+            "tags": unique_strings(
+                library.items.iter().flat_map(|item| item.metadata.tags.iter().cloned())
+            ),
+            "series": unique_strings(
+                library.items.iter().flat_map(|item| item.metadata.series.iter().cloned())
+            ).into_iter().map(|name| series_json(&name, &library.id)).collect::<Vec<_>>(),
+            "narrators": unique_strings(
+                library.items.iter().flat_map(|item| item.metadata.narrators.iter().cloned())
+            ),
+            "languages": unique_strings(library.items.iter().map(|item| {
+                if item.metadata.language.is_empty() {
+                    "en".to_owned()
+                } else {
+                    item.metadata.language.clone()
+                }
+            })),
+            "publishers": unique_strings(library.items.iter().filter_map(|item| {
+                (!item.metadata.publisher.is_empty()).then(|| item.metadata.publisher.clone())
+            })),
+            "publishedDecades": unique_strings(library.items.iter().filter_map(|item| {
+                let date = if item.metadata.published_year.is_empty() {
+                    &item.metadata.published_date
+                } else {
+                    &item.metadata.published_year
+                };
+                published_decade(date)
+            }))
         },
         "issues": 0,
         "numUserPlaylists": 0
     })
 }
 
+fn unique_strings<I, S>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut seen = std::collections::BTreeSet::new();
+    values
+        .into_iter()
+        .map(|value| value.as_ref().to_owned())
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn published_decade(year: &str) -> Option<String> {
+    let year = year.trim().get(0..4)?.parse::<u32>().ok()?;
+    Some(format!("{}s", year / 10 * 10))
+}
+
+fn named_id(prefix: &str, name: &str) -> String {
+    let mut slug = String::new();
+    for character in name.to_ascii_lowercase().chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character);
+        } else if !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-');
+    format!(
+        "{prefix}-{}",
+        if slug.is_empty() { "unknown" } else { slug }
+    )
+}
+
+fn author_json(name: &str, library_id: &str) -> Value {
+    json!({
+        "id": named_id("author", name),
+        "name": name,
+        "libraryId": library_id,
+        "numBooks": 0
+    })
+}
+
+fn series_json(value: &str, library_id: &str) -> Value {
+    let mut name = value.to_owned();
+    let mut sequence = None;
+    if let Some(index) = value.rfind(" #") {
+        let candidate = &value[index + 2..];
+        if !candidate.is_empty()
+            && candidate
+                .chars()
+                .all(|character| !character.is_whitespace() && character != '#')
+        {
+            name = value[..index].to_owned();
+            sequence = Some(candidate.to_owned());
+        }
+    }
+    json!({
+        "id": named_id("series", &name),
+        "name": name,
+        "libraryId": library_id,
+        "books": [],
+        "numBooks": 0,
+        "sequence": sequence
+    })
+}
+
+fn chapter_json(chapter: &BookChapter) -> Value {
+    json!({
+        "id": chapter.id,
+        "start": chapter.start,
+        "end": chapter.end,
+        "title": chapter.title
+    })
+}
+
 pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
+    let book = &item.metadata;
+    let authors = if book.authors.is_empty() {
+        vec![author_json(&item.author, &item.library_id)]
+    } else {
+        book.authors
+            .iter()
+            .map(|name| author_json(name, &item.library_id))
+            .collect::<Vec<_>>()
+    };
+    let language = if book.language.is_empty() {
+        "en"
+    } else {
+        &book.language
+    };
     let metadata = if minified {
         json!({
             "title": item.title,
             "titleIgnorePrefix": item.title,
-            "subtitle": "",
+            "subtitle": book.subtitle,
             "authorName": item.author,
             "authorNameLF": item.author,
-            "narratorName": "",
-            "seriesName": "",
-            "genres": [],
-            "publishedYear": "",
-            "publishedDate": "",
-            "publisher": "",
+            "narratorName": book.narrators.join(", "),
+            "seriesName": book.series.join(", "),
+            "genres": book.genres,
+            "publishedYear": book.published_year,
+            "publishedDate": book.published_date,
+            "publisher": book.publisher,
             "description": item.description,
-            "isbn": "",
-            "asin": "",
-            "language": "en",
-            "explicit": false,
-            "abridged": false
+            "isbn": book.isbn,
+            "asin": book.asin,
+            "language": language,
+            "explicit": book.explicit,
+            "abridged": book.abridged
         })
     } else {
         json!({
             "title": item.title,
             "titleIgnorePrefix": item.title,
-            "subtitle": "",
-            "authors": [{"id": "author-unknown", "name": item.author}],
-            "narrators": [],
-            "series": [],
-            "genres": [],
+            "subtitle": book.subtitle,
+            "authors": authors,
+            "narrators": book.narrators,
+            "series": book.series.iter().map(|name| series_json(name, &item.library_id)).collect::<Vec<_>>(),
+            "genres": book.genres,
             "description": item.description,
-            "publishedYear": "",
-            "publishedDate": "",
-            "publisher": "",
-            "language": "en",
-            "explicit": false,
-            "abridged": false,
-            "isbn": "",
-            "asin": ""
+            "publishedYear": book.published_year,
+            "publishedDate": book.published_date,
+            "publisher": book.publisher,
+            "language": language,
+            "explicit": book.explicit,
+            "abridged": book.abridged,
+            "isbn": book.isbn,
+            "asin": book.asin
         })
     };
+    let chapters = item.chapters();
     let mut media = json!({
         "id": format!("me_{}", item.id.trim_start_matches("li_")),
         "libraryItemId": item.id,
         "metadata": metadata,
         "coverPath": cover_path(item),
-        "tags": [],
+        "tags": book.tags,
         "numTracks": item.audio_files.len().max(1),
         "numAudioFiles": item.audio_files.len().max(1),
-        "numChapters": 0,
+        "numChapters": chapters.len(),
         "duration": item.duration,
         "size": item.size,
         "ebookFormat": null
@@ -231,7 +347,7 @@ pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
             .iter()
             .map(|file| audio_track_json(file, &item.id))
             .collect::<Vec<_>>());
-        media["chapters"] = json!([]);
+        media["chapters"] = json!(chapters.iter().map(chapter_json).collect::<Vec<_>>());
     }
     let mut result = json!({
         "id": item.id,
@@ -321,7 +437,7 @@ pub(crate) fn playback_session_json(session: &PlaybackSession, item: &Item) -> V
         "episodeId": null,
         "mediaType": "book",
         "mediaMetadata": metadata,
-        "chapters": [],
+        "chapters": detail["media"]["chapters"].clone(),
         "displayTitle": item.title,
         "displayAuthor": item.author,
         "coverPath": cover_path(item),

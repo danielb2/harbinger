@@ -50,6 +50,33 @@ fn fixture() -> Fixture {
     let track_path = book_dir.join("Track 01.mp3");
     std::fs::write(&track_path, b"0123456789abcdef").unwrap();
     std::fs::write(book_dir.join("cover.jpg"), b"cover-bytes").unwrap();
+    std::fs::write(
+        book_dir.join("metadata.json"),
+        json!({
+            "title": "Harbor of Shadows",
+            "subtitle": "The Lighthouse File",
+            "authors": ["Nora Vale"],
+            "narrators": ["Iris Quinn"],
+            "series": ["Stormbound #2"],
+            "genres": ["Mystery"],
+            "tags": ["favorite"],
+            "publishedYear": "2024",
+            "publishedDate": "2024-05-17",
+            "publisher": "Northwind Audio",
+            "description": "A harbor town keeps a dangerous secret.",
+            "isbn": "9780000000001",
+            "asin": "B000000001",
+            "language": "en",
+            "explicit": false,
+            "abridged": false,
+            "chapters": [
+                {"id": 1, "title": "Prologue", "start": 0.0, "end": 5.0},
+                {"id": 2, "title": "The Arrival", "start": 5.0, "end": 16.0}
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(movie_dir.join("Movie Theme.mp3"), b"movie-theme").unwrap();
 
     let db = rusqlite::Connection::open(config_dir.join("state.sqlite")).unwrap();
@@ -551,6 +578,91 @@ async fn library_details_include_every_filterdata_field() {
 }
 
 #[tokio::test]
+async fn metadata_json_populates_abs_item_and_filter_data() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/items/{}", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let metadata = &value["media"]["metadata"];
+    assert_eq!(metadata["title"], "Harbor of Shadows");
+    assert_eq!(metadata["subtitle"], "The Lighthouse File");
+    assert_eq!(metadata["authors"][0]["name"], "Nora Vale");
+    assert_eq!(metadata["narrators"][0], "Iris Quinn");
+    assert_eq!(metadata["series"][0]["name"], "Stormbound");
+    assert_eq!(metadata["series"][0]["sequence"], "2");
+    assert_eq!(metadata["genres"][0], "Mystery");
+    assert_eq!(metadata["publishedYear"], "2024");
+    assert_eq!(metadata["publisher"], "Northwind Audio");
+    assert_eq!(
+        metadata["description"],
+        "A harbor town keeps a dangerous secret."
+    );
+    assert_eq!(metadata["isbn"], "9780000000001");
+    assert_eq!(metadata["asin"], "B000000001");
+    assert_eq!(metadata["language"], "en");
+    assert_eq!(value["media"]["tags"][0], "favorite");
+    assert_eq!(value["media"]["numChapters"], 2);
+    assert_eq!(value["media"]["chapters"][0]["id"], 1);
+    assert_eq!(value["media"]["chapters"][1]["id"], 2);
+    assert_eq!(value["media"]["chapters"][1]["title"], "The Arrival");
+    assert_eq!(value["media"]["chapters"][1]["start"], 5.0);
+
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}?include=filterdata"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let has_named_value = |key: &str, expected: &str| {
+        value["filterdata"][key].as_array().is_some_and(|values| {
+            values.iter().any(|entry| {
+                let text = entry.as_str().unwrap_or_default();
+                let name = entry["name"].as_str().unwrap_or_default();
+                text == expected || name == expected
+            })
+        })
+    };
+    assert!(has_named_value("authors", "Nora Vale"));
+    assert!(has_named_value("genres", "Mystery"));
+    assert!(has_named_value("tags", "favorite"));
+    assert!(has_named_value("series", "Stormbound"));
+    assert!(has_named_value("narrators", "Iris Quinn"));
+    assert!(has_named_value("publishers", "Northwind Audio"));
+    assert!(has_named_value("publishedDecades", "2020s"));
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?minified=1"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    let minified = &value["results"][0]["media"]["metadata"];
+    assert_eq!(minified["narratorName"], "Iris Quinn");
+    assert_eq!(minified["seriesName"], "Stormbound #2");
+    assert_eq!(minified["genres"][0], "Mystery");
+}
+
+#[tokio::test]
 async fn playback_streams_ranges_and_syncs_progress() {
     let fixture = fixture();
     let token = login(&fixture).await;
@@ -565,6 +677,8 @@ async fn playback_streams_ranges_and_syncs_progress() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let session: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(session["chapters"].as_array().unwrap().len(), 2);
+    assert_eq!(session["chapters"][1]["title"], "The Arrival");
     let session_id = session["id"].as_str().unwrap();
     let content_url = session["audioTracks"][0]["contentUrl"]
         .as_str()

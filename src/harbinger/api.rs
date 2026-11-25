@@ -743,6 +743,39 @@ pub(crate) async fn web_translated_subtitle(
         .into_response()
 }
 
+async fn audiobook_media_key_for_web_path(
+    state: &AppState,
+    library: Option<usize>,
+    folder: Option<usize>,
+    relative: &std::path::Path,
+) -> Option<String> {
+    let is_audiobook = library
+        .and_then(|index| {
+            state
+                .config
+                .lock()
+                .ok()
+                .and_then(|config| config.libraries.get(index).cloned())
+        })
+        .is_some_and(|config| is_audiobook_library(&config.kind));
+    if !is_audiobook {
+        return None;
+    }
+    let root = selected_library_folder_root(state, library, folder);
+    let path = web_path(state, &root, relative).await.ok()?;
+    let catalog = crate::audiobookshelf::catalog::Catalog::load(state);
+    catalog
+        .libraries
+        .iter()
+        .find(|entry| entry.source_index == library.unwrap_or_default())?
+        .items
+        .iter()
+        .find_map(|item| {
+            let item_path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
+            (item_path == path).then(|| item.id.clone())
+        })
+}
+
 pub(crate) async fn web_progress(
     State(state): State<AppState>,
     Query(query): Query<ProgressQuery>,
@@ -754,12 +787,15 @@ pub(crate) async fn web_progress(
     if web_path(&state, &root, &path).await.is_err() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let media_key = audiobook_media_key_for_web_path(&state, query.library, query.folder, &path)
+        .await
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let progress = connection.query_row(
         "SELECT position_ms, duration_ms, watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
-        (USER_ID, path.to_string_lossy().as_ref()),
+        (USER_ID, media_key.as_str()),
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, bool>(2)?)),
     );
     match progress {
@@ -806,6 +842,9 @@ pub(crate) async fn update_web_progress(
     if web_path(&state, &root, &path).await.is_err() {
         return StatusCode::NOT_FOUND.into_response();
     }
+    let media_key = audiobook_media_key_for_web_path(&state, update.library, update.folder, &path)
+        .await
+        .unwrap_or_else(|| path.to_string_lossy().into_owned());
     let Ok(connection) = state.db.lock() else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
@@ -816,7 +855,7 @@ pub(crate) async fn update_web_progress(
     if connection
         .execute(
             "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = excluded.position_ms, duration_ms = excluded.duration_ms, watched = excluded.watched, hidden_from_continue = 0, updated_at = excluded.updated_at",
-            (USER_ID, path.to_string_lossy().as_ref(), update.position_ms.max(0), update.duration_ms, update.watched, updated_at),
+            (USER_ID, media_key.as_str(), update.position_ms.max(0), update.duration_ms, update.watched, updated_at),
         )
         .is_err()
     {
@@ -836,37 +875,8 @@ pub(crate) async fn web_watch_action(
         return StatusCode::NOT_FOUND.into_response();
     }
     let root = selected_library_folder_root(&state, update.library, update.folder);
-    let audiobook_media_key = if update
-        .library
-        .and_then(|index| {
-            state
-                .config
-                .lock()
-                .ok()
-                .and_then(|config| config.libraries.get(index).cloned())
-        })
-        .is_some_and(|library| is_audiobook_library(&library.kind))
-    {
-        web_path(&state, &root, &relative)
-            .await
-            .ok()
-            .and_then(|path| {
-                let catalog = crate::audiobookshelf::catalog::Catalog::load(&state);
-                catalog
-                    .libraries
-                    .iter()
-                    .find(|library| library.source_index == update.library.unwrap_or_default())
-                    .and_then(|library| {
-                        library.items.iter().find_map(|item| {
-                            let item_path = std::fs::canonicalize(&item.path)
-                                .unwrap_or_else(|_| item.path.clone());
-                            (item_path == path).then(|| item.id.clone())
-                        })
-                    })
-            })
-    } else {
-        None
-    };
+    let audiobook_media_key =
+        audiobook_media_key_for_web_path(&state, update.library, update.folder, &relative).await;
     let media_keys = if let Some(media_key) = audiobook_media_key {
         vec![media_key]
     } else {
@@ -3558,6 +3568,29 @@ pub(crate) async fn web_client(
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
     };
+    let audiobook_detail_item = if !files_view
+        && query.play.is_none()
+        && query.episode.is_none()
+        && library_kind.as_deref().is_some_and(is_audiobook_library)
+    {
+        let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+        catalog
+            .libraries
+            .iter()
+            .find(|entry| Some(entry.source_index) == query.library)
+            .and_then(|library| {
+                library.items.iter().find(|item| {
+                    let item_path =
+                        std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
+                    let directory_path =
+                        std::fs::canonicalize(&directory).unwrap_or_else(|_| directory.clone());
+                    item_path == directory_path
+                })
+            })
+            .cloned()
+    } else {
+        None
+    };
     let selected_relative = query
         .episode
         .as_deref()
@@ -3632,7 +3665,9 @@ pub(crate) async fn web_client(
         && relative.components().count() == 1
         && !tv_season_view;
 
-    let info_panel = if let Some(selected_relative) = selected_relative.as_deref() {
+    let info_panel = if audiobook_detail_item.is_some() {
+        String::new()
+    } else if let Some(selected_relative) = selected_relative.as_deref() {
         if tv_episode_info(&library_root, &library_root.join(selected_relative)).is_some() {
             episode_info_panel(&s, &library_root, selected_relative).await
         } else {
@@ -3816,7 +3851,7 @@ pub(crate) async fn web_client(
     let virtual_tv_view = !files_view
         && library_kind.as_deref() == Some("tv")
         && (tv_show_view || query.season.is_some());
-    if (!library_top_level || files_view) && !virtual_tv_view {
+    if audiobook_detail_item.is_none() && (!library_top_level || files_view) && !virtual_tv_view {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -3884,6 +3919,16 @@ pub(crate) async fn web_client(
     let mut folder_cards = String::new();
     let mut season_sections = String::new();
     let mut has_content = false;
+    if let Some(item) = audiobook_detail_item.as_ref() {
+        items.push_str(&audiobook_detail(
+            &s,
+            item,
+            &relative,
+            query.library.unwrap_or_default(),
+            query.folder,
+        ));
+        has_content = true;
+    }
     let section_metadata = query
         .library
         .map(|index| plex_section_metadata(&s, index + 1))
@@ -4537,7 +4582,40 @@ pub(crate) async fn web_client(
     .metadata-panel-layout.metadata-panel-layout-no-cover {{ grid-template-columns: minmax(0, 1fr); }}
     .metadata-panel-layout.metadata-panel-layout-no-cover > .metadata-panel {{ grid-column: 1; }}
     .metadata-panel-cover {{ display: block; width: 100%; aspect-ratio: 2 / 3; object-fit: cover; border: 1px solid rgba(148,163,184,.28); border-radius: .8rem; background: linear-gradient(135deg, #1e3a8a, #312e81); box-shadow: 0 18px 36px rgba(2,6,23,.55); }}
+    .audiobook-detail {{ grid-column: 1 / -1; width: 100%; max-width: 100%; overflow: visible; border: 0; background: transparent; box-shadow: none; }}
+    .audiobook-player-cover img, .audiobook-cover-placeholder {{ display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border: 1px solid rgba(148,163,184,.25); border-radius: .9rem; background: linear-gradient(135deg, #1e3a8a, #312e81); box-shadow: 0 18px 36px rgba(2,6,23,.55); }}
+    .audiobook-cover-placeholder {{ display: grid; place-items: center; padding: .75rem; color: #bfdbfe; font-size: .8rem; text-align: center; }}
+    .audiobook-status {{ min-height: 1rem; margin: .6rem 0 0; color: #fca5a5; font-size: .8rem; text-align: center; }}
+    .audiobook-player-shell {{ display: grid; grid-template-columns: minmax(160px, 240px) minmax(0, 1fr) minmax(190px, 240px); gap: 1.5rem; margin-top: 1.25rem; padding: 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: radial-gradient(circle at 20% 20%, rgba(59,130,246,.18), transparent 55%), #131c2b; }}
+    .audiobook-player-main {{ min-width: 0; align-self: center; }}
+    .audiobook-player-heading {{ margin-bottom: 1rem; }}
+    .audiobook-player-heading h3 {{ margin: .2rem 0 0; font-size: 1.25rem; line-height: 1.25; }}
+    .audiobook-player-position {{ color: #93c5fd; font-size: .75rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }}
+    .audiobook-seek {{ width: 100%; accent-color: #60a5fa; }}
+    .audiobook-times {{ display: flex; justify-content: space-between; margin-top: .25rem; color: #9ca3af; font-size: .75rem; font-variant-numeric: tabular-nums; }}
+    .audiobook-transport {{ display: flex; flex-wrap: wrap; justify-content: center; align-items: center; gap: .65rem; margin: 1rem 0; }}
+    .audiobook-transport button {{ display: grid; place-items: center; min-width: 2.6rem; height: 2.6rem; padding: 0 .6rem; border: 1px solid rgba(148,163,184,.25); border-radius: 999px; color: #e5e7eb; background: #253247; font: inherit; font-weight: 700; cursor: pointer; }}
+    .audiobook-transport .audiobook-toggle-button {{ width: 3.6rem; height: 3.6rem; border-color: #60a5fa; color: #fff; background: #2563eb; font-size: 1.2rem; }}
+    .audiobook-transport button:disabled {{ opacity: .4; cursor: default; }}
+    .audiobook-player-options {{ display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: .9rem; color: #9ca3af; font-size: .8rem; }}
+    .audiobook-player-options select {{ margin-left: .3rem; padding: .3rem .45rem; border: 1px solid #4b5563; border-radius: .35rem; color: #fff; background: #111827; }}
+    .audiobook-volume {{ width: 6rem; accent-color: #60a5fa; }}
+    .audiobook-audio {{ display: none; }}
+    .audiobook-chapters {{ min-width: 0; max-height: 22rem; overflow: auto; padding: .75rem; border: 1px solid rgba(148,163,184,.16); border-radius: .75rem; background: rgba(15,23,42,.6); }}
+    .audiobook-chapters h3 {{ margin: 0 0 .5rem; font-size: .85rem; }}
+    .audiobook-chapter {{ display: grid; grid-template-columns: 1.4rem minmax(0, 1fr) auto; gap: .45rem; width: 100%; padding: .45rem .5rem; border: 0; border-radius: .4rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }}
+    .audiobook-chapter:hover, .audiobook-chapter[data-active="true"] {{ background: #263244; }}
+    .audiobook-chapter-index, .audiobook-chapter-time {{ color: #9ca3af; font-size: .7rem; font-variant-numeric: tabular-nums; }}
+    .audiobook-chapter-title {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .audiobook-info {{ margin-top: 1.25rem; padding: 1.25rem 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: #1f2937; }}
+    .audiobook-info h3 {{ margin: 0 0 .5rem; }}
+    .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; white-space: pre-wrap; }}
+    .audiobook-facts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem 1rem; margin: 1rem 0 0; padding-top: .85rem; border-top: 1px solid rgba(148,163,184,.18); }}
+    .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
+    .audiobook-fact dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
     @media (max-width: 640px) {{ .metadata-panel-layout {{ grid-template-columns: minmax(84px, 26vw) minmax(0, 1fr); gap: .8rem; }} .metadata-panel {{ padding: 1rem; }} }}
+    @media (max-width: 900px) {{ .audiobook-player-shell {{ grid-template-columns: minmax(120px, 180px) minmax(0, 1fr); padding: 1rem; }} .audiobook-chapters {{ grid-column: 1 / -1; max-height: 14rem; }} }}
+    @media (max-width: 600px) {{ .audiobook-player-shell {{ grid-template-columns: minmax(0, 1fr); }} .audiobook-player-cover {{ max-width: 220px; }} }}
     .folder-card {{ display: block; width: 100%; overflow: hidden; color: inherit; text-decoration: none; border: 1px solid #374151; border-radius: .75rem; background: #1f2937; transition: border-color .15s, transform .15s; }}
     .folder-card:hover {{ border-color: #60a5fa; transform: translateY(-2px); }}
     .folder-preview {{ position: relative; display: grid; place-items: center; overflow: hidden; aspect-ratio: 2 / 3; color: #bfdbfe; font-size: 3rem; background: linear-gradient(135deg, #1e3a8a, #312e81 55%, #111827); }}
@@ -5259,6 +5337,184 @@ pub(crate) async fn web_client(
         }}
       }}, {{ once: true }});
     }});
+    document.querySelectorAll("[data-audiobook-player]").forEach(player => {{
+      const audio = player.querySelector(".audiobook-audio");
+      const seek = player.querySelector(".audiobook-seek");
+      const status = player.querySelector(".audiobook-status");
+      const currentLabel = player.querySelector(".audiobook-current-time");
+      const totalLabel = player.querySelector(".audiobook-total-time");
+      const titleLabel = player.querySelector(".audiobook-current-title");
+      const positionLabel = player.querySelector(".audiobook-player-position");
+      const toggleButtons = [...player.querySelectorAll(".audiobook-toggle-button")];
+      const chapterButtons = [...player.querySelectorAll(".audiobook-chapter")];
+      const resumeButton = player.querySelector(".audiobook-resume-button");
+      const previousChapter = player.querySelector(".audiobook-previous-chapter");
+      const nextChapter = player.querySelector(".audiobook-next-chapter");
+      if (!audio || !seek) return;
+      let tracks = [];
+      let chapters = [];
+      try {{ tracks = JSON.parse(player.dataset.tracks || "[]"); }} catch (_) {{ tracks = []; }}
+      try {{ chapters = JSON.parse(player.dataset.chapters || "[]"); }} catch (_) {{ chapters = []; }}
+      if (!tracks.length) {{
+        if (status) status.textContent = "No playable audio files were found for this book.";
+        return;
+      }}
+      const durations = tracks.map(track => Math.max(0, Number(track.duration) || 0));
+      let duration = Math.max(0, Number(player.dataset.duration) || 0);
+      if (duration <= 0) duration = durations.reduce((sum, value) => sum + value, 0);
+      let trackIndex = 0;
+      let pendingSeek = null;
+      let resumed = false;
+      let saveTimer = null;
+      let lastSave = 0;
+      const trackStart = index => durations.slice(0, index).reduce((sum, value) => sum + value, 0);
+      const absoluteTime = () => trackStart(trackIndex) + (Number.isFinite(audio.currentTime) ? audio.currentTime : 0);
+      const formatTime = seconds => {{
+        const total = Math.max(0, Math.round(Number(seconds) || 0));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const remainder = total % 60;
+        return hours > 0
+          ? `${{hours}}:${{String(minutes).padStart(2, "0")}}:${{String(remainder).padStart(2, "0")}}`
+          : `${{minutes}}:${{String(remainder).padStart(2, "0")}}`;
+      }};
+      const chapterAt = time => chapters.find(chapter => time >= Number(chapter.start) && time < Number(chapter.end));
+      const update = () => {{
+        const time = absoluteTime();
+        if (duration <= 0 && Number.isFinite(audio.duration) && audio.duration > 0) {{
+          duration = trackStart(trackIndex) + audio.duration;
+        }}
+        seek.max = String(Math.max(0, duration));
+        seek.value = String(Math.max(0, Math.min(time, duration)));
+        if (currentLabel) currentLabel.textContent = formatTime(time);
+        if (totalLabel) totalLabel.textContent = formatTime(duration);
+        const chapter = chapterAt(time);
+        if (titleLabel) titleLabel.textContent = chapter ? chapter.title : (tracks[trackIndex].title || player.dataset.title || "Audiobook");
+        if (positionLabel) positionLabel.textContent = chapters.length
+          ? `Chapter ${{chapters.indexOf(chapter) + 1}} of ${{chapters.length}}`
+          : `Track ${{trackIndex + 1}} of ${{tracks.length}}`;
+        chapterButtons.forEach((button, index) => {{
+          const active = chapter ? chapters[index] === chapter : false;
+          button.dataset.active = String(active);
+        }});
+        if (previousChapter) previousChapter.disabled = !chapters.length || (chapter && chapters.indexOf(chapter) === 0 && time < chapter.start + 3);
+        if (nextChapter) nextChapter.disabled = !chapters.length || !chapter || chapters.indexOf(chapter) === chapters.length - 1;
+        toggleButtons.forEach(button => {{ button.textContent = audio.paused ? "▶" : "❚❚"; }});
+      }};
+      const setTrack = (index, autoplay) => {{
+        trackIndex = Math.max(0, Math.min(index, tracks.length - 1));
+        audio.src = tracks[trackIndex].url;
+        audio.load();
+        if (autoplay) audio.play().catch(error => {{
+          if (status) status.textContent = error && error.message ? error.message : "Playback could not start.";
+        }});
+        update();
+      }};
+      const seekTo = target => {{
+        const wanted = Math.max(0, Math.min(duration || Number(seek.max) || 0, Number(target) || 0));
+        let remaining = wanted;
+        for (let index = 0; index < tracks.length; index += 1) {{
+          const trackDuration = durations[index];
+          if (remaining < trackDuration || index === tracks.length - 1 || trackDuration <= 0) {{
+            if (index !== trackIndex) setTrack(index, false);
+            pendingSeek = remaining;
+            if (audio.readyState >= 1) {{
+              audio.currentTime = Math.min(remaining, audio.duration || remaining);
+              pendingSeek = null;
+            }} else {{
+              audio.addEventListener("loadedmetadata", () => {{
+                if (pendingSeek !== null) {{
+                  audio.currentTime = Math.min(pendingSeek, audio.duration || pendingSeek);
+                  pendingSeek = null;
+                }}
+              }}, {{ once: true }});
+            }}
+            update();
+            return;
+          }}
+          remaining -= trackDuration;
+        }}
+      }};
+      const sendProgress = watched => {{
+        const positionMs = Math.round(Math.min(absoluteTime(), duration || absoluteTime()) * 1000);
+        fetch("/web/progress", {{
+          method: "POST", headers: {{ "content-type": "application/json" }},
+          body: JSON.stringify({{
+            path: player.dataset.path,
+            library: Number(player.dataset.library),
+            folder: Number(player.dataset.folder),
+            position_ms: watched ? 0 : positionMs,
+            duration_ms: duration > 0 ? Math.round(duration * 1000) : null,
+            watched
+          }})
+        }}).catch(() => {{}});
+        lastSave = Date.now();
+        if (resumeButton && positionMs > 2000) resumeButton.hidden = false;
+      }};
+      const save = watched => {{
+        if (watched || audio.paused) {{
+          clearTimeout(saveTimer);
+          saveTimer = null;
+          sendProgress(watched);
+          return;
+        }}
+        if (saveTimer !== null) return;
+        const delay = Math.max(0, 5000 - (Date.now() - lastSave));
+        saveTimer = setTimeout(() => {{ saveTimer = null; if (!audio.paused) sendProgress(false); }}, delay);
+      }};
+      const togglePlayback = () => {{
+        if (!audio.paused) {{ audio.pause(); return; }}
+        if (status) status.textContent = "";
+        audio.play().catch(error => {{
+          if (status) status.textContent = error && error.message ? error.message : "Playback could not start.";
+        }});
+      }};
+      const moveChapter = step => {{
+        const time = absoluteTime();
+        const index = chapters.findIndex(chapter => time >= chapter.start && time < chapter.end);
+        if (chapters.length === 0) return;
+        const target = chapters[Math.max(0, Math.min(chapters.length - 1, (index < 0 ? 0 : index) + step))];
+        if (target) seekTo(Number(target.start));
+      }};
+      seek.addEventListener("input", () => seekTo(seek.value));
+      toggleButtons.forEach(button => button.addEventListener("click", togglePlayback));
+      player.querySelector(".audiobook-skip-back")?.addEventListener("click", () => seekTo(absoluteTime() - 15));
+      player.querySelector(".audiobook-skip-forward")?.addEventListener("click", () => seekTo(absoluteTime() + 30));
+      previousChapter?.addEventListener("click", () => moveChapter(-1));
+      nextChapter?.addEventListener("click", () => moveChapter(1));
+      chapterButtons.forEach(button => button.addEventListener("click", () => seekTo(Number(button.dataset.audiobookSeek || 0))));
+      resumeButton?.addEventListener("click", () => seekTo(Number(player.dataset.start || 0)));
+      player.querySelector(".audiobook-speed")?.addEventListener("change", event => {{
+        audio.playbackRate = Number(event.target.value) || 1;
+      }});
+      player.querySelector(".audiobook-volume")?.addEventListener("input", event => {{
+        audio.volume = Math.max(0, Math.min(1, Number(event.target.value)));
+      }});
+      audio.addEventListener("loadedmetadata", () => {{
+        if (pendingSeek !== null) {{
+          audio.currentTime = Math.min(pendingSeek, audio.duration || pendingSeek);
+          pendingSeek = null;
+        }}
+        if (!resumed && Number(player.dataset.start || 0) > 2) {{
+          resumed = true;
+          seekTo(Number(player.dataset.start));
+          if (resumeButton) resumeButton.hidden = false;
+        }}
+        update();
+      }});
+      audio.addEventListener("timeupdate", () => {{ update(); if (!audio.paused) save(false); }});
+      audio.addEventListener("play", update);
+      audio.addEventListener("pause", () => {{ update(); save(false); }});
+      audio.addEventListener("error", () => {{
+        if (status) status.textContent = "This audio file could not be played. Try another track or check the server log.";
+      }});
+      audio.addEventListener("ended", () => {{
+        if (trackIndex + 1 < tracks.length) {{ setTrack(trackIndex + 1, true); return; }}
+        save(true);
+        update();
+      }});
+      update();
+    }});
     if (!window.__mplexMediaHotkeysBound) {{
       window.__mplexMediaHotkeysBound = true;
       window.__mplexSelectedVideo = null;
@@ -5320,8 +5576,10 @@ pub(crate) async fn web_client(
         const next = document.querySelector(".library");
         const hasPlaybackState = [...window.document.querySelectorAll("video")]
           .some(video => !video.paused && !video.ended || video.currentTime > 0);
-        const hasPlayer = Boolean(current?.querySelector("video[data-progress-path]"));
-        if (!hasPlaybackState && !hasPlayer && current && next && current.innerHTML !== next.innerHTML) {{
+        const hasPlayer = Boolean(current?.querySelector("video[data-progress-path], [data-audiobook-player]"));
+        const hasAudiobookPlayback = [...window.document.querySelectorAll(".audiobook-audio")]
+          .some(audio => !audio.paused || audio.currentTime > 0);
+        if (!hasPlaybackState && !hasPlayer && !hasAudiobookPlayback && current && next && current.innerHTML !== next.innerHTML) {{
           current.replaceWith(next);
           window.__mplexSelectedVideo = null;
         }}
@@ -7168,6 +7426,28 @@ pub(crate) fn folder_card_with_badge(
     )
 }
 
+fn audiobook_saved_progress(state: &AppState, item_id: &str) -> (i64, Option<i64>, bool) {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT position_ms, duration_ms, watched FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
+                params![USER_ID, item_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .ok()
+        })
+        .unwrap_or((0, None, false))
+}
+
 fn audiobook_media_card(
     state: &AppState,
     item: &crate::audiobookshelf::catalog::Item,
@@ -7182,40 +7462,33 @@ fn audiobook_media_card(
         "/?library={library}&{folder_query}path={}",
         url_encode(&relative.to_string_lossy())
     );
-    let details = format!(
+    let track_label = format!(
         "{} track{}",
         item.audio_files.len(),
         if item.audio_files.len() == 1 { "" } else { "s" }
     );
+    let details = if item.metadata.narrators.is_empty() {
+        track_label
+    } else {
+        format!(
+            "{} · Narrated by {}",
+            track_label,
+            item.metadata.narrators.join(", ")
+        )
+    };
     let cover_url = item
         .cover_path
         .as_ref()
         .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
-    let progress = state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| {
-            db.query_row(
-                "SELECT watched, position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
-                params![USER_ID, item.id],
-                |row| {
-                    if row.get::<_, bool>(0)? {
-                        return Ok(1.0);
-                    }
-                    let position = row.get::<_, i64>(1)?;
-                    let duration = row.get::<_, Option<i64>>(2)?;
-                    Ok(match duration {
-                        Some(duration) if duration > 0 => {
-                            (position as f64 / duration as f64).clamp(0.0, 1.0)
-                        }
-                        _ => 0.0,
-                    })
-                },
-            )
-            .ok()
-        })
-        .unwrap_or_default();
+    let (position, duration, watched) = audiobook_saved_progress(state, &item.id);
+    let progress = if watched {
+        1.0
+    } else {
+        match duration {
+            Some(duration) if duration > 0 => (position as f64 / duration as f64).clamp(0.0, 1.0),
+            _ => 0.0,
+        }
+    };
     media_card_with_options(
         None,
         &href,
@@ -7233,6 +7506,234 @@ fn audiobook_media_card(
         cover_url.as_deref(),
         Some(&item.id),
     )
+}
+
+fn audiobook_detail(
+    state: &AppState,
+    item: &crate::audiobookshelf::catalog::Item,
+    relative: &std::path::Path,
+    library: usize,
+    folder: Option<usize>,
+) -> String {
+    let book = &item.metadata;
+    let folder_index = folder.unwrap_or_default();
+    let cover_url = item
+        .cover_path
+        .as_ref()
+        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+    let cover = match cover_url.as_deref() {
+        Some(url) => format!(
+            r#"<img src="{}" alt="Cover for {}">"#,
+            html(url),
+            html(&item.title)
+        ),
+        None => format!(
+            r#"<div class="audiobook-cover-placeholder" role="img" aria-label="Cover unavailable for {}">No cover available</div>"#,
+            html(&item.title)
+        ),
+    };
+    let chapters = item.chapters();
+    let chapter_end = chapters
+        .last()
+        .map(|chapter| chapter.end)
+        .unwrap_or_default();
+    let duration = item.duration.max(chapter_end).max(0.0);
+    let (saved_position, saved_duration, watched) = audiobook_saved_progress(state, &item.id);
+    let saved_seconds = if watched {
+        duration
+    } else {
+        let reported = if saved_duration.unwrap_or_default() > 0 {
+            saved_position as f64 / saved_duration.unwrap() as f64 * duration
+        } else {
+            saved_position as f64 / 1000.0
+        };
+        reported.clamp(0.0, duration)
+    };
+    let location_query = format!("library={library}&folder={folder_index}&");
+    let total_size = item.audio_files.iter().map(|file| file.size).sum::<u64>();
+    let tracks = item
+        .audio_files
+        .iter()
+        .map(|file| {
+            let estimated_duration = if file.duration > 0.0 {
+                file.duration
+            } else if total_size > 0 {
+                duration * file.size as f64 / total_size as f64
+            } else if !item.audio_files.is_empty() {
+                duration / item.audio_files.len() as f64
+            } else {
+                0.0
+            };
+            serde_json::json!({
+                "title": file.title,
+                "url": format!("/web/stream?{}path={}", location_query, url_encode(&file.rel_path)),
+                "duration": estimated_duration,
+            })
+        })
+        .collect::<Vec<_>>();
+    let track_json = serde_json::to_string(&tracks).unwrap_or_else(|_| "[]".to_owned());
+    let chapter_json = serde_json::to_string(
+        &chapters
+            .iter()
+            .map(|chapter| {
+                serde_json::json!({
+                    "id": chapter.id,
+                    "title": chapter.title,
+                    "start": chapter.start,
+                    "end": chapter.end,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_owned());
+    let chapter_rows = chapters
+        .iter()
+        .enumerate()
+        .map(|(index, chapter)| {
+            format!(
+                r#"<button type="button" class="audiobook-chapter" data-audiobook-seek="{}"><span class="audiobook-chapter-index">{}</span><span class="audiobook-chapter-title">{}</span><span class="audiobook-chapter-time">{}</span></button>"#,
+                chapter.start,
+                index + 1,
+                html(&chapter.title),
+                html(&clock_duration(chapter.end - chapter.start)),
+            )
+        })
+        .collect::<String>();
+    let mut facts = Vec::new();
+    facts.push(("Title", item.title.clone()));
+    if !book.subtitle.trim().is_empty() {
+        facts.push(("Subtitle", book.subtitle.clone()));
+    }
+    if !item.author.is_empty() {
+        facts.push(("Author", item.author.clone()));
+    }
+    if !book.narrators.is_empty() {
+        facts.push(("Narrator", book.narrators.join(", ")));
+    }
+    if !book.series.is_empty() {
+        facts.push(("Series", book.series.join(", ")));
+    }
+    if !book.publisher.is_empty() {
+        facts.push(("Publisher", book.publisher.clone()));
+    }
+    let published = if book.published_year.is_empty() {
+        book.published_date.as_str()
+    } else {
+        book.published_year.as_str()
+    };
+    if !published.is_empty() {
+        facts.push(("Published", published.to_owned()));
+    }
+    if !book.genres.is_empty() {
+        facts.push(("Genres", book.genres.join(", ")));
+    }
+    if !book.language.is_empty() {
+        facts.push(("Language", book.language.clone()));
+    }
+    if book.abridged {
+        facts.push(("Edition", "Abridged".to_owned()));
+    }
+    if book.explicit {
+        facts.push(("Rating", "Explicit".to_owned()));
+    }
+    if !book.isbn.is_empty() {
+        facts.push(("ISBN", book.isbn.clone()));
+    }
+    if !book.asin.is_empty() {
+        facts.push(("ASIN", book.asin.clone()));
+    }
+    facts.push(("Length", clock_duration(duration)));
+    facts.push((
+        "Tracks",
+        format!(
+            "{} track{}",
+            item.audio_files.len(),
+            if item.audio_files.len() == 1 { "" } else { "s" }
+        ),
+    ));
+    let fact_markup = facts
+        .into_iter()
+        .map(|(label, value)| {
+            format!(
+                r#"<div class="audiobook-fact"><dt>{}</dt><dd>{}</dd></div>"#,
+                html(label),
+                html(&value)
+            )
+        })
+        .collect::<String>();
+    let description = if item.description.trim().is_empty() {
+        "No book description is available in metadata.json.".to_owned()
+    } else {
+        item.description.clone()
+    };
+    let first_track = tracks
+        .first()
+        .and_then(|track| track["url"].as_str())
+        .unwrap_or_default();
+    let initial_title = chapters
+        .first()
+        .map(|chapter| chapter.title.as_str())
+        .unwrap_or(&item.title);
+
+    format!(
+        r#"<article class="audiobook-detail" data-audiobook-player data-library="{library}" data-folder="{folder_index}" data-path="{path}" data-duration="{duration}" data-start="{saved_seconds}" data-tracks="{tracks}" data-chapters="{chapters}">
+  <section class="audiobook-player-shell">
+    <div class="audiobook-player-cover">{cover}</div>
+    <div class="audiobook-player-main">
+      <div class="audiobook-player-heading"><span class="audiobook-player-position">Track 1 of {track_count}</span><h3 class="audiobook-current-title">{initial_title}</h3></div>
+      <input class="audiobook-seek" type="range" min="0" max="{duration}" value="0" step="0.1" aria-label="Seek through audiobook">
+      <div class="audiobook-times"><span class="audiobook-current-time">0:00</span><span class="audiobook-total-time">{duration_label}</span></div>
+      <div class="audiobook-transport">
+        <button type="button" class="audiobook-previous-chapter" title="Previous chapter" aria-label="Previous chapter">⏮</button>
+        <button type="button" class="audiobook-skip-back" title="Back 15 seconds" aria-label="Back 15 seconds">↶ 15</button>
+        <button type="button" class="audiobook-toggle-button" title="Play or pause" aria-label="Play or pause">▶</button>
+        <button type="button" class="audiobook-skip-forward" title="Forward 30 seconds" aria-label="Forward 30 seconds">30 ↷</button>
+        <button type="button" class="audiobook-next-chapter" title="Next chapter" aria-label="Next chapter">⏭</button>
+      </div>
+      <div class="audiobook-player-options">
+        <label>Speed <select class="audiobook-speed" aria-label="Playback speed"><option value="0.75">0.75×</option><option value="1" selected>1×</option><option value="1.25">1.25×</option><option value="1.5">1.5×</option><option value="2">2×</option></select></label>
+        <label>Volume <input class="audiobook-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume"></label>
+        <button type="button" class="audiobook-resume-button" title="Resume from saved position" aria-label="Resume from saved position" hidden>↪ Resume</button>
+      </div>
+      <p class="audiobook-status" role="status" aria-live="polite"></p>
+      <audio class="audiobook-audio" preload="metadata" src="{first_track}">Your browser does not support HTML audio.</audio>
+    </div>
+    <aside class="audiobook-chapters"><h3>Chapters</h3>{chapter_rows}</aside>
+  </section>
+  <section class="audiobook-info">
+    <h3>About this book</h3>
+    <p class="audiobook-description">{description}</p>
+    <dl class="audiobook-facts">{fact_markup}</dl>
+  </section>
+</article>"#,
+        library = library,
+        folder_index = folder_index,
+        path = html(&relative.to_string_lossy()),
+        duration = duration,
+        saved_seconds = saved_seconds,
+        tracks = html(&track_json),
+        chapters = html(&chapter_json),
+        cover = cover,
+        track_count = item.audio_files.len().max(1),
+        initial_title = html(initial_title),
+        duration_label = html(&clock_duration(duration)),
+        first_track = html(first_track),
+        chapter_rows = chapter_rows,
+        description = html(&description),
+        fact_markup = fact_markup,
+    )
+}
+
+fn clock_duration(seconds: f64) -> String {
+    let seconds = seconds.max(0.0).round() as u64;
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let remainder = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{remainder:02}")
+    } else {
+        format!("{minutes}:{remainder:02}")
+    }
 }
 
 fn web_media_type(path: &std::path::Path) -> Option<(&'static str, &'static str)> {
