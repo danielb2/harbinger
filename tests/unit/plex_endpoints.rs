@@ -1213,7 +1213,10 @@ async fn settings_can_rename_a_library() {
     assert!(body.contains("flex-wrap:nowrap"));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
     assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
-    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
+    assert!(body.contains(
+        ".sidebar-chevron { margin-left: auto; color: #7f8ea3; transform: rotate(-90deg);"
+    ));
+    assert!(body.contains(".sidebar-subnav { display: grid; gap: .15rem;"));
     assert!(body.contains("input, select, textarea { font-size: 16px; }"));
     assert!(body
         .contains("form=\"library-settings-0\" style=\"margin-left:auto\">Save changes</button>"));
@@ -2614,7 +2617,13 @@ async fn web_library_book_folder_renders_audiobook_player() {
     assert!(!body.contains(r#"class="breadcrumb""#));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
     assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
-    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
+    assert!(body.contains(
+        ".sidebar-chevron { margin-left: auto; color: #7f8ea3; transform: rotate(-90deg);"
+    ));
+    assert!(body.contains(".sidebar-subnav { display: grid; gap: .15rem;"));
+    assert!(body.contains("translateX(102%)"));
+    assert!(body.contains("sidebar-mobile-toggle"));
+    assert!(body.contains("app-sidebar-panel"));
     assert!(body
         .contains(".audiobook-player-options { flex-wrap: wrap; gap: .5rem; font-size: .75rem; }"));
     assert!(body.contains(".audiobook-chapter-control { flex-basis: 100%; }"));
@@ -6285,7 +6294,10 @@ async fn home_page_search_returns_matching_media_and_empty_state() {
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
     assert!(body.contains(".sidebar-toggle { display: none; } .sidebar-label { display: none; }"));
     assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
-    assert!(body.contains(".sidebar-settings-group { flex: 1 0 100%; }"));
+    assert!(body.contains(
+        ".sidebar-chevron { margin-left: auto; color: #7f8ea3; transform: rotate(-90deg);"
+    ));
+    assert!(body.contains(".sidebar-subnav { display: grid; gap: .15rem;"));
     assert!(body.contains(".media-card-menu-items { right: 0; min-width: 9rem;"));
     assert!(body.contains(".continue-grid > .empty-state { grid-column: 1 / -1; }"));
     assert!(body.contains("input, select, textarea { font-size: 16px; }"));

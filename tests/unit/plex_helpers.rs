@@ -981,6 +981,10 @@ fn sidebar_lists_libraries_directly_without_generic_library_item() {
     assert!(settings.contains("class=\"sidebar-sublink active\" href=\"/settings\""));
     assert!(settings.contains("href=\"/settings?tab=logs\""));
     assert!(settings.contains("href=\"/settings#plex-heading\""));
+    assert!(settings.contains("class=\"sidebar-chevron\""));
+    assert!(settings.contains("sidebar-mobile-toggle"));
+    assert!(settings.contains("id=\"app-sidebar-panel\""));
+    assert!(settings.contains("nav-js"));
     assert!(!settings.contains("<a class=\"sidebar-link active\" href=\"/\""));
 }
 #[test]
