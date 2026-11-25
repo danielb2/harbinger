@@ -2629,6 +2629,34 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_string(response).await;
     assert!(body.contains("data-audiobook-player"));
+    let detail_markup = &body[body
+        .find(r#"<article class="audiobook-detail""#)
+        .expect("audiobook detail is rendered")..];
+    let cover_index = detail_markup
+        .find(r#"<div class="audiobook-player-cover">"#)
+        .expect("cover is rendered");
+    let toggle_index = detail_markup
+        .find("audiobook-toggle-button")
+        .expect("play button is rendered");
+    let transport_start = detail_markup
+        .find(r#"<div class="audiobook-transport">"#)
+        .expect("navigation buttons are rendered");
+    let main_index = detail_markup
+        .find(r#"<div class="audiobook-player-main">"#)
+        .expect("player details are rendered");
+    let transport_end = transport_start
+        + detail_markup[transport_start..]
+            .find("</div>")
+            .expect("navigation buttons are contained");
+    let transport_markup = &detail_markup[transport_start..transport_end];
+    assert!(cover_index < toggle_index);
+    assert!(toggle_index < transport_start);
+    assert!(transport_start < main_index);
+    assert!(detail_markup[cover_index..transport_start].contains("audiobook-toggle-button"));
+    assert!(transport_markup.contains("audiobook-previous-chapter"));
+    assert!(transport_markup.contains("audiobook-next-chapter"));
+    assert!(!transport_markup.contains("audiobook-toggle-button"));
+    assert!(body.contains(".audiobook-player-options { display: flex; flex-wrap: nowrap;"));
     assert!(body.contains("The Silent Harbor"));
     assert!(body.contains("A Stormbound Mystery"));
     assert!(body.contains("Nora Vale"));
