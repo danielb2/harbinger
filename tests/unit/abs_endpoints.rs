@@ -68,7 +68,8 @@ fn fixture() -> Fixture {
          );
          CREATE TABLE web_sessions (
              token_hash TEXT PRIMARY KEY,
-             expires_at INTEGER NOT NULL
+             expires_at INTEGER NOT NULL,
+             user_id TEXT
          );
          CREATE TABLE watch_progress (
              user_id TEXT NOT NULL,
@@ -211,18 +212,57 @@ async fn send(
 }
 
 async fn login(fixture: &Fixture) -> String {
+    login_as(fixture, "root", PASSWORD).await
+}
+
+async fn login_as(fixture: &Fixture, username: &str, password: &str) -> String {
     let (status, body, _) = send(
         &fixture.app,
         Method::POST,
         "/login",
         None,
-        Some(json!({"username": "root", "password": PASSWORD})),
+        Some(json!({"username": username, "password": password})),
         None,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_slice(&body).unwrap();
     value["user"]["token"].as_str().unwrap().to_owned()
+}
+
+fn add_user(
+    fixture: &Fixture,
+    id: &str,
+    username: &str,
+    password: &str,
+    user_type: &str,
+    is_active: bool,
+) {
+    let db = rusqlite::Connection::open(fixture.root.join("config").join("state.sqlite")).unwrap();
+    let salt = SaltString::generate(&mut OsRng);
+    let hash = Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .unwrap();
+    db.execute(
+        "INSERT INTO users (id, name, username, password_hash, user_type, is_active)
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![id, username, hash.to_string(), user_type, is_active],
+    )
+    .unwrap();
+}
+
+async fn login_body(fixture: &Fixture, username: &str, password: &str) -> (StatusCode, Value) {
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        "/login",
+        None,
+        Some(json!({"username": username, "password": password})),
+        None,
+    )
+    .await;
+    let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+    (status, value)
 }
 
 #[tokio::test]
@@ -259,6 +299,123 @@ async fn login_rejects_bad_credentials_and_accepts_admin_password() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert!(!login(&fixture).await.is_empty());
+}
+
+#[tokio::test]
+async fn login_uses_submitted_username_and_isolates_user_data() {
+    let fixture = fixture();
+    add_user(
+        &fixture,
+        "daniel-id",
+        "daniel",
+        "daniel-password",
+        "guest",
+        true,
+    );
+    add_user(
+        &fixture,
+        "disabled-id",
+        "disabled",
+        PASSWORD,
+        "guest",
+        false,
+    );
+
+    let (status, body) = login_body(&fixture, "daniel", "daniel-password").await;
+    assert_eq!(status, StatusCode::OK);
+    let user = &body["user"];
+    assert_eq!(user["id"], "daniel-id");
+    assert_eq!(user["username"], "daniel");
+    assert_eq!(user["type"], "guest");
+    let daniel_token = user["token"].as_str().unwrap().to_owned();
+
+    // ABS looks up usernames case-insensitively.
+    let (status, _) = login_body(&fixture, "DANIEL", "daniel-password").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _) = login_body(&fixture, "daniel", "wrong-password").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = login_body(&fixture, "missing", PASSWORD).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = login_body(&fixture, "disabled", PASSWORD).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me",
+        Some(&daniel_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["username"], "daniel");
+
+    let root_token = login(&fixture).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me",
+        Some(&root_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["username"], "root");
+    assert_eq!(me["type"], "root");
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::PATCH,
+        &format!("/api/me/progress/{}", fixture.item_id),
+        Some(&daniel_token),
+        Some(json!({"currentTime": 30.0, "duration": 100.0})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/me/progress/{}", fixture.item_id),
+        Some(&daniel_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let progress: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(progress["userId"], "daniel-id");
+    assert_eq!(progress["currentTime"], 30.0);
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/me/progress/{}", fixture.item_id),
+        Some(&root_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me",
+        Some(&root_token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Value = serde_json::from_slice(&body).unwrap();
+    assert!(me["mediaProgress"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

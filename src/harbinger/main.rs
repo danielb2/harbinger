@@ -2058,7 +2058,8 @@ fn open_database(
          );
          CREATE TABLE IF NOT EXISTS web_sessions (
              token_hash TEXT PRIMARY KEY,
-             expires_at INTEGER NOT NULL
+             expires_at INTEGER NOT NULL,
+             user_id TEXT
          );
          CREATE TABLE IF NOT EXISTS media (
              media_key TEXT PRIMARY KEY,
@@ -2202,11 +2203,25 @@ fn open_database(
         "ALTER TABLE users ADD COLUMN libraries TEXT NOT NULL DEFAULT '[]'",
         [],
     );
+    let _ = connection.execute("ALTER TABLE web_sessions ADD COLUMN user_id TEXT", []);
     let _ = connection.execute(
         "INSERT OR IGNORE INTO users (id, name, username, password_hash, user_type)
          SELECT 'admin', 'Administrator', 'admin', password_hash, 'admin'
          FROM web_admin WHERE id = 1
            AND NOT EXISTS (SELECT 1 FROM users WHERE password_hash IS NOT NULL)",
+        [],
+    );
+    // ABS playback used a single shared progress identity before accounts were
+    // wired into sessions; retain that progress under the administrator.
+    let _ = connection.execute(
+        "INSERT OR IGNORE INTO watch_progress
+            (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at)
+         SELECT 'admin', media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at
+           FROM watch_progress WHERE user_id = 'mplex-user'",
+        [],
+    );
+    let _ = connection.execute(
+        "DELETE FROM watch_progress WHERE user_id = 'mplex-user'",
         [],
     );
     connection.execute(
@@ -8479,7 +8494,7 @@ fn issue_web_session(state: &AppState) -> Response {
         .unwrap_or_default();
     if state.db.lock().ok().is_none_or(|db| {
         db.execute(
-            "INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)",
+            "INSERT INTO web_sessions (token_hash, expires_at, user_id) VALUES (?1, ?2, 'admin')",
             (&token_hash, now + 60 * 60 * 24 * 14),
         )
         .is_err()

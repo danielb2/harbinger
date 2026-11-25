@@ -2,7 +2,7 @@ use super::{
     catalog::{image_content_type, Catalog, Item, SERVER_VERSION},
     dto::{
         item_json, library_detail_json, library_json, login_envelope, media_progress_json,
-        playback_session_json, user_json, PlaybackSession, USER_ID,
+        playback_session_json, user_json, PlaybackSession, UserIdentity,
     },
 };
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
@@ -189,22 +189,20 @@ async fn login(
         Err(response) => return response,
     };
     let credentials = parse_credentials(&body);
-    if credentials.username.trim().is_empty()
-        || credentials.password.is_empty()
-        || !password_valid(&state, &credentials.password)
-    {
+    let Some(identity) = authenticate(&state, &credentials.username, &credentials.password) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let (access_token, refresh_token) = match issue_tokens(&state) {
+    };
+    let (access_token, refresh_token) = match issue_tokens(&state, &identity.id) {
         Ok(tokens) => tokens,
         Err(status) => return status.into_response(),
     };
     let catalog = Catalog::load(&state);
     let default_library_id = catalog.default_library_id();
     let user = user_json(
+        &identity,
         &access_token,
         &default_library_id,
-        progress_values(&state, &catalog),
+        progress_values(&state, &catalog, &identity.id),
         Some(&access_token),
         return_tokens.then_some(refresh_token.as_str()),
     );
@@ -246,19 +244,20 @@ async fn refresh(
     let Some(token) = token else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    if !token_valid(&state, &token) {
+    let Some(identity) = session_user(&state, &token) else {
         return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let (access_token, refresh_token) = match issue_tokens(&state) {
+    };
+    let (access_token, refresh_token) = match issue_tokens(&state, &identity.id) {
         Ok(tokens) => tokens,
         Err(status) => return status.into_response(),
     };
     let catalog = Catalog::load(&state);
     let default_library_id = catalog.default_library_id();
     let user = user_json(
+        &identity,
         &access_token,
         &default_library_id,
-        progress_values(&state, &catalog),
+        progress_values(&state, &catalog, &identity.id),
         Some(&access_token),
         Some(&refresh_token),
     );
@@ -311,15 +310,9 @@ async fn authorize(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(&state);
-    let default_library_id = catalog.default_library_id();
-    let user = user_json(
-        &token,
-        &default_library_id,
-        progress_values(&state, &catalog),
-        None,
-        None,
-    );
+    let Some((user, default_library_id)) = current_user_json(&state, &token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
     Json(login_envelope(user, &default_library_id)).into_response()
 }
 
@@ -429,9 +422,10 @@ async fn item(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let catalog = Catalog::load(&state);
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -441,17 +435,18 @@ async fn item(
     let expanded = query_value(&uri, "expanded")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "True"));
     if expanded || include.contains("progress") {
-        if let Some((current_time, duration)) = read_progress(&state, item) {
+        if let Some((current_time, duration)) = read_progress(&state, item, &identity.id) {
             let row = state.db.lock().ok().and_then(|db| {
                 db.query_row(
                     "SELECT watched, hidden_from_continue, updated_at FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
-                    params![USER_ID, item.id],
+                    params![identity.id, item.id],
                     |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, i64>(2)?)),
                 )
                 .ok()
             });
             if let Some((watched, hidden, updated)) = row {
                 response["userProgress"] = media_progress_json(
+                    &identity.id,
                     item,
                     current_time,
                     if duration > 0.0 {
@@ -497,9 +492,10 @@ async fn play(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let catalog = Catalog::load(&state);
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -507,11 +503,11 @@ async fn play(
     let Some(library) = catalog.item_library(item) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let progress = read_progress(&state, item);
+    let progress = read_progress(&state, item, &identity.id);
     let now = now_ms();
     let session = PlaybackSession {
         id: format!("play_{}", random_hex(16)),
-        user_id: USER_ID.to_owned(),
+        user_id: identity.id.clone(),
         library_id: library.id.clone(),
         library_item_id: item.id.clone(),
         current_time: progress.as_ref().map(|row| row.0).unwrap_or(0.0),
@@ -539,15 +535,10 @@ async fn me(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(&state);
-    Json(user_json(
-        &token,
-        &catalog.default_library_id(),
-        progress_values(&state, &catalog),
-        None,
-        None,
-    ))
-    .into_response()
+    let Some((user, _)) = current_user_json(&state, &token) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    Json(user).into_response()
 }
 
 async fn all_progress(
@@ -555,11 +546,12 @@ async fn all_progress(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let catalog = Catalog::load(&state);
-    Json(progress_values(&state, &catalog)).into_response()
+    Json(progress_values(&state, &catalog, &identity.id)).into_response()
 }
 
 async fn items_in_progress(
@@ -567,14 +559,15 @@ async fn items_in_progress(
     headers: HeaderMap,
     uri: Uri,
 ) -> Response {
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let limit = query_value(&uri, "limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(25);
     let catalog = Catalog::load(&state);
-    let mut results = progress_values(&state, &catalog)
+    let mut results = progress_values(&state, &catalog, &identity.id)
         .into_iter()
         .filter(|progress| {
             progress["isFinished"].as_bool() == Some(false)
@@ -616,20 +609,21 @@ async fn progress_response(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> Response {
-    if let Err(response) = require_auth(state, headers, uri) {
-        return response;
-    }
+    let identity = match require_user(state, headers, uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let catalog = Catalog::load(state);
     let Some(item) = catalog.find_item(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some((current_time, duration)) = read_progress(state, item) else {
+    let Some((current_time, duration)) = read_progress(state, item, &identity.id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let row = state.db.lock().ok().and_then(|db| {
         db.query_row(
             "SELECT watched, hidden_from_continue, updated_at FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
-            params![USER_ID, item.id],
+            params![identity.id, item.id],
             |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?, row.get::<_, i64>(2)?)),
         )
         .ok()
@@ -638,6 +632,7 @@ async fn progress_response(
         return StatusCode::NOT_FOUND.into_response();
     };
     Json(media_progress_json(
+        &identity.id,
         item,
         current_time,
         if duration > 0.0 {
@@ -676,9 +671,10 @@ async fn update_progress_impl(
 ) -> Response {
     let headers = request.headers().clone();
     let uri = request.uri().clone();
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -688,7 +684,7 @@ async fn update_progress_impl(
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match save_progress(&state, item, &payload) {
+    match save_progress(&state, item, &payload, &identity.id) {
         Ok(progress) => Json(progress).into_response(),
         Err(status) => status.into_response(),
     }
@@ -700,9 +696,10 @@ async fn batch_progress(
 ) -> Response {
     let headers = request.headers().clone();
     let uri = request.uri().clone();
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -717,7 +714,7 @@ async fn batch_progress(
         let Some(item) = catalog.find_item(&payload.library_item_id) else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        match save_progress(&state, item, &payload.progress) {
+        match save_progress(&state, item, &payload.progress, &identity.id) {
             Ok(progress) => results.push(progress),
             Err(status) => return status.into_response(),
         }
@@ -755,9 +752,10 @@ async fn sync_session(
 ) -> Response {
     let headers = request.headers().clone();
     let uri = request.uri().clone();
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -798,6 +796,7 @@ async fn sync_session(
             is_finished: None,
             hide_from_continue_listening: None,
         },
+        &identity.id,
     );
     if let Err(status) = progress {
         return status.into_response();
@@ -812,9 +811,10 @@ async fn close_session(
 ) -> Response {
     let headers = request.headers().clone();
     let uri = request.uri().clone();
-    if let Err(response) = require_auth(&state, &headers, &uri) {
-        return response;
-    }
+    let identity = match require_user(&state, &headers, &uri) {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
     let body = match read_body(request).await {
         Ok(body) => body,
         Err(response) => return response,
@@ -849,6 +849,7 @@ async fn close_session(
             is_finished: None,
             hide_from_continue_listening: None,
         },
+        &identity.id,
     ) {
         return status.into_response();
     }
@@ -968,6 +969,15 @@ fn require_auth(
     }
 }
 
+fn require_user(
+    state: &crate::harbinger::AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> Result<UserIdentity, Response> {
+    let token = require_auth(state, headers, uri)?;
+    session_user(state, &token).ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())
+}
+
 fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
@@ -979,19 +989,7 @@ fn bearer_from_headers(headers: &HeaderMap) -> Option<String> {
 }
 
 fn token_valid(state: &crate::harbinger::AppState, token: &str) -> bool {
-    state
-        .db
-        .lock()
-        .ok()
-        .and_then(|db| {
-            db.query_row(
-                "SELECT EXISTS(SELECT 1 FROM web_sessions WHERE token_hash = ?1 AND expires_at > ?2)",
-                params![hash_token(token), now_seconds()],
-                |row| row.get::<_, bool>(0),
-            )
-            .ok()
-        })
-        .unwrap_or(false)
+    session_user(state, token).is_some()
 }
 
 fn revoke_token(state: &crate::harbinger::AppState, token: &str) {
@@ -1003,26 +1001,89 @@ fn revoke_token(state: &crate::harbinger::AppState, token: &str) {
     }
 }
 
-fn password_valid(state: &crate::harbinger::AppState, password: &str) -> bool {
-    let hash = state.db.lock().ok().and_then(|db| {
-        db.query_row(
-            "SELECT password_hash FROM users WHERE password_hash IS NOT NULL LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-    });
-    match hash {
-        Some(hash) => PasswordHash::new(&hash).ok().is_some_and(|parsed| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
-        }),
-        None => false,
+fn authenticate(
+    state: &crate::harbinger::AppState,
+    username: &str,
+    password: &str,
+) -> Option<UserIdentity> {
+    let username = username.trim();
+    if username.is_empty() || password.is_empty() {
+        return None;
     }
+    let db = state.db.lock().ok()?;
+    let (identity, hash) = db
+        .query_row(
+            "SELECT id, COALESCE(username, name), COALESCE(user_type, 'guest'), created_at, last_seen, password_hash
+               FROM users
+              WHERE lower(username) = lower(?1) AND is_active = 1
+              LIMIT 1",
+            [username],
+            |row| {
+                Ok((
+                    UserIdentity {
+                        id: row.get(0)?,
+                        username: row.get(1)?,
+                        user_type: row.get(2)?,
+                        created_at: row.get(3)?,
+                        last_seen: row.get(4)?,
+                    },
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            },
+        )
+        .ok()?;
+    let hash = hash?;
+    let parsed = PasswordHash::new(&hash).ok()?;
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .ok()?;
+    Some(identity)
 }
 
-fn issue_tokens(state: &crate::harbinger::AppState) -> Result<(String, String), StatusCode> {
+fn session_user(state: &crate::harbinger::AppState, token: &str) -> Option<UserIdentity> {
+    state.db.lock().ok().and_then(|db| {
+        db.query_row(
+            "SELECT users.id, COALESCE(users.username, users.name),
+                        COALESCE(users.user_type, 'guest'), users.created_at, users.last_seen
+                   FROM web_sessions
+                   JOIN users ON users.id = COALESCE(web_sessions.user_id, 'admin')
+                  WHERE web_sessions.token_hash = ?1
+                    AND web_sessions.expires_at > ?2
+                    AND users.is_active = 1",
+            params![hash_token(token), now_seconds()],
+            |row| {
+                Ok(UserIdentity {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    user_type: row.get(2)?,
+                    created_at: row.get(3)?,
+                    last_seen: row.get(4)?,
+                })
+            },
+        )
+        .ok()
+    })
+}
+
+fn current_user_json(state: &crate::harbinger::AppState, token: &str) -> Option<(Value, String)> {
+    let identity = session_user(state, token)?;
+    let catalog = Catalog::load(state);
+    let default_library_id = catalog.default_library_id();
+    let user = user_json(
+        &identity,
+        token,
+        &default_library_id,
+        progress_values(state, &catalog, &identity.id),
+        None,
+        None,
+    );
+    Some((user, default_library_id))
+}
+
+fn issue_tokens(
+    state: &crate::harbinger::AppState,
+    user_id: &str,
+) -> Result<(String, String), StatusCode> {
     let access = random_token();
     let refresh = random_token();
     let now = now_seconds();
@@ -1031,19 +1092,23 @@ fn issue_tokens(state: &crate::harbinger::AppState) -> Result<(String, String), 
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
-        "INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)",
-        params![hash_token(&access), now + TOKEN_TTL_SECONDS],
+        "INSERT INTO web_sessions (token_hash, expires_at, user_id) VALUES (?1, ?2, ?3)",
+        params![hash_token(&access), now + TOKEN_TTL_SECONDS, user_id],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     db.execute(
-        "INSERT INTO web_sessions (token_hash, expires_at) VALUES (?1, ?2)",
-        params![hash_token(&refresh), now + REFRESH_TTL_SECONDS],
+        "INSERT INTO web_sessions (token_hash, expires_at, user_id) VALUES (?1, ?2, ?3)",
+        params![hash_token(&refresh), now + REFRESH_TTL_SECONDS, user_id],
     )
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((access, refresh))
 }
 
-fn read_progress(state: &crate::harbinger::AppState, item: &Item) -> Option<(f64, f64)> {
+fn read_progress(
+    state: &crate::harbinger::AppState,
+    item: &Item,
+    user_id: &str,
+) -> Option<(f64, f64)> {
     state
         .db
         .lock()
@@ -1051,7 +1116,7 @@ fn read_progress(state: &crate::harbinger::AppState, item: &Item) -> Option<(f64
         .and_then(|db| {
             db.query_row(
                 "SELECT position_ms, duration_ms FROM watch_progress WHERE user_id = ?1 AND media_key = ?2",
-                params![USER_ID, item.id],
+                params![user_id, item.id],
                 |row| {
                     let position = row.get::<_, i64>(0)?;
                     let duration = row.get::<_, Option<i64>>(1)?;
@@ -1068,7 +1133,11 @@ fn read_progress(state: &crate::harbinger::AppState, item: &Item) -> Option<(f64
         })
 }
 
-fn progress_values(state: &crate::harbinger::AppState, catalog: &Catalog) -> Vec<Value> {
+fn progress_values(
+    state: &crate::harbinger::AppState,
+    catalog: &Catalog,
+    user_id: &str,
+) -> Vec<Value> {
     let rows = state
         .db
         .lock()
@@ -1081,7 +1150,7 @@ fn progress_values(state: &crate::harbinger::AppState, catalog: &Catalog) -> Vec
                 )
                 .ok()?;
             let rows = statement
-                .query_map(params![USER_ID], |row| {
+                .query_map(params![user_id], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
@@ -1099,6 +1168,7 @@ fn progress_values(state: &crate::harbinger::AppState, catalog: &Catalog) -> Vec
         .filter_map(|(key, position, duration, watched, hidden, updated)| {
             let item = catalog.find_item(&key)?;
             Some(media_progress_json(
+                user_id,
                 item,
                 position as f64 / 1000.0,
                 duration.unwrap_or_default() as f64 / 1000.0,
@@ -1114,6 +1184,7 @@ fn save_progress(
     state: &crate::harbinger::AppState,
     item: &Item,
     payload: &ProgressRequest,
+    user_id: &str,
 ) -> Result<Value, StatusCode> {
     let duration = payload.duration.unwrap_or(item.duration).max(0.0);
     let current_time = payload.current_time.unwrap_or(0.0).max(0.0);
@@ -1149,7 +1220,7 @@ fn save_progress(
                 hidden_from_continue = excluded.hidden_from_continue,
                 updated_at = excluded.updated_at",
             params![
-                USER_ID,
+                user_id,
                 item.id,
                 position_ms,
                 duration_ms,
@@ -1161,6 +1232,7 @@ fn save_progress(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     }
     Ok(media_progress_json(
+        user_id,
         item,
         current_time,
         duration,

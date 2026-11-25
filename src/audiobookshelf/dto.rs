@@ -1,7 +1,23 @@
 use super::catalog::{AudioFile, Item, Library, SERVER_VERSION};
 use serde_json::{json, Value};
 
-pub(crate) const USER_ID: &str = "mplex-user";
+#[derive(Clone, Debug)]
+pub(crate) struct UserIdentity {
+    pub(crate) id: String,
+    pub(crate) username: String,
+    pub(crate) user_type: String,
+    pub(crate) created_at: i64,
+    pub(crate) last_seen: i64,
+}
+
+impl UserIdentity {
+    fn audiobookshelf_type(&self) -> &str {
+        match self.user_type.as_str() {
+            "admin" => "root",
+            other => other,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PlaybackSession {
@@ -48,25 +64,31 @@ pub(crate) fn server_settings_json() -> Value {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn user_json(
+    identity: &UserIdentity,
     token: &str,
     default_library_id: &str,
     media_progress: Vec<Value>,
     access_token: Option<&str>,
     refresh_token: Option<&str>,
 ) -> Value {
+    let last_seen = if identity.last_seen > 0 {
+        identity.last_seen * 1000
+    } else {
+        now_ms()
+    };
     let mut user = json!({
-        "id": USER_ID,
-        "username": "admin",
+        "id": identity.id,
+        "username": identity.username,
         "email": "",
-        "type": "root",
+        "type": identity.audiobookshelf_type(),
         "token": token,
         "mediaProgress": media_progress,
         "seriesHideFromContinueListening": [],
         "bookmarks": [],
         "isActive": true,
         "isLocked": false,
-        "lastSeen": now_ms(),
-        "createdAt": 0,
+        "lastSeen": last_seen,
+        "createdAt": identity.created_at * 1000,
         "defaultLibraryId": default_library_id,
         "librariesAccessible": [],
         "itemTagsAccessible": [],
@@ -241,6 +263,7 @@ pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
 }
 
 pub(crate) fn media_progress_json(
+    user_id: &str,
     item: &Item,
     current_time: f64,
     duration: f64,
@@ -257,7 +280,7 @@ pub(crate) fn media_progress_json(
     };
     json!({
         "id": item.id,
-        "userId": USER_ID,
+        "userId": user_id,
         "libraryItemId": item.id,
         "episodeId": null,
         "mediaItemId": item.id,
