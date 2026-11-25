@@ -114,7 +114,7 @@ use tracing_subscriber::{
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const WEB_UI_PORT: u16 = 4826;
 const ABS_PORT: u16 = 13378;
-pub(crate) const USER_ID: &str = "mplex-user";
+pub(crate) const USER_ID: &str = "admin";
 
 static MARKER_DETECTION_GROUPS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
@@ -2370,13 +2370,20 @@ fn open_database(
            AND NOT EXISTS (SELECT 1 FROM users WHERE password_hash IS NOT NULL)",
         [],
     );
-    // ABS playback used a single shared progress identity before accounts were
-    // wired into sessions; retain that progress under the administrator.
+    // Web and Plex progress used a single shared identity before accounts were
+    // wired into sessions. Keep the newest row under the administrator identity.
     let _ = connection.execute(
-        "INSERT OR IGNORE INTO watch_progress
+        "INSERT INTO watch_progress
             (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at)
          SELECT 'admin', media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at
-           FROM watch_progress WHERE user_id = 'mplex-user'",
+           FROM watch_progress WHERE user_id = 'mplex-user'
+         ON CONFLICT(user_id, media_key) DO UPDATE SET
+            position_ms = excluded.position_ms,
+            duration_ms = excluded.duration_ms,
+            watched = excluded.watched,
+            hidden_from_continue = excluded.hidden_from_continue,
+            updated_at = excluded.updated_at
+         WHERE excluded.updated_at > watch_progress.updated_at",
         [],
     );
     let _ = connection.execute(
@@ -6885,7 +6892,6 @@ pub(crate) struct WebPath {
     pub(crate) stream: Option<usize>,
     pub(crate) play: Option<String>,
     pub(crate) episode: Option<String>,
-    pub(crate) view: Option<String>,
     pub(crate) season: Option<u32>,
     pub(crate) bilingual: Option<bool>,
 }
@@ -8312,13 +8318,6 @@ pub(crate) fn media_card_with_options(
     } else {
         card.replace(&remove_action, "")
     }
-}
-
-fn file_item(name: &str) -> String {
-    format!(
-        r#"<div class="file-item">📄 <span>{}</span></div>"#,
-        html(name)
-    )
 }
 
 pub(crate) fn url_encode(value: &str) -> String {

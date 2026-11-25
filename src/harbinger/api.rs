@@ -1857,7 +1857,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 {dashboard_styles_html}
 .settings-section {{ padding: 0; overflow: hidden; }} .settings-section-summary {{ display: flex; width: 100%; align-items: center; justify-content: space-between; padding: 1.05rem; border: 0; border-radius: 0; background: transparent; text-align: left; }} .settings-section-summary span {{ display: grid; gap: .3rem; }} .settings-section-summary strong {{ color: #e8eef8; font-size: 1rem; }} .settings-section-summary small {{ color: #9aa8bf; font-size: .83rem; font-weight: 400; }} .settings-section-content {{ padding: 0 1.05rem 1.05rem; }} .settings-toggle {{ display: flex; align-items: center; gap: .55rem; color: #d4deec; }}
 </style></head><body><div class="app-shell">{}
-<main class="with-global-topbar">{}<header class="page-heading"><p class="eyebrow">harbinger</p><h1>Settings</h1><p class="page-subtitle">Manage Plex access, users, metadata storage, subtitle translation, and the libraries available on this server.</p></header>{}{}
+<main class="with-global-topbar">{}{}{}
 <div class="settings-stack"{}>
 <section class="settings-card" aria-labelledby="plex-heading"><div class="section-heading"><div><h2 id="plex-heading">Plex account</h2><p class="section-description">Connect harbinger to Plex so compatible clients can discover and authenticate with this server.</p></div></div>{}<form method="post" action="/settings/server-name" class="settings-form server-name-form"><label class="field"><span>Server name</span><input name="server_name" type="text" value="{}" maxlength="64" required><small class="note">This is the name Plex clients see. It defaults to harbinger.</small></label><div><button class="button-secondary" type="submit">Save server name</button></div></form></section>
 <section class="settings-card" aria-labelledby="metadata-heading"><div class="section-heading"><div><h2 id="metadata-heading">Metadata storage</h2><p class="section-description">Both options use the same .hbgr sidecar format. Reads prefer the selected location and fall back to the other. New metadata, artwork, and skip markers are written only to the selected location. Config mode never writes to media folders.</p></div></div><form method="post" action="/settings/preferences" class="settings-form" id="metadata-storage-form"><div class="metadata-options"><label class="metadata-option"><input type="radio" name="metadata_storage" value="config" {}><span class="option-copy"><strong>Store metadata in config folder {}</strong><span class="note">Files are stored under the server config folder.</span></span></label><label class="metadata-option"><input type="radio" name="metadata_storage" value="media" {}><span class="option-copy"><strong>Store metadata with media {}</strong><span class="note">Files are stored in each media folder’s <code>.hbgr</code> directory.</span></span></label></div><label class="field"><span>TMDB bearer token</span><input name="tmdb_bearer_token" type="password" autocomplete="new-password" placeholder="Enter a token to save or replace it"></label><input type="hidden" name="copy_existing" id="copy-existing" value="false">{}<div><button type="submit">Save metadata settings</button></div></form><dialog id="metadata-storage-dialog" aria-labelledby="metadata-storage-dialog-title"><form method="dialog"><button type="submit" aria-label="Close storage dialog" title="Close">×</button></form><h2 id="metadata-storage-dialog-title">Change metadata storage?</h2><p>Existing metadata and artwork stay in their current location unless you choose to copy them. Copying adds files to the new location and does not delete the originals or overwrite files already there.</p><div class="action-row"><button type="button" class="button-secondary" id="storage-switch-only">Switch without copying</button><button type="button" id="storage-switch-copy">Switch and copy existing data</button></div></dialog></section>
@@ -3281,7 +3281,7 @@ pub(crate) async fn home_client(State(state): State<AppState>, search: Option<St
         ),
     );
     let mut home_page = format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} .sidebar-settings-group {{ margin: 0; }} .sidebar-settings-group > summary {{ list-style: none; cursor: pointer; }} .sidebar-settings-group > summary::-webkit-details-marker {{ display: none; }} .sidebar-settings-group > summary::marker {{ content: ""; }} .sidebar-chevron {{ margin-left: auto; color: #7f8ea3; transition: transform .15s ease; }} .sidebar-settings-group[open] > summary .sidebar-chevron {{ transform: rotate(180deg); }} .sidebar-subnav {{ display: grid; gap: .15rem; margin: .2rem 0 .35rem 1.15rem; padding-left: .65rem; border-left: 1px solid #263244; }} .sidebar-sublink {{ display: flex; align-items: center; min-height: 2rem; padding: .4rem .55rem; border-radius: .4rem; color: #94a3b8; text-decoration: none; font-size: .86rem; }} .sidebar-sublink:hover, .sidebar-sublink.active {{ color: #fff; background: #17243a; }} .sidebar-collapsed .sidebar-settings-group[open] .sidebar-subnav {{ display: none; }} .sidebar-collapsed .sidebar-chevron {{ display: none; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} .continue-grid > .empty-state {{ grid-column: 1 / -1; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ justify-content: flex-start; padding-bottom: .35rem; }} .sidebar-brand {{ display: inline-block; padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-collapsed .sidebar-top {{ justify-content: flex-start; }} .sidebar-collapsed .sidebar-brand {{ font-size: 1.25rem; }} .sidebar-collapsed .sidebar-link {{ justify-content: flex-start; padding-left: .7rem; padding-right: .7rem; font-size: 1rem; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }} .sidebar-nav {{ display: flex; flex-wrap: wrap; gap: .35rem; padding-bottom: .2rem; }} .sidebar-link {{ min-height: 2.75rem; white-space: nowrap; }} .sidebar-settings-group {{ flex: 1 0 100%; }} .sidebar-settings-group > summary {{ width: 100%; }} .sidebar-subnav {{ margin-left: 0; padding-left: 0; border-left: 0; }} .sidebar-collapsed .sidebar-settings-group[open] .sidebar-subnav {{ display: grid; }} main {{ padding: 1rem .9rem max(2rem, calc(1.25rem + env(safe-area-inset-bottom, 0px))); }} h1 {{ font-size: clamp(1.65rem, 7vw, 2rem); line-height: 1.15; overflow-wrap: anywhere; }} .library-grid, .recent-grid, .continue-grid {{ gap: .7rem; }} .media-card {{ padding: .55rem; }} .media-card-menu summary {{ min-width: 2.5rem; min-height: 2.5rem; padding: .45rem; }} .media-card-menu-items {{ right: 0; min-width: 9rem; max-width: calc(100vw - 2rem); }} .media-card-menu-items button {{ min-height: 2.5rem; }} input, select, textarea {{ font-size: 16px; }} }}</style></head><body><div class="app-shell">{}<main><h1>Home</h1><form class="section" method="get" action="/" role="search"><label for="media-search">Search all media</label><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="media-search" name="search" type="search" value="{}" style="flex:1;min-width:0;padding:.7rem;border:1px solid #374151;border-radius:.45rem;color:#fff;background:#0d1421" autocomplete="off"><button type="submit">Search</button></div></form>{}<section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" href="/favicon.ico" sizes="any"><title>harbinger</title><style>body {{ margin: 0; color: #f9fafb; background: #111827; font-family: system-ui, sans-serif; }} .app-shell {{ display: grid; grid-template-columns: 240px minmax(0, 1fr); min-height: 100vh; }} .sidebar {{ position: sticky; top: 0; height: 100vh; box-sizing: border-box; padding: 1.25rem .9rem; border-right: 1px solid #263244; background: #0d1421; }} .sidebar-brand {{ display: block; padding: .5rem .7rem 1.5rem; color: #f9fafb; font-size: 1.25rem; font-weight: 700; text-decoration: none; }} .sidebar-top {{ display: flex; justify-content: space-between; align-items: center; }} .sidebar-toggle {{ background: none; border: 0; color: #cbd5e1; font-size: 1.3rem; cursor: pointer; }} .sidebar-label {{ padding: 1rem .7rem .4rem; color: #6b7280; font-size: .7rem; text-transform: uppercase; }} .sidebar-nav {{ display: grid; gap: .25rem; }} .sidebar-link {{ display: flex; gap: .7rem; padding: .65rem .7rem; border-radius: .5rem; color: #cbd5e1; text-decoration: none; }} .sidebar-link.active, .sidebar-link:hover {{ background: #1d4ed8; color: #fff; }} .sidebar-icon {{ width: 1.3rem; text-align: center; }} .sidebar-settings-group {{ margin: 0; }} .sidebar-settings-group > summary {{ list-style: none; cursor: pointer; }} .sidebar-settings-group > summary::-webkit-details-marker {{ display: none; }} .sidebar-settings-group > summary::marker {{ content: ""; }} .sidebar-chevron {{ margin-left: auto; color: #7f8ea3; transition: transform .15s ease; }} .sidebar-settings-group[open] > summary .sidebar-chevron {{ transform: rotate(180deg); }} .sidebar-subnav {{ display: grid; gap: .15rem; margin: .2rem 0 .35rem 1.15rem; padding-left: .65rem; border-left: 1px solid #263244; }} .sidebar-sublink {{ display: flex; align-items: center; min-height: 2rem; padding: .4rem .55rem; border-radius: .4rem; color: #94a3b8; text-decoration: none; font-size: .86rem; }} .sidebar-sublink:hover, .sidebar-sublink.active {{ color: #fff; background: #17243a; }} .sidebar-collapsed .sidebar-settings-group[open] .sidebar-subnav {{ display: none; }} .sidebar-collapsed .sidebar-chevron {{ display: none; }} main {{ max-width: 1100px; width: 100%; box-sizing: border-box; margin: auto; padding: 2rem 1rem; }} a {{ color: #93c5fd; text-decoration: none; }} h1 {{ margin-top: 0; }} .section {{ margin: 2rem 0; }} .library-grid, .recent-grid, .continue-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax({}px, 1fr)); gap: 1rem; }} .library-card {{ display: flex; flex-direction: column; gap: .4rem; padding: 1rem; border: 1px solid #374151; border-radius: .7rem; background: #1f2937; }} .media-card {{ position: relative; min-width: 0; padding: .7rem; border: 1px solid transparent; border-radius: .6rem; background: #1f2937; transition: border-color .15s, transform .15s; }} .media-card:hover {{ border-color: #374151; transform: translateY(-2px); }} .media-card-artwork {{ position: relative; }} .media-card-info {{ display: grid; gap: .12rem; padding: .55rem 0 1.6rem; color: inherit; text-align: center; text-decoration: none; }} .media-card-title {{ display: block; height: 2.4em; overflow: hidden; margin: .25rem 0 .15rem; font-size: .8rem; font-weight: 500; line-height: 1.2; }} .media-card-tv .media-card-title {{ height: auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }} .media-card-subtitle, .media-card-details {{ overflow: hidden; color: #9ca3af; font-size: .75rem; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }} .media-card-progress-row {{ display: flex; align-items: center; gap: .45rem; margin: .3rem 0 .4rem; }} .media-card-progress {{ flex: 1 1 auto; min-width: 0; height: .3rem; border-radius: 999px; background: #374151; overflow: hidden; }} .media-card-progress span {{ display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #2563eb, #22c55e); }} .media-card-percent {{ flex: 0 0 auto; color: #93c5fd; font-size: .68rem; line-height: 1; }} .media-card-menu {{ position: absolute; right: .45rem; bottom: .45rem; z-index: 4; }} .media-card-menu summary {{ display: grid; width: 1.65rem; height: 1.65rem; place-items: center; border: 1px solid rgba(255,255,255,.25); border-radius: 50%; color: #f9fafb; background: rgba(17,24,39,.58); backdrop-filter: blur(3px); font-size: 1rem; font-weight: 800; line-height: 1; list-style: none; cursor: pointer; }} .media-card-menu summary::-webkit-details-marker {{ display: none; }} .media-card-menu-items {{ position: absolute; right: 0; bottom: calc(100% + .35rem); display: grid; min-width: 12.5rem; gap: .2rem; padding: .35rem; border: 1px solid #374151; border-radius: .5rem; background: #111827; box-shadow: 0 8px 24px #0008; }} .media-card-menu-items button {{ padding: .55rem .65rem; border: 0; border-radius: .3rem; color: #e5e7eb; background: transparent; font: inherit; font-size: .78rem; text-align: left; cursor: pointer; }} .media-card-menu-items button:hover {{ background: #263244; }} .library-icon {{ font-size: 2rem; }} .note {{ color: #9ca3af; }} .empty-state {{ padding: 1.5rem; border: 1px dashed #4b5563; border-radius: .7rem; }} .continue-grid > .empty-state {{ grid-column: 1 / -1; }} @media (max-width: 700px) {{ .app-shell {{ display: block; }} .sidebar {{ position: static; height: auto; width: 100%; padding: .7rem; border-right: 0; border-bottom: 1px solid #263244; }} .sidebar-top {{ justify-content: flex-start; padding-bottom: .35rem; }} .sidebar-brand {{ display: inline-block; padding: .35rem .55rem; }} .sidebar-toggle {{ display: none; }} .sidebar-label {{ display: none; }} .sidebar-collapsed .sidebar-top {{ justify-content: flex-start; }} .sidebar-collapsed .sidebar-brand {{ font-size: 1.25rem; }} .sidebar-collapsed .sidebar-link {{ justify-content: flex-start; padding-left: .7rem; padding-right: .7rem; font-size: 1rem; }} .sidebar-collapsed .sidebar-icon {{ font-size: 1.1rem; }} .sidebar-nav {{ display: flex; flex-wrap: wrap; gap: .35rem; padding-bottom: .2rem; }} .sidebar-link {{ min-height: 2.75rem; white-space: nowrap; }} .sidebar-settings-group {{ flex: 1 0 100%; }} .sidebar-settings-group > summary {{ width: 100%; }} .sidebar-subnav {{ margin-left: 0; padding-left: 0; border-left: 0; }} .sidebar-collapsed .sidebar-settings-group[open] .sidebar-subnav {{ display: grid; }} main {{ padding: 1rem .9rem max(2rem, calc(1.25rem + env(safe-area-inset-bottom, 0px))); }} h1 {{ font-size: clamp(1.65rem, 7vw, 2rem); line-height: 1.15; overflow-wrap: anywhere; }} .library-grid, .recent-grid, .continue-grid {{ gap: .7rem; }} .media-card {{ padding: .55rem; }} .media-card-menu summary {{ min-width: 2.5rem; min-height: 2.5rem; padding: .45rem; }} .media-card-menu-items {{ right: 0; min-width: 9rem; max-width: calc(100vw - 2rem); }} .media-card-menu-items button {{ min-height: 2.5rem; }} input, select, textarea {{ font-size: 16px; }} }}</style></head><body><div class="app-shell">{}<main><form class="section" method="get" action="/" role="search"><label for="media-search">Search all media</label><div style="display:flex;gap:.5rem;margin-top:.5rem"><input id="media-search" name="search" type="search" value="{}" style="flex:1;min-width:0;padding:.7rem;border:1px solid #374151;border-radius:.45rem;color:#fff;background:#0d1421" autocomplete="off"><button type="submit">Search</button></div></form>{}<section class="section"><h2>Continue watching</h2><div class="continue-grid">{}</div></section><section class="section"><h2>Recently added</h2><div class="recent-grid">{}</div></section><section class="section"><h2>Your libraries</h2><div class="library-grid">{}</div></section></main></div>{}{}{}<script>const shell=document.querySelector('.app-shell'), toggle=document.querySelector('.sidebar-toggle'); if(localStorage.getItem('mplex-sidebar-collapsed')==='true') shell.classList.add('sidebar-collapsed'); toggle?.addEventListener('click',()=>{{shell.classList.toggle('sidebar-collapsed');localStorage.setItem('mplex-sidebar-collapsed',shell.classList.contains('sidebar-collapsed')?'true':'false')}});</script></body></html>"#,
         POSTER_CARD_MIN_WIDTH,
         sidebar_markup,
         html(search_term),
@@ -3301,11 +3301,8 @@ pub(crate) async fn home_client(State(state): State<AppState>, search: Option<St
         }
     }
     home_page = home_page.replace(
-        "<main><h1>Home</h1>",
-        &format!(
-            "<main class=\"with-global-topbar\">{}<h1>Home</h1>",
-            search_markup
-        ),
+        "<main>",
+        &format!("<main class=\"with-global-topbar\">{}", search_markup),
     );
     Html(add_build_info_footer(home_page)).into_response()
 }
@@ -3529,7 +3526,6 @@ pub(crate) async fn web_client(
             .ok()
             .and_then(|config| (!config.libraries.is_empty()).then_some(0));
     }
-    let files_view = query.view.as_deref() == Some("files");
     let media_index = media_snapshot(&s);
     let relative = match clean_relative_path(query.path.as_deref().unwrap_or("")) {
         Some(path) => path,
@@ -3564,8 +3560,7 @@ pub(crate) async fn web_client(
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
         Err(status) => return status.into_response(),
     };
-    let audiobook_detail_item = if !files_view
-        && query.play.is_none()
+    let audiobook_detail_item = if query.play.is_none()
         && query.episode.is_none()
         && library_kind.as_deref().is_some_and(is_audiobook_library)
     {
@@ -3844,10 +3839,9 @@ pub(crate) async fn web_client(
     };
     let mut directories = Vec::new();
     let mut files = Vec::new();
-    let virtual_tv_view = !files_view
-        && library_kind.as_deref() == Some("tv")
-        && (tv_show_view || query.season.is_some());
-    if audiobook_detail_item.is_none() && (!library_top_level || files_view) && !virtual_tv_view {
+    let virtual_tv_view =
+        library_kind.as_deref() == Some("tv") && (tv_show_view || query.season.is_some());
+    if audiobook_detail_item.is_none() && !library_top_level && !virtual_tv_view {
         let mut entries = match tokio::fs::read_dir(&directory).await {
             Ok(entries) => entries,
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -3865,7 +3859,7 @@ pub(crate) async fn web_client(
             if file_type.is_dir() {
                 directories.push((name, child_relative));
             } else if file_type.is_file()
-                && (files_view || web_media_type(&path).is_some())
+                && web_media_type(&path).is_some()
                 && selected_relative
                     .as_deref()
                     .is_none_or(|selected| selected == child_relative)
@@ -3886,23 +3880,6 @@ pub(crate) async fn web_client(
             library_kind.as_deref(),
         ));
     }
-    let view_library = query.library.unwrap_or_default();
-    let view_path = url_encode(&relative.to_string_lossy());
-    let media_view_href = format!("/?library={view_library}&path={view_path}");
-    let files_view_href = format!("{media_view_href}&view=files");
-    let media_view_style = if files_view {
-        "padding:.45rem .75rem;border-radius:.45rem;color:#cbd5e1;background:#1f2937;text-decoration:none"
-    } else {
-        "padding:.45rem .75rem;border-radius:.45rem;color:#fff;background:#1d4ed8;text-decoration:none"
-    };
-    let files_view_style = if files_view {
-        "padding:.45rem .75rem;border-radius:.45rem;color:#fff;background:#1d4ed8;text-decoration:none"
-    } else {
-        "padding:.45rem .75rem;border-radius:.45rem;color:#cbd5e1;background:#1f2937;text-decoration:none"
-    };
-    items.push_str(&format!(
-        "<nav aria-label=\"Library view\" style=\"display:flex;grid-column:1 / -1;gap:.4rem;margin-bottom:.5rem\"><a data-spa-link href=\"{media_view_href}\" style=\"{media_view_style}\">Media</a><a data-spa-link href=\"{files_view_href}\" style=\"{files_view_style}\">Files</a></nav>"
-    ));
     let sidebar_library = query.library.or_else(|| {
         s.config
             .lock()
@@ -3910,26 +3887,25 @@ pub(crate) async fn web_client(
             .and_then(|config| (!config.libraries.is_empty()).then_some(0))
     });
     let sidebar = sidebar_nav_for(&s, &relative, sidebar_library);
-    let page_heading = if let Some(item) = audiobook_detail_item.as_ref() {
-        if item.metadata.title.is_some() {
-            if item.author.trim().is_empty() {
-                html(&item.title)
+    let page_heading = audiobook_detail_item
+        .as_ref()
+        .map(|item| {
+            let title = if item.metadata.title.is_some() {
+                if item.author.trim().is_empty() {
+                    html(&item.title)
+                } else {
+                    format!("{} - {}", html(&item.author), html(&item.title))
+                }
             } else {
-                format!("{} - {}", html(&item.author), html(&item.title))
-            }
-        } else {
-            relative
-                .file_name()
-                .and_then(|name| name.to_str())
-                .map(html)
-                .unwrap_or_else(|| html(&item.title))
-        }
-    } else {
-        library_config
-            .as_ref()
-            .map(|library| html(&library.name))
-            .unwrap_or_else(|| "Home".to_owned())
-    };
+                relative
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(html)
+                    .unwrap_or_else(|| html(&item.title))
+            };
+            format!("<h1>{title}</h1>")
+        })
+        .unwrap_or_default();
     let mut folder_cards = String::new();
     let mut season_sections = String::new();
     let mut has_content = false;
@@ -4069,7 +4045,7 @@ pub(crate) async fn web_client(
             }
         }
     }
-    if library_top_level && !files_view {
+    if library_top_level {
         if let (Some(library_index), Some(library)) = (query.library, library_config.as_ref()) {
             let mut media = media_index
                 .iter()
@@ -4235,19 +4211,6 @@ pub(crate) async fn web_client(
     }
     for (name, child_relative) in directories {
         has_content = true;
-        if files_view {
-            let href = format!(
-                "/?library={}&path={}&view=files",
-                query.library.unwrap_or_default(),
-                url_encode(&child_relative.to_string_lossy())
-            );
-            folder_cards.push_str(&format!(
-                "<a class=\"file-item\" data-spa-link href=\"{}\" style=\"display:flex;align-items:center;gap:.6rem;padding:.7rem .85rem;border:1px solid #374151;border-radius:.5rem;background:#1f2937;color:inherit;text-decoration:none\">📁 <span>{}</span></a>",
-                html(&href),
-                html(&name)
-            ));
-            continue;
-        }
         let directory = directory.join(&name);
         if library_kind.as_deref() == Some("tv") && parse_tv_season_directory(&name).is_some() {
             let season_number = parse_tv_season_directory(&name).unwrap_or_default();
@@ -4335,26 +4298,6 @@ pub(crate) async fn web_client(
     }
     for (name, child_relative, path) in files {
         has_content = true;
-        if files_view && selected_relative.is_none() {
-            let row = if web_media_type(&path).is_some() {
-                let folder = child_relative.parent().unwrap_or(&relative);
-                let href = format!(
-                    "/?library={}&path={}&play={}&view=files",
-                    query.library.unwrap_or_default(),
-                    url_encode(&folder.to_string_lossy()),
-                    url_encode(&child_relative.to_string_lossy())
-                );
-                format!(
-                    "<a class=\"file-item\" data-spa-link href=\"{}\" style=\"display:flex;align-items:center;gap:.6rem;padding:.7rem .85rem;border:1px solid #374151;border-radius:.5rem;background:#1f2937;color:inherit;text-decoration:none\">📄 <span>{}</span></a>",
-                    html(&href),
-                    html(&name)
-                )
-            } else {
-                file_item(&name)
-            };
-            items.push_str(&row);
-            continue;
-        }
         if let Some((_, mime)) = web_media_type(&path) {
             let matched_media = web_media_for_relative(&s, &library_root, &child_relative).await;
             if tv_season_view && selected_relative.is_none() {
@@ -4478,18 +4421,12 @@ pub(crate) async fn web_client(
                 &skip_intro_mode,
                 &skip_credits_mode,
             ));
-        } else {
-            items.push_str(&file_item(&name));
         }
     }
     items.push_str(&folder_cards);
     items.push_str(&season_sections);
     if !has_content {
-        items.push_str(if files_view {
-            r#"<p class="note">No files or folders here.</p>"#
-        } else {
-            r#"<p class="note">No supported media or subfolders here.</p>"#
-        });
+        items.push_str(r#"<p class="note">No supported media or subfolders here.</p>"#);
     }
     (
         [(header::CACHE_CONTROL, "no-store")],
@@ -4702,7 +4639,7 @@ pub(crate) async fn web_client(
   <div class="app-shell">
     {}
     <main{}>{}
-    <h1>{}</h1>
+    {}
     {}
     <section class="library">{}</section>
     <dialog id="info-modal"><form method="dialog"><button type="submit" aria-label="Close dialog" title="Close">×</button></form><h2>Technical media information</h2><div id="info-content" class="info-grid">Loading…</div></dialog>
@@ -6655,6 +6592,7 @@ pub(crate) fn sidebar_library_links(state: &AppState, selected_library: Option<u
         .unwrap_or_default()
 }
 
+#[cfg(test)]
 pub(crate) fn sidebar_nav_with_settings(settings_active: bool) -> String {
     sidebar_nav_with_library_links(!settings_active, settings_active, "")
 }
@@ -6793,16 +6731,12 @@ pub(crate) fn breadcrumb_nav(
     if relative.as_os_str().is_empty() && query.season.is_none() && selected_relative.is_none() {
         return String::new();
     }
-    let files_view = query.view.as_deref() == Some("files");
     let mut prefix = String::new();
     if let Some(library) = query.library {
         prefix.push_str(&format!("library={library}&"));
     }
     if let Some(folder) = query.folder {
         prefix.push_str(&format!("folder={folder}&"));
-    }
-    if files_view {
-        prefix.push_str("view=files&");
     }
     let href = |path: &std::path::Path, extra: &str| {
         format!(
@@ -6822,7 +6756,7 @@ pub(crate) fn breadcrumb_nav(
         crumbs.push((name.to_string_lossy().into_owned(), href(&current, "")));
     }
 
-    if library_kind == Some("tv") && !files_view {
+    if library_kind == Some("tv") {
         let season_from_episode = selected_relative.and_then(|selected| {
             selected
                 .components()
@@ -8340,7 +8274,6 @@ pub(crate) async fn root_handler(
             || query.path.is_some()
             || query.play.is_some()
             || query.episode.is_some()
-            || query.view.is_some()
         {
             timed_web_client(s, query, uri.to_string()).await
         } else {
@@ -8359,7 +8292,6 @@ pub(crate) async fn root_handler(
         || query.path.is_some()
         || query.play.is_some()
         || query.episode.is_some()
-        || query.view.is_some()
     {
         timed_web_client(s, query, uri.to_string()).await
     } else {

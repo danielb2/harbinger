@@ -1099,6 +1099,7 @@ async fn settings_logs_tab_displays_recent_events() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("<h2 id=\"logs-heading\">Logs</h2>"));
+    assert!(!body.contains("<h1>Settings</h1>"));
     assert!(body.contains("id=\"settings-logs-search\" type=\"search\""));
     assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
     assert!(body.contains("id=\"settings-logs-copy\" type=\"button\""));
@@ -3036,43 +3037,6 @@ async fn new_tv_episode_inherits_config_sidecar_show_match_automatically() {
     assert_eq!(new_metadata["mplex_season"], 1);
     assert_eq!(new_metadata["mplex_episode"], 3);
     assert_eq!(new_metadata["mplex_episode_title"], "Added");
-}
-
-#[tokio::test]
-async fn files_view_lists_folders_and_supported_or_unsupported_files() {
-    let fixture = fixture();
-    let archive = fixture.root.join("media/Archive");
-    std::fs::create_dir_all(&archive).unwrap();
-    std::fs::write(archive.join("readme.txt"), b"text file").unwrap();
-
-    let root = send(
-        &fixture.app,
-        Method::GET,
-        "/?library=0&view=files",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(root.status(), StatusCode::OK);
-    let root = to_bytes(root.into_body(), usize::MAX).await.unwrap();
-    let root = String::from_utf8(root.to_vec()).unwrap();
-    assert!(root.contains("Demo.mkv"));
-    assert!(!root.contains("readme.txt"));
-    assert!(root.contains("Archive"));
-    assert!(root.contains("view=files"));
-    assert!(!root.contains("<div class=\"media-card"));
-
-    let nested = send(
-        &fixture.app,
-        Method::GET,
-        "/?library=0&path=Archive&view=files",
-        Body::empty(),
-    )
-    .await;
-    assert_eq!(nested.status(), StatusCode::OK);
-    let nested = to_bytes(nested.into_body(), usize::MAX).await.unwrap();
-    let nested = String::from_utf8(nested.to_vec()).unwrap();
-    assert!(nested.contains("readme.txt"));
-    assert!(nested.contains("view=files&path=Archive"));
 }
 
 #[tokio::test]
@@ -6317,6 +6281,7 @@ async fn home_page_search_returns_matching_media_and_empty_state() {
     .unwrap();
     assert!(body.contains("Search all media"));
     assert!(body.contains("id=\"global-media-search\""));
+    assert!(!body.contains("<h1>Home</h1>"));
     assert!(body.contains(".sidebar-collapsed .sidebar-brand { font-size: 1.25rem; }"));
     assert!(body.contains(".sidebar-toggle { display: none; } .sidebar-label { display: none; }"));
     assert!(body.contains(".sidebar-nav { display: flex; flex-wrap: wrap;"));
@@ -6399,6 +6364,9 @@ async fn web_media_library_deduplicates_the_same_canonical_file() {
     .unwrap();
     assert_eq!(body.matches("data-media-path=\"Demo.mkv\"").count(), 1);
     assert!(body.contains("id=\"global-media-search\""));
+    assert!(!body.contains("Library view"));
+    assert!(!body.contains("view=files"));
+    assert!(!body.contains("<h1>"));
 }
 
 fn rendered_breadcrumb(body: &str) -> String {
@@ -10667,4 +10635,94 @@ async fn settings_user_password_change_syncs_the_web_sign_in() {
     assert!(Argon2::default()
         .verify_password(b"admin-new-password", &parsed)
         .is_ok());
+}
+
+#[test]
+fn legacy_watch_progress_migrates_to_admin_without_losing_newer_rows() {
+    assert_eq!(crate::harbinger::USER_ID, "admin");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "harbinger-progress-migration-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_path = dir.join("config.toml");
+    {
+        let (db, _) = open_database(&config_path).unwrap();
+        db.execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES ('mplex-user', 'Demo.mkv', 2500, 10000, 0, 0, 200)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES ('admin', 'Demo.mkv', 1000, 10000, 0, 0, 100)",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES ('mplex-user', 'Other.mkv', 500, 1000, 0, 0, 50)",
+            [],
+        )
+        .unwrap();
+    }
+    let (db, _) = open_database(&config_path).unwrap();
+    let merged = db
+        .query_row(
+            "SELECT position_ms, updated_at FROM watch_progress WHERE user_id = 'admin' AND media_key = 'Demo.mkv'",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(merged, (2500, 200));
+    let copied = db
+        .query_row(
+            "SELECT position_ms FROM watch_progress WHERE user_id = 'admin' AND media_key = 'Other.mkv'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(copied, 500);
+    let legacy_count = db
+        .query_row(
+            "SELECT COUNT(*) FROM watch_progress WHERE user_id = 'mplex-user'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    assert_eq!(legacy_count, 0);
+    drop(db);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[tokio::test]
+async fn home_continue_watching_reads_admin_progress_rows() {
+    let fixture = fixture();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    fixture
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, 'Demo.mkv', 2500, 10000, 0, 0, ?2)",
+            rusqlite::params![crate::harbinger::USER_ID, now],
+        )
+        .unwrap();
+    let response = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    let continue_cards = body
+        .split("class=\"continue-grid\">")
+        .nth(1)
+        .expect("continue watching section")
+        .split("</div>")
+        .next()
+        .expect("continue watching content");
+    assert!(continue_cards.contains("data-media-path=\"Demo.mkv\""));
+    assert!(!continue_cards.contains("Nothing to resume yet"));
 }
