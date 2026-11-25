@@ -302,6 +302,44 @@ async fn login_rejects_bad_credentials_and_accepts_admin_password() {
 }
 
 #[tokio::test]
+async fn authorize_accepts_post_and_returns_the_current_user() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+
+    for path in ["/api/authorize", "/abs/api/authorize"] {
+        let (status, body, _) =
+            send(&fixture.app, Method::POST, path, Some(&token), None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["user"]["username"], "root");
+        assert!(value["serverSettings"].is_object());
+        assert!(value["Source"].is_string());
+    }
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::POST,
+        "/api/authorize",
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/authorize",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+#[tokio::test]
 async fn login_uses_submitted_username_and_isolates_user_data() {
     let fixture = fixture();
     add_user(
@@ -477,6 +515,39 @@ async fn libraries_browse_and_cover_routes_work_with_prefix_aliases() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"cover-bytes");
     assert_eq!(headers[header::CONTENT_TYPE], "image/jpeg");
+}
+
+#[tokio::test]
+async fn library_details_include_every_filterdata_field() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}?include=filterdata"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    for key in [
+        "authors",
+        "genres",
+        "tags",
+        "series",
+        "narrators",
+        "languages",
+        "publishers",
+        "publishedDecades",
+    ] {
+        assert!(
+            value["filterdata"][key].is_array(),
+            "filterdata.{key} must be an array"
+        );
+    }
 }
 
 #[tokio::test]

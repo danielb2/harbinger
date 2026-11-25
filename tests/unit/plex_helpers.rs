@@ -1,16 +1,17 @@
 use super::{
     apply_plex_technical_metadata, ass_to_vtt, contains_hidden_component, copy_sidecar_tree,
-    external_subtitle_content, external_subtitle_label, external_subtitle_language_token,
-    external_subtitle_pair, extract_xml_token, html, next_tv_episode_paths, ordered_continue_paths,
-    parse_range, parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory,
-    plex_children_json, plex_codec, plex_connectivity_url, plex_device_announce_query,
-    plex_device_announce_url, plex_direct_play_decision_response, plex_empty_extras_response,
-    plex_external_subtitle_id, plex_genre_tokens, plex_hub_categories, plex_language,
-    plex_library_children_container, plex_library_media_container, plex_library_provider_features,
-    plex_mark_direct_play, plex_media_id, plex_paged_children, plex_part_id, plex_photo_source,
-    plex_play_queue_response, plex_play_queue_source_uri, plex_presence_url, plex_publish_urls,
-    plex_query_media_id, plex_queue_item_without_playback_decision, plex_ranked_tv_shows,
-    plex_rating_key, plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id,
+    default_log_tag, external_subtitle_content, external_subtitle_label,
+    external_subtitle_language_token, external_subtitle_pair, extract_xml_token, html,
+    logfmt_value, next_tv_episode_paths, ordered_continue_paths, parse_range,
+    parse_sidecar_metadata, parse_tv_episode_marker, parse_tv_season_directory, plex_children_json,
+    plex_codec, plex_connectivity_url, plex_device_announce_query, plex_device_announce_url,
+    plex_direct_play_decision_response, plex_empty_extras_response, plex_external_subtitle_id,
+    plex_genre_tokens, plex_hub_categories, plex_language, plex_library_children_container,
+    plex_library_media_container, plex_library_provider_features, plex_mark_direct_play,
+    plex_media_id, plex_paged_children, plex_part_id, plex_photo_source, plex_play_queue_response,
+    plex_play_queue_source_uri, plex_presence_url, plex_publish_urls, plex_query_media_id,
+    plex_queue_item_without_playback_decision, plex_ranked_tv_shows, plex_rating_key,
+    plex_rating_key_from_source, plex_request_token, plex_safe_numeric_id,
     plex_scrobble_threshold_reached, plex_search_hubs, plex_search_rank,
     plex_search_result_entries, plex_search_type_matches, plex_stream_id,
     plex_stream_id_and_format, plex_track_label, plex_tv_episode_parents, plex_tv_season_groups,
@@ -1682,4 +1683,81 @@ fn tv_show_cover_badge_shows_unwatched_count_or_checkmark() {
     assert!(watched.contains(">✓</span>"));
     assert!(watched.contains("No unwatched episodes"));
     assert!(!watched.contains(">0</span>"));
+}
+
+#[test]
+fn logfmt_values_are_quoted_only_when_required() {
+    assert_eq!(logfmt_value("plex"), "plex");
+    assert_eq!(logfmt_value("GET"), "GET");
+    assert_eq!(logfmt_value("info,hb"), "info,hb");
+    assert_eq!(
+        logfmt_value("error fetching library"),
+        "\"error fetching library\""
+    );
+    assert_eq!(logfmt_value("a=b"), "\"a=b\"");
+    assert_eq!(logfmt_value("a\"b"), "\"a\\\"b\"");
+    assert_eq!(logfmt_value("a\\b"), "\"a\\\\b\"");
+    assert_eq!(logfmt_value(""), "\"\"");
+}
+
+#[test]
+fn log_tags_follow_the_listener_module() {
+    assert_eq!(default_log_tag("harbinger::plex::api"), "plex");
+    assert_eq!(default_log_tag("harbinger::audiobookshelf::api"), "abs");
+    assert_eq!(default_log_tag("harbinger::api"), "hb");
+    assert_eq!(default_log_tag("harbinger::main"), "hb");
+}
+
+#[derive(Clone)]
+struct CapturingMakeWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturingMakeWriter {
+    type Writer = CapturingWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        CapturingWriter(self.0.clone())
+    }
+}
+
+struct CapturingWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CapturingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn log_events_are_formatted_as_logfmt_with_tags() {
+    let output = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(CapturingMakeWriter(output.clone()))
+        .event_format(super::LogfmtFormat {
+            timer: super::LocalSecondTimer,
+        })
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(
+            tag = "abs",
+            event = "http_request",
+            method = "GET",
+            path = "/api/libraries/a b",
+            "finished quickly"
+        );
+    });
+    let line = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+
+    assert!(line.contains("ts=\""), "{line}");
+    assert!(line.contains("tag=info,abs"), "{line}");
+    assert!(!line.contains("level="), "{line}");
+    assert!(line.contains("event=http_request"), "{line}");
+    assert!(line.contains("method=GET"), "{line}");
+    assert!(line.contains("path=\"/api/libraries/a b\""), "{line}");
+    assert!(line.contains("message=\"finished quickly\""), "{line}");
 }

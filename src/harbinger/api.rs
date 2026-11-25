@@ -1810,7 +1810,7 @@ button, .button-link {{ display: inline-flex; min-height: 2.65rem; align-items: 
 
 .library-add-folder[open] > summary::before {{ content: "+"; }}
 #settings-logs-live {{ color: #8fd6a7; font-size: .82rem; }} .log-follow[hidden] {{ display: none; }}
-.settings-logs .log-timestamp {{ color: #4ade80; }} .settings-logs .log-level-info {{ color: #facc15; font-weight: 700; }} .settings-logs .log-level-warn {{ color: #fb923c; font-weight: 700; }} .settings-logs .log-level-error {{ color: #f87171; font-weight: 700; }} .settings-logs .log-level-debug, .settings-logs .log-level-trace {{ color: #94a3b8; }} .settings-logs .log-key {{ color: #7dd3fc; }} .settings-logs .log-value {{ color: #c4b5fd; }}
+.settings-logs .log-timestamp {{ color: #4ade80; }} .settings-logs .log-tag-source {{ color: #7dd3fc; }} .settings-logs .log-level-info {{ color: #facc15; font-weight: 700; }} .settings-logs .log-level-warn {{ color: #fb923c; font-weight: 700; }} .settings-logs .log-level-error {{ color: #f87171; font-weight: 700; }} .settings-logs .log-level-debug, .settings-logs .log-level-trace {{ color: #94a3b8; }} .settings-logs .log-key {{ color: #7dd3fc; }} .settings-logs .log-value {{ color: #c4b5fd; }}
 .log-filters {{ display: flex; flex-wrap: wrap; align-items: end; gap: 1rem; margin-bottom: 1rem; }} .log-filters > label:first-child {{ display: grid; flex: 1 1 16rem; gap: .45rem; color: #c9d4e4; font-size: .84rem; font-weight: 650; }} .log-filters > label:first-child input {{ margin-top: 0; }} .log-filters > label:nth-child(2) {{ display: flex; align-items: center; gap: .45rem; min-height: 2.75rem; color: #c9d4e4; font-size: .84rem; }} #settings-logs-count {{ margin-left: auto; color: #98a6bb; font-size: .82rem; }}
 .settings-tabs {{ display: flex; gap: .35rem; margin: 0 0 1.15rem; padding-bottom: .7rem; border-bottom: 1px solid #29364b; }} .settings-tabs a {{ padding: .55rem .8rem; border-radius: .5rem; color: #aeb9cc; text-decoration: none; }} .settings-tabs a.active, .settings-tabs a:hover {{ color: #fff; background: #1d4ed8; }} .settings-logs {{ max-height: 70vh; margin: 0; padding: 1rem; overflow: auto; border: 1px solid #29364b; border-radius: .65rem; color: #d4deec; background: #0a111e; font: .8rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }}
 {dashboard_styles_html}
@@ -1852,7 +1852,7 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
   const isAtBottom = () => logOutput.scrollHeight - logOutput.scrollTop - logOutput.clientHeight <= 4;
   const scrollToLatest = () => {{ logOutput.scrollTop = logOutput.scrollHeight; }};
   const updateFollowButton = () => {{ logFollowButton.hidden = isAtBottom(); }};
-  const logTimestampPattern = /^(\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d [+-]\d\d:\d\d)(\s+)(TRACE|DEBUG|INFO|WARN|ERROR)(\s+)(.*)$/;
+  const logTimestampPattern = /^(ts="[^"]*")(\s+)tag=(TRACE|DEBUG|INFO|WARN|ERROR),([^\s]+)(\s+)(.*)$/i;
   const appendLogSpan = (parent, className, text) => {{
     const span = document.createElement('span');
     span.className = className;
@@ -1884,9 +1884,11 @@ if (logOutput && logSearch && logReverse && logCount && logEmpty && logFollowBut
       const styledLine = document.createElement('span');
       appendLogSpan(styledLine, 'log-timestamp', parts[1]);
       styledLine.append(document.createTextNode(parts[2]));
+      appendLogSpan(styledLine, 'log-key', 'tag=');
       appendLogSpan(styledLine, 'log-level-' + parts[3].toLowerCase(), parts[3]);
-      styledLine.append(document.createTextNode(parts[4]));
-      appendLogMessage(styledLine, parts[5]);
+      appendLogSpan(styledLine, 'log-tag-source', `,${{parts[4]}}`);
+      styledLine.append(document.createTextNode(parts[5]));
+      appendLogMessage(styledLine, parts[6]);
       logOutput.append(styledLine);
     }});
   }};
@@ -7566,7 +7568,7 @@ async fn timed_web_client(state: AppState, query: WebPath, request_path: String)
     let response = web_client(State(state), Query(query)).await;
     let elapsed_ms = started.elapsed().as_millis();
     if elapsed_ms > 250 {
-        info!(path = %request_path, elapsed_ms, "web client request completed");
+        info!(tag = "hb", path = %request_path, elapsed_ms, "web client request completed");
     }
     response
 }

@@ -1108,6 +1108,9 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains("visibleLogLines.slice()"));
     assert!(body.contains("navigator.clipboard?.writeText"));
     assert!(body.contains(".log-timestamp"));
+    assert!(body.contains(".log-tag-source"));
+    assert!(body.contains("ts=\""));
+    assert!(body.contains("tag=(TRACE|DEBUG|INFO|WARN|ERROR)"));
     assert!(body.contains(".log-level-info"));
     assert!(body.contains(".log-level-warn"));
     assert!(body.contains(".log-level-error"));

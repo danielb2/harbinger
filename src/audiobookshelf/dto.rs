@@ -157,7 +157,9 @@ pub(crate) fn library_detail_json(library: &Library) -> Value {
             "tags": [],
             "series": [],
             "narrators": [],
-            "languages": []
+            "languages": [],
+            "publishers": [],
+            "publishedDecades": []
         },
         "issues": 0,
         "numUserPlaylists": 0

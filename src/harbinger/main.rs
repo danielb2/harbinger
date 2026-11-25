@@ -97,7 +97,19 @@ use tokio::{
 };
 use tokio_util::io::ReaderStream;
 use tower_http::trace::TraceLayer;
-use tracing::{debug, info, warn, Span};
+use tracing::{
+    debug,
+    field::{Field, Visit},
+    info, warn, Event, Span, Subscriber,
+};
+use tracing_subscriber::{
+    fmt::{
+        format::{FormatEvent, FormatFields, Writer},
+        time::FormatTime,
+        FmtContext,
+    },
+    registry::LookupSpan,
+};
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
 const WEB_UI_PORT: u16 = 4826;
@@ -562,16 +574,155 @@ pub(crate) fn load_cached_media(
 
 struct LocalSecondTimer;
 
-impl tracing_subscriber::fmt::time::FormatTime for LocalSecondTimer {
-    fn format_time(
-        &self,
-        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
-    ) -> std::fmt::Result {
+impl FormatTime for LocalSecondTimer {
+    fn format_time(&self, writer: &mut Writer<'_>) -> std::fmt::Result {
         write!(
             writer,
             "{}",
             chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z")
         )
+    }
+}
+
+fn default_log_tag(target: &str) -> &'static str {
+    if target.starts_with("harbinger::audiobookshelf") {
+        "abs"
+    } else if target.starts_with("harbinger::plex") {
+        "plex"
+    } else {
+        "hb"
+    }
+}
+
+fn logfmt_needs_quotes(value: &str) -> bool {
+    value.is_empty()
+        || value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '"' | '=' | '\\'))
+}
+
+fn logfmt_value(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    if !logfmt_needs_quotes(value) {
+        return value.to_owned();
+    }
+    let mut output = String::with_capacity(value.len() + 2);
+    output.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => output.push_str("\\\\"),
+            '"' => output.push_str("\\\""),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(output, "\\u{{{:x}}}", ch as u32);
+            }
+            ch => output.push(ch),
+        }
+    }
+    output.push('"');
+    output
+}
+
+#[derive(Default)]
+struct LogfmtFields {
+    values: Vec<(String, String)>,
+}
+
+impl LogfmtFields {
+    fn push(&mut self, field: &Field, value: String) {
+        self.values.push((field.name().to_owned(), value));
+    }
+}
+
+impl Visit for LogfmtFields {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.push(field, format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.push(field, value.to_owned());
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_i128(&mut self, field: &Field, value: i128) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_u128(&mut self, field: &Field, value: u128) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_f64(&mut self, field: &Field, value: f64) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        self.push(field, value.to_string());
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        self.push(field, value.to_string());
+    }
+}
+
+struct LogfmtFormat<T> {
+    timer: T,
+}
+
+impl<S, N, T> FormatEvent<S, N> for LogfmtFormat<T>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+    T: FormatTime,
+{
+    fn format_event(
+        &self,
+        _ctx: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let mut timestamp = String::new();
+        self.timer.format_time(&mut Writer::new(&mut timestamp))?;
+        write!(writer, "ts={}", logfmt_value(&timestamp))?;
+
+        let mut recorded = LogfmtFields::default();
+        event.record(&mut recorded);
+        let mut source_tag = None;
+        let mut message = None;
+        let mut fields = Vec::new();
+        for (name, value) in recorded.values {
+            match name.as_str() {
+                "tag" => source_tag = Some(value),
+                "message" => message = Some(value),
+                _ => fields.push((name, value)),
+            }
+        }
+
+        let level = event.metadata().level().as_str().to_ascii_lowercase();
+        let source =
+            source_tag.unwrap_or_else(|| default_log_tag(event.metadata().target()).to_owned());
+        write!(
+            writer,
+            " tag={}",
+            logfmt_value(&format!("{level},{source}"))
+        )?;
+        for (name, value) in fields {
+            write!(writer, " {}={}", name, logfmt_value(&value))?;
+        }
+        if let Some(message) = message {
+            write!(writer, " message={}", logfmt_value(&message))?;
+        }
+        writeln!(writer)
     }
 }
 
@@ -724,10 +875,11 @@ fn recent_log_snapshot() -> (u64, Vec<String>) {
 
 pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_target(false)
         .with_ansi(false)
-        .with_timer(LocalSecondTimer)
         .with_writer(LogBufferMakeWriter)
+        .event_format(LogfmtFormat {
+            timer: LocalSecondTimer,
+        })
         .init();
     if let Ok(build_date) = std::env::var("IMAGE_BUILD_DATE") {
         if build_date != "unknown" {
@@ -1050,7 +1202,12 @@ fn restart_process() -> Result<(), Box<dyn std::error::Error>> {
     Err("SIGHUP process reload is only available on Unix".into())
 }
 
+#[cfg(test)]
 fn build_app(state: AppState) -> Router {
+    build_tagged_app(state, "plex")
+}
+
+fn build_tagged_app(state: AppState, tag: &'static str) -> Router {
     Router::new()
         .merge(api::web_routes())
         .merge(crate::plex::api::plex_routes())
@@ -1059,7 +1216,7 @@ fn build_app(state: AppState) -> Router {
         .layer(middleware::from_fn_with_state(state.clone(), web_auth_gate))
         .layer(
             TraceLayer::new_for_http()
-                .on_request(|request: &Request<Body>, _span: &Span| {
+                .on_request(move |request: &Request<Body>, _span: &Span| {
                     if request.uri().path() == "/settings/logs/socket" {
                         return;
                     }
@@ -1086,25 +1243,27 @@ fn build_app(state: AppState) -> Router {
                         .and_then(|value| value.to_str().ok())
                         .or_else(|| plex_query_value(request.uri(), "X-Plex-Platform"));
                     info!(
-                        "event=http_request remote_ip={} method={} path={} accept={:?} plex_product={:?} client_profile={:?} client_platform={:?} token_present={}",
-                        remote_ip,
-                        request.method(),
-                        request.uri().path(),
-                        request.headers().get(header::ACCEPT),
-                        plex_product,
-                        client_profile,
-                        client_platform,
-                        plex_request_token(request.headers(), request.uri()).is_some()
+                        tag,
+                        event = "http_request",
+                        remote_ip = %remote_ip,
+                        method = %request.method(),
+                        path = %request.uri().path(),
+                        accept = ?request.headers().get(header::ACCEPT),
+                        plex_product = ?plex_product,
+                        client_profile = ?client_profile,
+                        client_platform = ?client_platform,
+                        token_present = plex_request_token(request.headers(), request.uri()).is_some()
                     );
                 })
-                .on_response(|response: &Response, latency: Duration, _span: &Span| {
+                .on_response(move |response: &Response, latency: Duration, _span: &Span| {
                     if response.extensions().get::<SuppressHttpResponseLog>().is_some() {
                         return;
                     }
                     info!(
-                        "event=http_response status={} latency_ms={}",
-                        response.status(),
-                        latency.as_millis()
+                        tag,
+                        event = "http_response",
+                        status = %response.status(),
+                        latency_ms = latency.as_millis()
                     );
                 }),
         )
@@ -1118,7 +1277,7 @@ pub(crate) enum ListenerSurface {
 }
 
 fn build_web_listener_app(state: AppState) -> Router {
-    build_app(state).layer(middleware::from_fn(
+    build_tagged_app(state, "hb").layer(middleware::from_fn(
         |mut request: Request<Body>, next: Next| async move {
             if !is_web_surface_path(request.uri().path()) {
                 return StatusCode::NOT_FOUND.into_response();
@@ -1130,7 +1289,7 @@ fn build_web_listener_app(state: AppState) -> Router {
 }
 
 fn build_plex_listener_app(state: AppState) -> Router {
-    build_app(state).layer(middleware::from_fn(
+    build_tagged_app(state, "plex").layer(middleware::from_fn(
         |mut request: Request<Body>, next: Next| async move {
             if is_web_surface_path(request.uri().path())
                 && request.uri().path() != "/"

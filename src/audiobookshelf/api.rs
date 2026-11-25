@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{Mutex, OnceLock},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 const TOKEN_TTL_SECONDS: i64 = 60 * 60 * 24 * 14;
@@ -48,7 +48,7 @@ pub(crate) fn router(state: crate::harbinger::AppState) -> Router {
         .route("/status", get(status))
         .with_state(state.clone());
     let api = Router::new()
-        .route("/authorize", get(authorize))
+        .route("/authorize", post(authorize))
         .route("/libraries", get(libraries))
         .route("/libraries/:id", get(library))
         .route("/libraries/:id/items", get(library_items))
@@ -99,6 +99,7 @@ pub(crate) fn router(state: crate::harbinger::AppState) -> Router {
         .nest("/abs/api", discovery)
         .nest("/abs/api", api)
         .layer(middleware::from_fn(cors))
+        .layer(middleware::from_fn(log_requests))
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
@@ -123,6 +124,23 @@ async fn cors(request: Request<Body>, next: Next) -> Response {
     response.headers_mut().insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static("*"),
+    );
+    response
+}
+
+async fn log_requests(request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let started = Instant::now();
+    tracing::info!(tag = "abs", event = "http_request", method = %method, path = %path);
+    let response = next.run(request).await;
+    tracing::info!(
+        tag = "abs",
+        event = "http_response",
+        method = %method,
+        path = %path,
+        status = %response.status(),
+        latency_ms = started.elapsed().as_millis()
     );
     response
 }
