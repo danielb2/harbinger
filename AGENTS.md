@@ -35,9 +35,16 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 - Before work begins on a task refer to https://developer.plex.tv/pms and check offcial API for a solution rather than guessing or checking logs. also consolt implementations from https://github.com/debridmediamanager/rex, https://github.com/braedonsaunders/ether/, and https://github.com/edde746/plezy
 
 ## @rules/
-- Rules are flat list with snake_case names. Rules refer to each other by name, so nothing needs numbering.
-- Follow feature based rules in the rules folder and make sure those are adhered to
-- ask clarifying questions about rules you don't understand, and update them after
+Named rules in `rules/*.md` are mandatory requirements, not suggestions.
+
+- Each rule is one bullet formatted `name: requirement`. Names are stable `snake_case` identifiers, unique across the whole `rules/` folder. Rules refer to each other by name, so nothing needs numbering.
+- Before changing code, read every rule file that applies to the feature you are touching, and all relevant files when a change spans features. Not having read a rule is not an excuse for breaking it.
+- Follow every applicable rule. If a rule conflicts with the request or with `AGENTS.md`, stop and ask instead of silently bypassing it.
+- Refer to affected rules by name in plans, progress updates, and handoffs (for example `spa`, `dashboard_has_next`, `directory_structure`, `cover_precedence`). When the user names a rule, treat that name as the requirement and verify it before replying.
+- Do not take a shortcut that a rule forbids just because it is simpler, such as forcing a full-page reload when `spa` requires in-page navigation.
+- If a rule is unclear, incomplete, or missing, ask before implementing, then add or update it under a `snake_case` name.
+- If you find that a rule was violated, say so explicitly, correct the behavior, and add or strengthen a test or rule so it does not regress.
+- Add new feature rules to the matching `rules/*.md` file, not to `AGENTS.md`, and keep the rule wording concrete enough to verify.
 
 ## Commands
 

@@ -1,7 +1,16 @@
 # audiobookshelf rules
-- check_references: consult the official Audiobookshelf implementation to match API behavior
-    - https://github.com/advplyr/audiobookshelf
-- The ABS-compatible API in `src/audiobookshelf/` serves audiobook libraries and items as books, including library browsing, item detail, covers, and playback/progress. Use the reference implementation above when adding or changing ABS endpoints.
-- Book library scanning follows the ABS directory structure: https://audiobookshelf.org/docs/documentation/libraries/book-library/directory-structure. Items are `{Author}/{Series}/{Book}`, `{Author}/{Book}`, or a book folder at the library root; standalone audio files at the root are single-file books; `Disc`/`CD`/`Disk` subfolders belong to the parent book. Folder names populate title, author, series sequence, publish year, narrator, and ASIN. `src/audiobookshelf/scanner.rs` owns this grouping and parsing.
-- Book cover resolution order: a user-selected or previously extracted stored cover, then embedded cover art in the audio file, then `cover.<image ext>`, then the book/media filename with an image extension, then any image in the item directory. Store extracted and uploaded covers under `.hbgr` in media mode and under the config directory in config mode; config mode must not write to the media folder.
-- Book cards keep the shared media card but use a square cover and use read/unread wording: `Mark as read` / `Mark as unread`, with a checkmark badge when read. The card's ellipsis menu provides `Set cover image`.
+
+- abs_check_references: consult the official Audiobookshelf implementation to match API behavior (https://github.com/advplyr/audiobookshelf).
+  - Verify: cite the ABS source or documented behavior in the change notes for every ABS endpoint, scanner, or metadata behavior change.
+- abs_api: the ABS-compatible API in `src/audiobookshelf/` serves audiobook libraries and items as books, including library browsing, item detail, covers, and playback/progress. Use `abs_check_references` when adding or changing ABS endpoints.
+  - Verify: the affected routes and prefix aliases are exercised by `tests/unit/abs_endpoints.rs`.
+- directory_structure: book library scanning follows the ABS directory structure (https://audiobookshelf.org/docs/documentation/libraries/book-library/directory-structure). Items are `{Author}/{Series}/{Book}`, `{Author}/{Book}`, or a book folder at the library root; standalone audio files at the root are single-file books; `Disc`/`CD`/`Disk` subfolders belong to the parent book. Folder names populate title, author, series sequence, publish year, narrator, and ASIN. `src/audiobookshelf/scanner.rs` owns this grouping and parsing.
+  - Verify: scanner tests cover root single-file books, author-only books, `Author/Book`, `Author/Series/Book`, disc subfolders, and the documented folder-name forms for year, sequence, narrator, ASIN, and subtitles.
+- cover_precedence: resolve book covers in this order: a user-selected or previously extracted stored cover, then embedded cover art from the audio file, then `cover.<image ext>`, then the book/media filename with an image extension, then any image in the item directory. Store extracted and uploaded covers under `.hbgr` in media mode and under the config directory in config mode; config mode must not write to the media folder.
+  - Verify: tests prove each fallback in order, embedded-cover extraction from a real tagged audio file, and that config-mode uploads leave the media folder unchanged.
+- book_card_layout: book cards keep the shared media card but use a square cover.
+  - Verify: rendered book cards carry `media-card-book`, and only that card class is styled with `aspect-ratio: 1/1`.
+- book_read_state: book actions use read/unread wording (`Mark as read` / `Mark as unread`) and a read book shows a checkmark badge, matching the TV watched-state presentation.
+  - Verify: book card menus render the read/unread labels, and a read book renders a `✓` badge with the accessible label `Read`.
+- book_cover_upload: the book card's ellipsis menu provides `Set cover image`, and uploaded covers follow `cover_precedence` storage rules.
+  - Verify: the menu renders `Set cover image`; uploads persist to the selected metadata location and are served immediately through the book cover route.
