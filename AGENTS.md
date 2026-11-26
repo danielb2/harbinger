@@ -8,12 +8,7 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 
 - Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
-- Read `FEATURES.md` before changing a user-facing feature covered there. Treat its user goals and acceptance conditions as requirements; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a feature contract, preserve the contract and find another implementation. Record regressions as regressions.
-
-- With `metadata_storage = "media"`, media-folder sidecars are the portable metadata store, not a disposable cache. Their purpose is to let the operator copy a media directory from one host to another and keep the same match, posters, covers, and per-episode skip markers without refetching artwork or repeating expensive analysis such as intro/credit detection. Skip markers are metadata per episode and must round-trip through the sidecar in this mode. SQLite may be a local index or cache, but it must not be the only durable home for sidecar-owned metadata.
-- `metadata_storage = "config"` is an explicit opt-out for operators who require a read-only media directory or do not want media folders littered with files. In config mode Harbinger must not create, modify, or delete any file in a media folder, including `.hbgr` sidecars, skip markers, artwork, and metadata; sidecar-format files belong under the config directory only. Existing media-folder sidecars may be read as a fallback, but must never be written in config mode. Never describe marker persistence as complete when it only survives in a host-local database unless config mode was deliberately chosen.
-
-- Treat the configured Plex server name as a user-visible identity requirement. Preserve it in the Auth App device context, server registration, resource publication, Plex descriptors, and LAN discovery. Keep Harbinger's stable client/product identifier separate from that display name; never replace the configured name with the product identifier as an incidental protocol fix. Before changing this identity mapping, compare the last working commit and current Plex traces, state the expected visible name, and keep a regression check for every affected surface.
+- Read the named rules for a user-facing feature before changing it. Treat their requirements and `Verify:` checks as contracts; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a rule, preserve the rule and find another implementation. Record regressions as regressions.
 
 - Read relevant code and current Plex request traces before changing behavior.
 - Match log sources to the client the user is currently using. If a needed trace requires the user to reproduce an action or switch clients, state the exact action and why before asking; never assume a stale client log represents the current behavior.
@@ -37,14 +32,15 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 ## @rules/
 Named rules in `rules/*.md` are mandatory requirements, not suggestions.
 
-- Each rule is one bullet formatted `name: requirement`. Names are stable `snake_case` identifiers, unique across the whole `rules/` folder. Rules refer to each other by name, so nothing needs numbering.
+- Each rule is one bullet formatted `name: requirement`. Rules added or changed from now on must also include an indented `Verify:` line describing the observable evidence that proves them; migrate older rules when touching them. Names are stable `snake_case` identifiers, unique across the whole `rules/` folder.
+- Refer to a rule by its bare name inside its own file, and canonically from anywhere else as `@rules.<file>.<name>` using the file stem without `.md`. For example: `@rules.plex.skip_playback_modes`, `@rules.harbinger.spa`, `@rules.audiobookshelf.cover_precedence`.
 - Before changing code, read every rule file that applies to the feature you are touching, and all relevant files when a change spans features. Not having read a rule is not an excuse for breaking it.
 - Follow every applicable rule. If a rule conflicts with the request or with `AGENTS.md`, stop and ask instead of silently bypassing it.
-- Refer to affected rules by name in plans, progress updates, and handoffs (for example `spa`, `dashboard_has_next`, `directory_structure`, `cover_precedence`). When the user names a rule, treat that name as the requirement and verify it before replying.
-- Do not take a shortcut that a rule forbids just because it is simpler, such as forcing a full-page reload when `spa` requires in-page navigation.
+- Refer to affected rules in plans, progress updates, and handoffs using the canonical form, for example `@rules.harbinger.spa`, `@rules.harbinger.dashboard_has_next`, `@rules.audiobookshelf.directory_structure`, `@rules.audiobookshelf.cover_precedence`. When the user names a rule, treat that name as the requirement and verify it before replying.
+- Do not take a shortcut that a rule forbids just because it is simpler, such as forcing a full-page reload when `@rules.harbinger.spa` requires in-page navigation.
 - If a rule is unclear, incomplete, or missing, ask before implementing, then add or update it under a `snake_case` name.
 - If you find that a rule was violated, say so explicitly, correct the behavior, and add or strengthen a test or rule so it does not regress.
-- Add new feature rules to the matching `rules/*.md` file, not to `AGENTS.md`, and keep the rule wording concrete enough to verify.
+- Add new feature rules to the matching domain file in `rules/` under a `## section` heading, not to `AGENTS.md`. For example, skipping rules belong under `## skipping` in `rules/plex.md`. Do not create a standalone rule file for a single cross-cutting topic. Keep rule wording concrete enough to verify.
 
 ## Commands
 

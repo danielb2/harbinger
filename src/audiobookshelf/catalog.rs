@@ -74,6 +74,7 @@ pub(crate) struct Item {
     pub(crate) added_ms: i64,
     pub(crate) updated_ms: i64,
     pub(crate) metadata: BookMetadata,
+    pub(crate) metadata_present: bool,
 }
 
 impl Item {
@@ -346,11 +347,12 @@ fn build_item(
         .collect::<Option<Vec<_>>>()?;
     sort_audio_files(&mut audio_files);
 
-    let mut metadata = if book.is_file {
-        BookMetadata::default()
-    } else {
-        read_book_metadata(&book.path.join("metadata.json"))
-    };
+    let metadata_path = stored_metadata_path(&book, &id, source_index, cover_settings);
+    let metadata_present = metadata_path.is_some();
+    let mut metadata = metadata_path
+        .as_deref()
+        .map(read_book_metadata)
+        .unwrap_or_default();
     let fallback_title = if book.is_file {
         scanner::file_stem(&book.path)
     } else {
@@ -427,6 +429,7 @@ fn build_item(
         added_ms,
         updated_ms,
         metadata,
+        metadata_present,
     })
 }
 
@@ -436,11 +439,11 @@ fn resolve_cover(
     source_index: usize,
     settings: &CoverSettings,
 ) -> Option<PathBuf> {
-    let store = cover_store_dir(settings, source_index, item_id, &book.path, book.is_file);
+    let store = sidecar_dir(settings, source_index, item_id, &book.path, book.is_file);
     if let Some(cover) = scanner::stored_cover(&store) {
         return Some(cover);
     }
-    let fallback_store = cover_store_dir(
+    let fallback_store = sidecar_dir(
         &CoverSettings {
             config_mode: !settings.config_mode,
             config_dir: settings.config_dir.clone(),
@@ -492,7 +495,41 @@ fn resolve_cover(
     scanner::first_image(directory)
 }
 
-fn cover_store_dir(
+fn stored_metadata_path(
+    book: &BookFiles,
+    item_id: &str,
+    source_index: usize,
+    settings: &CoverSettings,
+) -> Option<PathBuf> {
+    let primary = sidecar_dir(settings, source_index, item_id, &book.path, book.is_file)
+        .join("metadata.json");
+    if primary.is_file() {
+        return Some(primary);
+    }
+    let fallback = sidecar_dir(
+        &CoverSettings {
+            config_mode: !settings.config_mode,
+            config_dir: settings.config_dir.clone(),
+        },
+        source_index,
+        item_id,
+        &book.path,
+        book.is_file,
+    )
+    .join("metadata.json");
+    if fallback.is_file() {
+        return Some(fallback);
+    }
+    if !book.is_file {
+        let legacy = book.path.join("metadata.json");
+        if legacy.is_file() {
+            return Some(legacy);
+        }
+    }
+    None
+}
+
+fn sidecar_dir(
     settings: &CoverSettings,
     source_index: usize,
     item_id: &str,
@@ -515,12 +552,12 @@ fn cover_store_dir(
     }
 }
 
-pub(crate) fn item_cover_store_dir(state: &AppState, source_index: usize, item: &Item) -> PathBuf {
+pub(crate) fn item_sidecar_dir(state: &AppState, source_index: usize, item: &Item) -> PathBuf {
     let config_mode = state
         .config
         .lock()
         .is_ok_and(|config| config.metadata_storage == "config");
-    cover_store_dir(
+    sidecar_dir(
         &CoverSettings {
             config_mode,
             config_dir: state
@@ -868,6 +905,66 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn hbgr_metadata_is_preferred_over_legacy_item_metadata() {
+        let root = catalog_temp_dir("hbgr-metadata");
+        let book_dir = root.join("Author").join("Book");
+        fs::create_dir_all(book_dir.join(".hbgr")).unwrap();
+        fs::write(book_dir.join("Chapter 01.mp3"), b"not real audio").unwrap();
+        fs::write(
+            book_dir.join("metadata.json"),
+            r#"{"title":"Legacy Title"}"#,
+        )
+        .unwrap();
+        fs::write(
+            book_dir.join(".hbgr/metadata.json"),
+            r#"{"title":"Sidecar Title"}"#,
+        )
+        .unwrap();
+
+        let books = scanner::scan_library(&root);
+        let path = stored_metadata_path(&books[0], "li_metadata", 0, &cover_settings(&root))
+            .expect("stored metadata is found");
+        assert_eq!(path, book_dir.join(".hbgr/metadata.json"));
+        assert_eq!(
+            read_book_metadata(&path).title.as_deref(),
+            Some("Sidecar Title")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn config_metadata_lives_under_the_config_hbgr_directory() {
+        let root = catalog_temp_dir("config-metadata");
+        let book_dir = root.join("Author").join("Book");
+        let sidecar = root
+            .join("config")
+            .join(".hbgr")
+            .join("1-li_config_metadata");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::create_dir_all(&sidecar).unwrap();
+        fs::write(book_dir.join("Chapter 01.mp3"), b"not real audio").unwrap();
+        fs::write(
+            sidecar.join("metadata.json"),
+            r#"{"title":"Config Sidecar"}"#,
+        )
+        .unwrap();
+
+        let books = scanner::scan_library(&root);
+        let settings = CoverSettings {
+            config_mode: true,
+            config_dir: root.join("config"),
+        };
+        let path = stored_metadata_path(&books[0], "li_config_metadata", 0, &settings)
+            .expect("config metadata is found");
+        assert_eq!(path, sidecar.join("metadata.json"));
+        assert_eq!(
+            read_book_metadata(&path).title.as_deref(),
+            Some("Config Sidecar")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

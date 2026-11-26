@@ -1633,7 +1633,16 @@ pub(crate) async fn scan_library_inventory(
     if is_audiobook_library(&library.kind) {
         let count = crate::audiobookshelf::catalog::count_audio_files(&library);
         crate::audiobookshelf::catalog::invalidate_cache();
-        info!(library = %library.name, count, "audiobook file scan completed");
+        let matched = if match_unmatched {
+            crate::audiobookshelf::matching::match_library(state, library_id, &library, manual)
+                .await
+        } else {
+            0
+        };
+        if matched > 0 {
+            crate::audiobookshelf::catalog::invalidate_cache();
+        }
+        info!(library = %library.name, count, matched, "audiobook file scan completed");
         return Ok(count);
     }
     let mut roots = Vec::with_capacity(library.folders.len());
@@ -1900,7 +1909,15 @@ async fn library_scan_scheduler(state: AppState) {
                 continue;
             }
             *last_scan = now;
-            if let Err(error) = scan_library_inventory(&state, index, false, false, false).await {
+            if let Err(error) = scan_library_inventory(
+                &state,
+                index,
+                is_audiobook_library(&library.kind),
+                false,
+                false,
+            )
+            .await
+            {
                 warn!(library = %library.name, %error, "automatic library scan failed");
             }
         }
@@ -8298,7 +8315,7 @@ pub(crate) fn media_card_with_options(
         ("Mark as watched", "Mark as unwatched")
     };
     let set_cover_action = if book_card {
-        r#"<button type="button" data-set-cover>Set cover image</button>"#
+        r#"<button type="button" data-set-cover>Set cover image</button><button type="button" data-book-match>Match audiobook</button>"#
     } else {
         ""
     };

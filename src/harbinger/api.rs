@@ -96,6 +96,8 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/web/info", get(web_info))
         .route("/web/tv-match/search", get(tv_match_search))
         .route("/web/tv-match/select", post(tv_match_select))
+        .route("/web/book-match/search", get(book_match_search))
+        .route("/web/book-match/select", post(book_match_select))
         .route(
             "/settings",
             get(settings_page).post(save_translation_settings),
@@ -1051,7 +1053,7 @@ pub(crate) async fn set_audiobook_cover(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let store = crate::audiobookshelf::catalog::item_cover_store_dir(&state, library_index, item);
+    let store = crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, item);
     if crate::audiobookshelf::catalog::write_cover_file(&store, &body, extension).is_none() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
@@ -2246,6 +2248,199 @@ pub(crate) async fn update_server_name(
         *current_name = name.to_owned();
     }
     Redirect::to("/settings?server_name_saved=true").into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BookMatchQuery {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: Option<String>,
+    pub(crate) query: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) provider: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct BookMatchSelection {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: String,
+    pub(crate) provider: Option<String>,
+    pub(crate) id: Option<String>,
+}
+
+async fn audiobook_item_for_match(
+    state: &AppState,
+    library_index: usize,
+    folder: Option<usize>,
+    relative: &std::path::Path,
+) -> Option<crate::audiobookshelf::catalog::Item> {
+    let root = selected_library_folder_root(state, Some(library_index), folder);
+    let requested = web_path(state, &root, relative).await.ok()?;
+    let requested = std::fs::canonicalize(&requested).unwrap_or(requested);
+    crate::audiobookshelf::catalog::Catalog::load(state)
+        .libraries
+        .iter()
+        .find(|library| library.source_index == library_index)?
+        .items
+        .iter()
+        .find(|item| {
+            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone()) == requested
+        })
+        .cloned()
+}
+
+pub(crate) async fn book_match_search(
+    State(state): State<AppState>,
+    Query(query): Query<BookMatchQuery>,
+) -> Response {
+    let Some(library_index) = query.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(item) = audiobook_item_for_match(&state, library_index, query.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let title = query
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or(item.title.as_str())
+        .to_owned();
+    let stored_author = item.metadata.authors.join(", ");
+    let mut author = query
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|author| !author.is_empty() && !author.eq_ignore_ascii_case("unknown"))
+        .map(str::to_owned)
+        .unwrap_or_else(|| stored_author.clone());
+    if title != item.title
+        && !stored_author.is_empty()
+        && (author == stored_author || author.eq_ignore_ascii_case("unknown"))
+    {
+        author.clear();
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!("harbinger/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let provider = query
+        .provider
+        .as_deref()
+        .and_then(crate::audiobookshelf::providers::Provider::from_key)
+        .unwrap_or(crate::audiobookshelf::providers::Provider::Audible);
+    let results =
+        crate::audiobookshelf::providers::search(provider, &client, &title, &author).await;
+    info!(
+        provider = provider.key(),
+        title = %title,
+        author = %author,
+        result_count = results.len(),
+        "Book match search finished"
+    );
+    Json(serde_json::json!({ "results": results })).into_response()
+}
+
+pub(crate) async fn book_match_select(
+    State(state): State<AppState>,
+    Json(selection): Json<BookMatchSelection>,
+) -> Response {
+    let Some(library_index) = selection.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = clean_relative_path(&selection.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let provider = selection
+        .provider
+        .as_deref()
+        .and_then(crate::audiobookshelf::providers::Provider::from_key)
+        .unwrap_or(crate::audiobookshelf::providers::Provider::Audible);
+    let Some(provider_id) = selection
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "A provider result id is required." })),
+        )
+            .into_response();
+    };
+    if provider == crate::audiobookshelf::providers::Provider::Audible
+        && (provider_id.len() != 10
+            || !provider_id
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "A valid Audible ASIN is required." })),
+        )
+            .into_response();
+    }
+    let Some(item) =
+        audiobook_item_for_match(&state, library_index, selection.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!("harbinger/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let Some(book) = crate::audiobookshelf::providers::lookup(provider, &client, provider_id).await
+    else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "The provider could not load that book." })),
+        )
+            .into_response();
+    };
+    if !crate::audiobookshelf::matching::persist_match(
+        &client,
+        &state,
+        library_index,
+        &item,
+        &book,
+        true,
+    )
+    .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "Could not save the matched metadata." })),
+        )
+            .into_response();
+    }
+    crate::audiobookshelf::catalog::invalidate_cache();
+    info!(
+        library = library_index,
+        title = %book.title,
+        provider = provider.key(),
+        provider_id = %book.provider_id,
+        "Audiobook match selected"
+    );
+    Json(serde_json::json!({
+        "success": true,
+        "title": book.title,
+        "provider": provider.key(),
+        "id": book.provider_id
+    }))
+    .into_response()
 }
 
 pub(crate) async fn tv_match_search(
@@ -4690,6 +4885,7 @@ pub(crate) async fn web_client(
     .audiobook-audio {{ display: none; }}
     .audiobook-info {{ margin-top: 1.25rem; padding: 1.25rem 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: #1f2937; }}
     .audiobook-info h3 {{ margin: 0 0 .5rem; }}
+    .audiobook-match {{ margin-top: 1rem; }}
     .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }}
     .audiobook-facts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem 1rem; margin: 1rem 0 0; padding-top: .85rem; border-top: 1px solid rgba(148,163,184,.18); }}
     .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
@@ -7119,6 +7315,7 @@ pub(crate) fn fix_match_dialog_markup() -> &'static str {
 .fix-match-close { position: absolute; top: .65rem; right: .65rem; min-width: 2.4rem; padding: .3rem .55rem; }
 .fix-match-search-row { display: flex; flex-wrap: wrap; gap: .5rem; margin: .9rem 0; }
 .fix-match-search-row input { flex: 1 1 16rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }
+.fix-match-provider { padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }
 .fix-match-results { display: grid; gap: .65rem; }
 .fix-match-result { display: flex; align-items: flex-start; gap: .9rem; padding: .75rem; border: 1px solid #374151; border-radius: .5rem; background: #1f2937; }
 .fix-match-cover { flex: 0 0 76px; width: 76px; height: 114px; object-fit: cover; border-radius: .3rem; background: #111827; }
@@ -7127,7 +7324,7 @@ pub(crate) fn fix_match_dialog_markup() -> &'static str {
 .fix-match-result p { margin: .35rem 0 .65rem; color: #cbd5e1; font-size: .85rem; line-height: 1.45; }
 .fix-match-status { min-height: 1.5rem; color: #cbd5e1; }
 @media (max-width: 420px) { .fix-match-cover { flex-basis: 60px; width: 60px; height: 90px; } .fix-match-result { gap: .6rem; } }
-</style><dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>"#
+</style><dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><select id="tv-fix-match-provider" class="fix-match-provider" aria-label="Metadata provider" hidden><option value="audible">Audible</option><option value="itunes">iTunes</option><option value="google">Google Books</option><option value="openlibrary">OpenLibrary</option><option value="fantlab">FantLab</option></select><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><input id="tv-fix-match-author" type="search" aria-label="Author (optional)" placeholder="Author (optional)" autocomplete="off" hidden><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>"#
 }
 
 pub(crate) fn media_card_action_script() -> &'static str {
@@ -7151,7 +7348,9 @@ bindCardAction(document, "error", event => {
   image.replaceWith(placeholder);
 }, true);
 const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
+const fixMatchProvider = document.querySelector("#tv-fix-match-provider");
 const fixMatchQuery = document.querySelector("#tv-fix-match-query");
+const fixMatchAuthor = document.querySelector("#tv-fix-match-author");
 const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
 const fixMatchStatus = document.querySelector("#tv-fix-match-status");
 const fixMatchResults = document.querySelector("#tv-fix-match-results");
@@ -7180,25 +7379,30 @@ const searchTvMatches = async () => {
   if (matchSearchPending) return;
   fixMatchResults.replaceChildren();
   const query = fixMatchQuery.value.trim();
+  const isBook = fixMatchDialog.dataset.kind === "book";
   if (!query) {
-    fixMatchStatus.textContent = "Enter a show title to search.";
+    fixMatchStatus.textContent = isBook ? "Enter a book title to search." : "Enter a show title to search.";
     return;
   }
   matchSearchPending = true;
-  fixMatchStatus.textContent = "Searching TMDB…";
+  fixMatchStatus.textContent = isBook ? "Searching Audible…" : "Searching TMDB…";
   fixMatchSearchButton.disabled = true;
   try {
     const params = new URLSearchParams({
       library: fixMatchDialog.dataset.library,
+      folder: fixMatchDialog.dataset.folder || "0",
       path: fixMatchDialog.dataset.path,
       query
     });
-    const response = await fetch(`/web/tv-match/search?${params}`, { cache: "no-store" });
+    if (isBook && fixMatchProvider) params.set("provider", fixMatchProvider.value);
+    if (isBook && fixMatchAuthor?.value.trim()) params.set("author", fixMatchAuthor.value.trim());
+    const endpoint = isBook ? "/web/book-match/search" : "/web/tv-match/search";
+    const response = await fetch(`${endpoint}?${params}`, { cache: "no-store" });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 404) {
       throw new Error("The match search endpoint is unavailable (404).");
     }
-    if (!response.ok) throw new Error(payload.error || `TMDB search failed (HTTP ${response.status}).`);
+    if (!response.ok) throw new Error(payload.error || `Match search failed (HTTP ${response.status}).`);
     if (!payload.results.length) {
       fixMatchStatus.textContent = "No matches found. Try another search.";
       return;
@@ -7211,19 +7415,33 @@ const searchTvMatches = async () => {
       cover.className = "fix-match-cover";
       cover.alt = "";
       cover.loading = "lazy";
-      if (result.poster_path) cover.src = `https://image.tmdb.org/t/p/w185${result.poster_path}`;
       const content = document.createElement("div");
       content.className = "fix-match-result-content";
       const heading = document.createElement("h3");
-      const year = result.first_air_date ? ` (${result.first_air_date.slice(0, 4)})` : "";
-      heading.textContent = `${result.title}${year}`;
-      const overview = document.createElement("p");
-      overview.textContent = result.overview || "No summary available.";
       const select = document.createElement("button");
       select.type = "button";
-      select.dataset.matchId = String(result.id);
       select.textContent = "Use this match";
-      content.append(heading, overview, select);
+      if (isBook) {
+        if (result.cover_url) cover.src = result.cover_url;
+        const year = result.published_year ? ` (${result.published_year})` : "";
+        heading.textContent = `${result.title}${year}`;
+        const overview = document.createElement("p");
+        const details = [];
+        if (result.authors?.length) details.push(result.authors.join(", "));
+        if (result.narrators?.length) details.push(`Narrated by ${result.narrators.join(", ")}`);
+        if (result.duration_minutes) details.push(`${Math.round(result.duration_minutes / 60)}h ${result.duration_minutes % 60}m`);
+        overview.textContent = details.join(" · ") || "No details available.";
+        select.dataset.matchBookId = result.provider_id;
+        content.append(heading, overview, select);
+      } else {
+        if (result.poster_path) cover.src = `https://image.tmdb.org/t/p/w185${result.poster_path}`;
+        const year = result.first_air_date ? ` (${result.first_air_date.slice(0, 4)})` : "";
+        heading.textContent = `${result.title}${year}`;
+        const overview = document.createElement("p");
+        overview.textContent = result.overview || "No summary available.";
+        select.dataset.matchId = String(result.id);
+        content.append(heading, overview, select);
+      }
       item.append(cover, content);
       fixMatchResults.append(item);
     });
@@ -7232,7 +7450,7 @@ const searchTvMatches = async () => {
       window.__mplexShowConnectionLost("Lost connection to Harbinger.");
       fixMatchStatus.textContent = "";
     } else {
-      fixMatchStatus.textContent = error.message || "TMDB search failed.";
+      fixMatchStatus.textContent = error.message || "Match search failed.";
     }
   } finally {
     matchSearchPending = false;
@@ -7240,6 +7458,14 @@ const searchTvMatches = async () => {
   }
 };
 bindCardAction(fixMatchSearchButton, "click", searchTvMatches);
+bindCardAction(fixMatchQuery, "input", () => {
+  if (!fixMatchAuthor || fixMatchDialog.dataset.kind !== "book") return;
+  const defaultAuthor = (fixMatchDialog.dataset.defaultAuthor || "").trim();
+  const defaultTitle = (fixMatchDialog.dataset.defaultTitle || "").trim();
+  if (fixMatchAuthor.value.trim() === defaultAuthor && fixMatchQuery.value.trim() !== defaultTitle) {
+    fixMatchAuthor.value = "";
+  }
+});
 bindCardAction(fixMatchQuery, "keydown", event => {
   if (event.key === "Enter") {
     event.preventDefault();
@@ -7247,19 +7473,30 @@ bindCardAction(fixMatchQuery, "keydown", event => {
   }
 });
 bindCardAction(fixMatchResults, "click", async event => {
-  const select = event.target.closest("[data-match-id]");
+  const isBook = fixMatchDialog.dataset.kind === "book";
+  const select = event.target.closest(isBook ? "[data-match-book-id]" : "[data-match-id]");
   if (!select || select.disabled) return;
   select.disabled = true;
   fixMatchStatus.textContent = "Saving match and artwork…";
   try {
-    const response = await fetch("/web/tv-match/select", {
+    const endpoint = isBook ? "/web/book-match/select" : "/web/tv-match/select";
+    const body = isBook
+      ? {
+          library: Number(fixMatchDialog.dataset.library),
+          folder: Number(fixMatchDialog.dataset.folder || 0),
+          path: fixMatchDialog.dataset.path,
+          provider: fixMatchProvider?.value || "audible",
+          id: select.dataset.matchBookId
+        }
+      : {
+          library: Number(fixMatchDialog.dataset.library),
+          path: fixMatchDialog.dataset.path,
+          tmdb_id: Number(select.dataset.matchId)
+        };
+    const response = await fetch(endpoint, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        library: Number(fixMatchDialog.dataset.library),
-        path: fixMatchDialog.dataset.path,
-        tmdb_id: Number(select.dataset.matchId)
-      })
+      body: JSON.stringify(body)
     });
     const payload = await response.json().catch(() => ({}));
     if (response.status === 404) {
@@ -7267,7 +7504,8 @@ bindCardAction(fixMatchResults, "click", async event => {
     }
     if (!response.ok) throw new Error(payload.error || "Could not save this match.");
     fixMatchDialog.close();
-    window.location.reload();
+    if (window.__mplexRefresh) window.__mplexRefresh();
+    else window.location.reload();
   } catch (error) {
     select.disabled = false;
     if (error instanceof TypeError) {
@@ -7293,6 +7531,7 @@ bindCardAction(document, "click", async event => {
   }
   const button = event.target.closest("[data-watch-action]");
   const setCoverButton = event.target.closest("[data-set-cover]");
+  const bookMatchButton = event.target.closest("[data-book-match]");
   const fixMatchButton = event.target.closest("[data-fix-match]");
   const refreshMetadataButton = event.target.closest("[data-refresh-metadata]");
   if (setCoverButton) {
@@ -7311,7 +7550,8 @@ bindCardAction(document, "click", async event => {
           { method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: await file.arrayBuffer() }
         );
         if (!response.ok) throw new Error("Could not save cover image.");
-        window.location.reload();
+        if (window.__mplexRefresh) window.__mplexRefresh();
+        else window.location.reload();
       } catch (error) {
         if (!status) {
           status = document.createElement("span");
@@ -7339,7 +7579,8 @@ bindCardAction(document, "click", async event => {
       const resultUrl = new URL(response.url);
       const error = resultUrl.searchParams.get("error");
       if (!response.ok || error) throw new Error(error || "Could not refresh metadata.");
-      window.location.reload();
+      if (window.__mplexRefresh) window.__mplexRefresh();
+      else window.location.reload();
     } catch (error) {
       refreshMetadataButton.disabled = false;
       refreshMetadataButton.textContent = originalLabel;
@@ -7356,7 +7597,7 @@ bindCardAction(document, "click", async event => {
     return;
   }
 
-  if (fixMatchButton) {
+  if (bookMatchButton || fixMatchButton) {
     event.preventDefault();
     const fixMatchHeading = document.querySelector("#tv-fix-match-heading");
     const fixMatchDescription = document.querySelector("#tv-fix-match-show");
@@ -7364,14 +7605,35 @@ bindCardAction(document, "click", async event => {
       return;
     }
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
-    const card = fixMatchButton.closest(".media-card");
-    const title = card?.querySelector(".media-card-title")?.textContent.trim() || "Media item";
-    fixMatchHeading.textContent = "Fix Match";
-    fixMatchQuery.setAttribute("aria-label", "Search movies and TV shows");
-    fixMatchDialog.dataset.library = fixMatchButton.dataset.library;
-    fixMatchDialog.dataset.path = fixMatchButton.dataset.path;
-    fixMatchDescription.textContent = `Search for the correct match for ${title}.`;
+    const trigger = bookMatchButton || fixMatchButton;
+    const card = trigger.closest(".media-card");
+    const detail = trigger.closest(".audiobook-detail");
+    const scope = card || detail;
+    const title = card?.querySelector(".media-card-title")?.textContent.trim()
+      || document.querySelector("main h1")?.textContent.trim()
+      || "Media item";
+    const isBook = Boolean(bookMatchButton);
+    fixMatchDialog.dataset.kind = isBook ? "book" : "tv";
+    if (fixMatchProvider) {
+      fixMatchProvider.hidden = !isBook;
+      fixMatchProvider.value = "audible";
+    }
+    if (fixMatchAuthor) {
+      fixMatchAuthor.hidden = !isBook;
+      const cardAuthor = card?.querySelector(".media-card-subtitle")?.textContent.trim() || "";
+      fixMatchAuthor.value = isBook && cardAuthor.toLowerCase() !== "unknown" ? cardAuthor : "";
+    }
+    fixMatchHeading.textContent = isBook ? "Match Audiobook" : "Fix Match";
+    fixMatchQuery.setAttribute("aria-label", isBook ? "Search Audible audiobooks" : "Search movies and TV shows");
+    fixMatchDialog.dataset.library = scope?.dataset.library || "";
+    fixMatchDialog.dataset.folder = scope?.dataset.folder || "0";
+    fixMatchDialog.dataset.path = card?.dataset.mediaPath || detail?.dataset.path || "";
+    fixMatchDescription.textContent = isBook
+      ? `Search Audible for ${title}.`
+      : `Search for the correct match for ${title}.`;
     fixMatchQuery.value = title;
+    fixMatchDialog.dataset.defaultTitle = title;
+    fixMatchDialog.dataset.defaultAuthor = fixMatchAuthor?.value.trim() || "";
     fixMatchStatus.textContent = "";
     fixMatchResults.replaceChildren();
     fixMatchDialog.showModal();
@@ -7503,6 +7765,7 @@ async function navigateMplex(url, addHistory) {
   });
   window.scrollTo(0, 0);
 }
+window.__mplexRefresh = () => navigateMplex(location.pathname + location.search + location.hash, false);
 document.addEventListener("click", event => {
   const link = event.target.closest("a[data-spa-link]");
   if (!link || event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
@@ -7972,6 +8235,7 @@ fn audiobook_detail(
     <h3>About this book</h3>
     <div class="audiobook-description">{description}</div>
     <dl class="audiobook-facts">{fact_markup}</dl>
+    <button type="button" class="button-secondary audiobook-match" data-book-match>Match audiobook</button>
   </section>
 </article>"#,
         library = library,

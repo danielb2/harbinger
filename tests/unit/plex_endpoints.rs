@@ -2556,6 +2556,13 @@ async fn web_library_root_shows_audiobook_cards() {
     assert!(body.contains("Mark as unread"));
     assert!(body.contains("data-set-cover"));
     assert!(body.contains("Set cover image"));
+    assert!(body.contains("Match audiobook"));
+    assert!(body.contains("data-book-match"));
+    assert!(body.contains("tv-fix-match-provider"));
+    assert!(body.contains("option value=\"itunes\""));
+    assert!(body.contains("option value=\"google\""));
+    assert!(body.contains("option value=\"openlibrary\""));
+    assert!(body.contains("option value=\"fantlab\""));
     assert!(body.contains(".media-card-book .media-card-cover,.media-card-book .media-card-cover img{aspect-ratio:1/1}"));
     assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
@@ -2969,6 +2976,33 @@ async fn web_audiobook_cover_upload_replaces_the_card_cover() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn web_book_match_rejects_invalid_asin() {
+    let fixture = audiobook_web_fixture("audiobooks-web-book-match");
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/book-match/select")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "library": 0,
+                        "path": "Author One/Book One",
+                        "provider": "audible",
+                        "id": "not-an-asin"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
