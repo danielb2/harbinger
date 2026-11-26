@@ -2543,11 +2543,20 @@ async fn web_library_root_shows_audiobook_cards() {
     assert!(
         body.contains("/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover")
     );
-    assert!(body.contains("<div class=\"media-card\""));
+    assert!(body.contains("<div class=\"media-card media-card-book\""));
     assert!(body.contains("</details></div><a class=\"media-card-info\""));
-    assert_eq!(body.matches("<div class=\"media-card\"").count(), 1);
+    assert_eq!(
+        body.matches("<div class=\"media-card media-card-book\"")
+            .count(),
+        1
+    );
     assert!(body.contains("data-watch-action=\"watched\""));
     assert!(body.contains("data-watch-action=\"unwatched\""));
+    assert!(body.contains("Mark as read"));
+    assert!(body.contains("Mark as unread"));
+    assert!(body.contains("data-set-cover"));
+    assert!(body.contains("Set cover image"));
+    assert!(body.contains(".media-card-book .media-card-cover,.media-card-book .media-card-cover img{aspect-ratio:1/1}"));
     assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
 }
@@ -2597,6 +2606,8 @@ async fn web_watch_action_marks_audiobook_with_catalog_item_key() {
     let home = body_string(home).await;
     assert!(home.contains(&format!("data-watch-key=\"{}\"", item.id)));
     assert!(home.contains("aria-valuenow=\"100\""));
+    assert!(home.contains("class=\"media-card-unwatched\" aria-label=\"Read\""));
+    assert!(home.contains(">✓</span>"));
 }
 
 #[tokio::test]
@@ -2899,6 +2910,101 @@ async fn web_artwork_serves_local_audiobook_cover() {
     assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&bytes[..], b"cover-bytes");
+}
+
+#[tokio::test]
+async fn web_audiobook_cover_upload_replaces_the_card_cover() {
+    let fixture = audiobook_web_fixture("audiobooks-web-cover-upload");
+    let upload = b"\xFF\xD8\xFF\xE0uploaded-cover".to_vec();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/audiobook-cover?library=0&folder=0&path=Author%20One%2FBook%20One")
+                .header(header::CONTENT_TYPE, "image/jpeg")
+                .body(Body::from(upload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let book_dir = fixture
+        .root
+        .join("audiobooks-web-cover-upload")
+        .join("Author One")
+        .join("Book One");
+    assert_eq!(
+        std::fs::read(book_dir.join(".hbgr/cover.jpg")).unwrap(),
+        upload
+    );
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CONTENT_TYPE], "image/jpeg");
+    assert_eq!(
+        &to_bytes(response.into_body(), usize::MAX).await.unwrap()[..],
+        upload
+    );
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/audiobook-cover?library=0&folder=0&path=Author%20One%2FBook%20One")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(Body::from("not an image"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn web_audiobook_cover_upload_respects_config_storage_mode() {
+    let fixture = audiobook_web_fixture("audiobooks-web-cover-config");
+    fixture.config.lock().unwrap().metadata_storage = "config".to_owned();
+    let upload = b"\x89PNG\r\n\x1a\nuploaded-cover".to_vec();
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/audiobook-cover?library=0&folder=0&path=Author%20One%2FBook%20One")
+                .header(header::CONTENT_TYPE, "image/png")
+                .body(Body::from(upload.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let book_dir = fixture
+        .root
+        .join("audiobooks-web-cover-config")
+        .join("Author One")
+        .join("Book One");
+    assert!(!book_dir.join(".hbgr").exists());
+    let config_covers = std::fs::read_dir(fixture.root.join("config/.hbgr"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path().join("cover.png"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(config_covers.len(), 1);
+    assert_eq!(std::fs::read(&config_covers[0]).unwrap(), upload);
 }
 
 #[test]

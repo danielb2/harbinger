@@ -74,6 +74,10 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/web/progress", get(web_progress).post(update_web_progress))
         .route("/web/translation-stop", post(stop_web_translation))
         .route("/web/watch-action", post(web_watch_action))
+        .route(
+            "/web/audiobook-cover",
+            post(set_audiobook_cover).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
+        )
         .route("/web/audio-selection", post(update_web_audio_selection))
         .route(
             "/web/subtitle-selection",
@@ -1002,6 +1006,60 @@ pub(crate) async fn web_watch_action(
         library = ?update.library,
         media_keys = ?media_keys,
         "Web watch action saved"
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub(crate) async fn set_audiobook_cover(
+    State(state): State<AppState>,
+    Query(query): Query<WebPath>,
+    body: axum::body::Bytes,
+) -> Response {
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if contains_hidden_component(&relative) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(library_index) = query.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if body.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let Some(extension) = crate::audiobookshelf::scanner::image_extension(&body) else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    let root = selected_library_folder_root(&state, query.library, query.folder);
+    let requested_path = match web_path(&state, &root, &relative).await {
+        Ok(path) => path,
+        Err(status) => return status.into_response(),
+    };
+    let requested_canonical =
+        std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
+    let catalog = crate::audiobookshelf::catalog::Catalog::load(&state);
+    let Some(item) = catalog
+        .libraries
+        .iter()
+        .find(|library| library.source_index == library_index)
+        .and_then(|library| {
+            library.items.iter().find(|item| {
+                std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+                    == requested_canonical
+            })
+        })
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let store = crate::audiobookshelf::catalog::item_cover_store_dir(&state, library_index, item);
+    if crate::audiobookshelf::catalog::write_cover_file(&store, &body, extension).is_none() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    crate::audiobookshelf::catalog::invalidate_cache();
+    info!(
+        path = %relative.display(),
+        library = library_index,
+        "Audiobook cover image saved"
     );
     StatusCode::NO_CONTENT.into_response()
 }
@@ -6163,9 +6221,9 @@ pub(crate) async fn web_artwork(
         return StatusCode::NOT_FOUND.into_response();
     }
     let root = selected_library_folder_root(&s, query.library, query.folder);
-    let directory = match web_path(&s, &root, &relative).await {
-        Ok(path) if path.is_dir() => path,
-        _ => return StatusCode::NOT_FOUND.into_response(),
+    let requested_path = match web_path(&s, &root, &relative).await {
+        Ok(path) => path,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
     let library_index = query.library.unwrap_or_default();
     let library = s
@@ -6174,6 +6232,34 @@ pub(crate) async fn web_artwork(
         .ok()
         .and_then(|config| config.libraries.get(library_index).cloned());
     let Some(library) = library else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if is_audiobook_library(&library.kind) && kind == "cover" {
+        let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+        let requested_canonical =
+            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
+        let cover = catalog
+            .libraries
+            .iter()
+            .find(|entry| entry.source_index == library_index)
+            .and_then(|library| {
+                library.items.iter().find(|item| {
+                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
+                        == requested_canonical
+                })
+            })
+            .and_then(|item| item.cover_path.clone());
+        if let Some(cover) = cover {
+            if let Ok(bytes) = tokio::fs::read(&cover).await {
+                let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
+                return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
+            }
+        }
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let directory = if requested_path.is_dir() {
+        requested_path
+    } else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let media_index = media_snapshot(&s);
@@ -6210,20 +6296,6 @@ pub(crate) async fn web_artwork(
     paths.push(directory.join(".hbgr").join(format!("{kind}.jpg")));
     if !config_mode {
         paths.reverse();
-    }
-    if is_audiobook_library(&library.kind) && kind == "cover" {
-        let mut local_paths = [
-            "cover.jpg",
-            "cover.jpeg",
-            "cover.png",
-            "folder.jpg",
-            "folder.png",
-        ]
-        .into_iter()
-        .map(|name| directory.join(name))
-        .collect::<Vec<_>>();
-        local_paths.extend(paths);
-        paths = local_paths;
     }
     for path in paths {
         if let Ok(bytes) = tokio::fs::read(&path).await {
@@ -7220,8 +7292,40 @@ bindCardAction(document, "click", async event => {
     document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
   }
   const button = event.target.closest("[data-watch-action]");
+  const setCoverButton = event.target.closest("[data-set-cover]");
   const fixMatchButton = event.target.closest("[data-fix-match]");
   const refreshMetadataButton = event.target.closest("[data-refresh-metadata]");
+  if (setCoverButton) {
+    event.preventDefault();
+    const card = setCoverButton.closest(".media-card");
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/png,image/jpeg,image/webp";
+    input.addEventListener("change", async () => {
+      const file = input.files?.[0];
+      if (!file || !card) return;
+      let status = setCoverButton.closest(".media-card-menu")?.querySelector(".media-card-menu-status");
+      try {
+        const response = await fetch(
+          `/web/audiobook-cover?library=${encodeURIComponent(card.dataset.library || "")}&folder=${encodeURIComponent(card.dataset.folder || "0")}&path=${encodeURIComponent(card.dataset.mediaPath || "")}`,
+          { method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: await file.arrayBuffer() }
+        );
+        if (!response.ok) throw new Error("Could not save cover image.");
+        window.location.reload();
+      } catch (error) {
+        if (!status) {
+          status = document.createElement("span");
+          status.className = "media-card-menu-status";
+          status.setAttribute("role", "status");
+          status.style.cssText = "padding:.45rem .65rem;color:#fca5a5;font-size:.72rem";
+          setCoverButton.closest(".media-card-menu-items")?.append(status);
+        }
+        status.textContent = error.message || "Could not save cover image.";
+      }
+    });
+    input.click();
+    return;
+  }
   if (refreshMetadataButton) {
     event.preventDefault();
     const originalLabel = refreshMetadataButton.textContent;
@@ -7322,6 +7426,15 @@ bindCardAction(document, "click", async event => {
         progress?.setAttribute("aria-valuenow", percentValue);
         if (fill) fill.style.width = `${percentValue}%`;
         if (percent) percent.textContent = `${percentValue}%`;
+        const badge = item.querySelector(".media-card-unwatched");
+        if (item.classList.contains("media-card-book") && badge) {
+          if (action === "watched") {
+            badge.textContent = "✓";
+            badge.setAttribute("aria-label", "Read");
+          } else {
+            badge.remove();
+          }
+        }
         if (action === "watched" && item.closest(".continue-grid")) item.remove();
       });
     } else if (action === "remove_from_continue") {
@@ -7605,7 +7718,7 @@ fn audiobook_media_card(
         Some(&item.author),
         Some(&details),
         progress,
-        None,
+        watched.then_some(0),
         relative,
         library,
         false,

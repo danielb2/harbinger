@@ -1,5 +1,5 @@
 use super::scanner::{self, BookFiles, ParsedBookPath};
-use crate::harbinger::{is_audiobook_library, is_hidden_path, AppState};
+use crate::harbinger::{database_media_key, is_audiobook_library, is_hidden_path, AppState};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -100,6 +100,12 @@ impl Item {
 }
 
 #[derive(Clone, Debug)]
+struct CoverSettings {
+    config_mode: bool,
+    config_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct Folder {
     pub(crate) id: String,
     pub(crate) full_path: String,
@@ -158,7 +164,15 @@ impl Catalog {
                 }
             }
         }
-        let catalog = build_catalog(&config.libraries);
+        let cover_settings = CoverSettings {
+            config_mode: config.metadata_storage == "config",
+            config_dir: state
+                .subtitle_checkpoints_dir
+                .parent()
+                .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+                .to_path_buf(),
+        };
+        let catalog = build_catalog(&config.libraries, &cover_settings);
         if let Ok(mut guard) = cache.lock() {
             *guard = Some(CacheEntry {
                 key,
@@ -227,7 +241,10 @@ pub(crate) fn count_audio_files(library: &crate::harbinger::ConfigLibrary) -> us
     files.len()
 }
 
-fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalog {
+fn build_catalog(
+    config_libraries: &[crate::harbinger::ConfigLibrary],
+    cover_settings: &CoverSettings,
+) -> Catalog {
     let libraries = config_libraries
         .iter()
         .enumerate()
@@ -261,6 +278,8 @@ fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalo
                             .get(folder_index)
                             .map(|folder| folder.id.as_str())
                             .unwrap_or(&folder_id),
+                        index,
+                        cover_settings,
                     ) {
                         items.push(item);
                     }
@@ -285,10 +304,17 @@ fn build_catalog(config_libraries: &[crate::harbinger::ConfigLibrary]) -> Catalo
     Catalog { libraries }
 }
 
-fn build_item(book: BookFiles, library_id: &str, folder_id: &str) -> Option<Item> {
+fn build_item(
+    book: BookFiles,
+    library_id: &str,
+    folder_id: &str,
+    source_index: usize,
+    cover_settings: &CoverSettings,
+) -> Option<Item> {
     if book.audio_files.is_empty() {
         return None;
     }
+    let id = stable_id("li", &format!("{}|{}", library_id, book.path.display()));
     let parsed = if book.is_file {
         ParsedBookPath {
             title: Some(scanner::file_stem(&book.path)),
@@ -371,16 +397,7 @@ fn build_item(book: BookFiles, library_id: &str, folder_id: &str) -> Option<Item
     } else {
         metadata.authors.join(", ")
     };
-    let cover_path = if book.is_file {
-        None
-    } else {
-        scanner::choose_cover(&book.path).or_else(|| {
-            [".hbgr/cover.jpg", ".hbgr/cover.jpeg", ".hbgr/cover.png"]
-                .iter()
-                .map(|name| book.path.join(name))
-                .find(|path| path.is_file())
-        })
-    };
+    let cover_path = resolve_cover(&book, &id, source_index, cover_settings);
     let duration = audio_files.iter().map(|file| file.duration).sum();
     let size = audio_files.iter().map(|file| file.size).sum();
     let added_ms = audio_files
@@ -393,7 +410,6 @@ fn build_item(book: BookFiles, library_id: &str, folder_id: &str) -> Option<Item
         .map(|file| file.modified_ms)
         .max()
         .unwrap_or_default();
-    let id = stable_id("li", &format!("{}|{}", library_id, book.path.display()));
     Some(Item {
         id,
         library_id: library_id.to_owned(),
@@ -412,6 +428,129 @@ fn build_item(book: BookFiles, library_id: &str, folder_id: &str) -> Option<Item
         updated_ms,
         metadata,
     })
+}
+
+fn resolve_cover(
+    book: &BookFiles,
+    item_id: &str,
+    source_index: usize,
+    settings: &CoverSettings,
+) -> Option<PathBuf> {
+    let store = cover_store_dir(settings, source_index, item_id, &book.path, book.is_file);
+    if let Some(cover) = scanner::stored_cover(&store) {
+        return Some(cover);
+    }
+    let fallback_store = cover_store_dir(
+        &CoverSettings {
+            config_mode: !settings.config_mode,
+            config_dir: settings.config_dir.clone(),
+        },
+        source_index,
+        item_id,
+        &book.path,
+        book.is_file,
+    );
+    if let Some(cover) = scanner::stored_cover(&fallback_store) {
+        return Some(cover);
+    }
+    if let Some(file) = book.audio_files.first() {
+        if let Some((bytes, extension)) = scanner::embedded_cover(&file.path) {
+            if let Some(cover) = write_stored_cover(&store, &bytes, extension) {
+                return Some(cover);
+            }
+        }
+    }
+    let directory = if book.is_file {
+        book.path.parent()?
+    } else {
+        book.path.as_path()
+    };
+    if let Some(cover) = scanner::cover_image(directory, "cover") {
+        return Some(cover);
+    }
+    let filename_stem = if book.is_file {
+        scanner::file_stem(&book.path)
+    } else {
+        book.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    if let Some(cover) = scanner::cover_image(directory, &filename_stem) {
+        return Some(cover);
+    }
+    if !book.is_file {
+        if let Some(title) = scanner::parse_book_path(&book.rel_path, false).title {
+            if title != filename_stem {
+                if let Some(cover) = scanner::cover_image(directory, &title) {
+                    return Some(cover);
+                }
+            }
+        }
+    }
+    scanner::first_image(directory)
+}
+
+fn cover_store_dir(
+    settings: &CoverSettings,
+    source_index: usize,
+    item_id: &str,
+    item_path: &Path,
+    is_file: bool,
+) -> PathBuf {
+    if settings.config_mode {
+        settings
+            .config_dir
+            .join(".hbgr")
+            .join(database_media_key(source_index + 1, item_id))
+    } else if is_file {
+        item_path
+            .parent()
+            .unwrap_or(item_path)
+            .join(".hbgr")
+            .join(item_id)
+    } else {
+        item_path.join(".hbgr")
+    }
+}
+
+pub(crate) fn item_cover_store_dir(state: &AppState, source_index: usize, item: &Item) -> PathBuf {
+    let config_mode = state
+        .config
+        .lock()
+        .is_ok_and(|config| config.metadata_storage == "config");
+    cover_store_dir(
+        &CoverSettings {
+            config_mode,
+            config_dir: state
+                .subtitle_checkpoints_dir
+                .parent()
+                .unwrap_or(state.subtitle_checkpoints_dir.as_path())
+                .to_path_buf(),
+        },
+        source_index,
+        &item.id,
+        &item.path,
+        item.is_file,
+    )
+}
+
+pub(crate) fn write_cover_file(directory: &Path, bytes: &[u8], extension: &str) -> Option<PathBuf> {
+    fs::create_dir_all(directory).ok()?;
+    for existing in ["jpg", "jpeg", "png", "webp"] {
+        let path = directory.join(format!("cover.{existing}"));
+        if path.is_file() {
+            fs::remove_file(path).ok();
+        }
+    }
+    let path = directory.join(format!("cover.{extension}"));
+    fs::write(&path, bytes).ok()?;
+    Some(path)
+}
+
+fn write_stored_cover(directory: &Path, bytes: &[u8], extension: &str) -> Option<PathBuf> {
+    write_cover_file(directory, bytes, extension)
 }
 
 fn sort_audio_files(audio_files: &mut [AudioFile]) {
@@ -697,6 +836,113 @@ mod tests {
         assert!(metadata.narrators.is_empty());
         assert!(metadata.chapters.is_empty());
         assert!(metadata.description.is_empty());
+    }
+
+    const EMBEDDED_COVER_MP3: &str = "SUQzAwAAAAACLFRTU0UAAAAPAAAATGF2ZjYzLjE2LjEwMABBUElDAAAA/wAAAGltYWdlL2pwZWcAA0FsYnVtIGNvdmVyAP/Y/+AAEEpGSUYAAQIAAAEAAQAA//4AEExhdmM2My4yNC4xMDAA/9sAQwAIBAQEBAQFBQUFBQUGBgYGBgYGBgYGBgYGBwcHCAgIBwcHBgYHBwgICAgJCQkICAgICQkKCgoMDAsLDg4OEREU/8QATQABAQAAAAAAAAAAAAAAAAAAAAYBAQEBAAAAAAAAAAAAAAAAAAAGBxABAAAAAAAAAAAAAAAAAAAAABEBAAAAAAAAAAAAAAAAAAAAAP/AABEIACAAIAMBIgACEQADEQD/2gAMAwEAAhEDEQA/AIsBJt/AAAAAAf/ZAAAAAAAAAAAAAP/jOMQAAAAAAAAAAABJbmZvAAAADwAAAAQAAAH4AJKSkpKSkpKSkpKSkpKSkpKSkpKSkpKSkra2tra2tra2tra2tra2tra2tra2tra2trbb29vb29vb29vb29vb29vb29vb29vb29vb/////////////////////////////////wAAAABMYXZjNjMuMjQAAAAAAAAAAAAAAAAC86AAAAAAAAAB+KYmbGoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAP/jGMQACviOxblDAAKqBSi20B3d3dz+IiIn7u7v/9cDAwNzUEDiIPg+/BB13+GOA36Qxy7+c6fd0iaHOFnEN/xlRCUcoQt/g//jGMQPEJlCkAGUUABvB+oHuQAZcRJwD4mA5kdYHeph74BoAkAqKwiguv/yEeiqRD4fGm//+QoDQlCQNf+JToNV5Xt8lMtmpf/jGMQHDnkKoAGZQAA///T29xuWx59Yr//8+/5w9MEX0IAzIJBwOv/2DgyEoBITg6LWT//CVCejWSxVn/OlZ1ZMQU1FNC4wqv/jGMQIAAADSAHAAACqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqg==";
+
+    fn catalog_temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "mplex-book-catalog-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn cover_settings(root: &Path) -> CoverSettings {
+        CoverSettings {
+            config_mode: false,
+            config_dir: root.join("config"),
+        }
+    }
+
+    fn ffmpeg_available() -> bool {
+        let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+        std::process::Command::new(ffmpeg)
+            .arg("-version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    #[test]
+    fn embedded_cover_precedes_folder_images() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        if !ffmpeg_available() {
+            eprintln!("skipping embedded cover test because ffmpeg is unavailable");
+            return;
+        }
+        let root = catalog_temp_dir("embedded-cover");
+        let book_dir = root.join("Author").join("Book");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::write(
+            book_dir.join("Chapter 01.mp3"),
+            STANDARD.decode(EMBEDDED_COVER_MP3).unwrap(),
+        )
+        .unwrap();
+        fs::write(book_dir.join("cover.jpg"), b"folder-cover").unwrap();
+
+        let books = scanner::scan_library(&root);
+        assert_eq!(books.len(), 1);
+        let cover = resolve_cover(&books[0], "li_embedded", 0, &cover_settings(&root))
+            .expect("embedded cover is extracted");
+        assert!(cover.starts_with(book_dir.join(".hbgr")));
+        let bytes = fs::read(&cover).unwrap();
+        assert_eq!(
+            bytes,
+            scanner::embedded_cover(&book_dir.join("Chapter 01.mp3"))
+                .unwrap()
+                .0
+        );
+        assert_ne!(bytes, b"folder-cover");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cover_images_fall_back_from_cover_stem_to_filename_stem_and_any_image() {
+        let root = catalog_temp_dir("cover-order");
+        let book_dir = root.join("Author").join("Named Book");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::write(book_dir.join("Chapter 01.mp3"), b"not real audio").unwrap();
+        fs::write(book_dir.join("zzz.jpg"), b"any-image").unwrap();
+        fs::write(book_dir.join("Named Book.jpg"), b"filename-image").unwrap();
+
+        let books = scanner::scan_library(&root);
+        let settings = cover_settings(&root);
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        assert_eq!(cover, book_dir.join("Named Book.jpg"));
+
+        fs::write(book_dir.join("cover.png"), b"cover-image").unwrap();
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        assert_eq!(cover, book_dir.join("cover.png"));
+
+        fs::remove_file(book_dir.join("cover.png")).unwrap();
+        fs::remove_file(book_dir.join("Named Book.jpg")).unwrap();
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        assert_eq!(cover, book_dir.join("zzz.jpg"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stored_cover_overrides_automatic_cover_sources() {
+        let root = catalog_temp_dir("stored-cover");
+        let book_dir = root.join("Author").join("Book");
+        fs::create_dir_all(&book_dir).unwrap();
+        fs::write(book_dir.join("Chapter 01.mp3"), b"not real audio").unwrap();
+        fs::write(book_dir.join("cover.jpg"), b"folder-cover").unwrap();
+        let store = book_dir.join(".hbgr");
+        write_cover_file(&store, b"custom-cover", "png").unwrap();
+
+        let books = scanner::scan_library(&root);
+        let cover = resolve_cover(&books[0], "li_stored", 0, &cover_settings(&root)).unwrap();
+        assert_eq!(cover, store.join("cover.png"));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

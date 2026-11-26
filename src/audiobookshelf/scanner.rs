@@ -8,9 +8,12 @@
 //! Reference: <https://audiobookshelf.org/docs/documentation/libraries/book-library/directory-structure>
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
+    time::UNIX_EPOCH,
 };
 
 const IGNORED_EXTENSIONS: &[&str] = &[
@@ -305,22 +308,40 @@ pub(crate) fn file_stem(path: &Path) -> String {
         .to_owned()
 }
 
-/// Choose the cover image for a book folder, preferring `cover.*` and then the
-/// first supported image in the folder.
-pub(crate) fn choose_cover(directory: &Path) -> Option<PathBuf> {
-    let entries = fs::read_dir(directory).ok()?;
+/// Find an image in `directory` whose filename stem matches `stem`.
+pub(crate) fn cover_image(directory: &Path, stem: &str) -> Option<PathBuf> {
+    image_files(directory).into_iter().find(|path| {
+        path.file_stem()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(stem))
+    })
+}
+
+/// Return the first supported image in `directory`, ordered by filename.
+pub(crate) fn first_image(directory: &Path) -> Option<PathBuf> {
+    image_files(directory).into_iter().next()
+}
+
+/// A user-selected or previously extracted cover stored in the item's cover
+/// directory.
+pub(crate) fn stored_cover(directory: &Path) -> Option<PathBuf> {
+    ["jpg", "jpeg", "png", "webp"]
+        .into_iter()
+        .map(|extension| directory.join(format!("cover.{extension}")))
+        .find(|path| path.is_file())
+}
+
+fn image_files(directory: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
     let mut images = entries
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.is_file() && is_image_path(path))
         .collect::<Vec<_>>();
     images.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
-    let preferred = images.iter().find(|path| {
-        path.file_stem()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.eq_ignore_ascii_case("cover"))
-    });
-    preferred.cloned().or_else(|| images.into_iter().next())
+    images
 }
 
 fn is_image_path(path: &Path) -> bool {
@@ -331,6 +352,76 @@ fn is_image_path(path: &Path) -> bool {
                 .iter()
                 .any(|candidate| candidate.eq_ignore_ascii_case(extension))
         })
+}
+
+/// Image extension from the file contents, accepting the formats the web UI
+/// supports for uploaded covers.
+pub(crate) fn image_extension(data: &[u8]) -> Option<&'static str> {
+    if data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if data.len() > 12 && data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+        Some("webp")
+    } else {
+        None
+    }
+}
+
+/// Read the first embedded cover from an audio file. FFmpeg copies the
+/// attached picture stream without re-encoding, preserving the source format.
+pub(crate) fn embedded_cover(path: &Path) -> Option<(Vec<u8>, &'static str)> {
+    let (size, modified) = cover_cache_key(path)?;
+    let cache = EMBEDDED_COVER_CACHE.get_or_init(Default::default);
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_size, cached_modified, false)) = guard.get(path) {
+            if *cached_size == size && *cached_modified == modified {
+                return None;
+            }
+        }
+    }
+    let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+    let output = Command::new(ffmpeg)
+        .args(["-v", "error", "-i"])
+        .arg(path)
+        .args([
+            "-map",
+            "0:v:0?",
+            "-frames:v",
+            "1",
+            "-c:v",
+            "copy",
+            "-f",
+            "image2pipe",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    let present = output.status.success() && !output.stdout.is_empty();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (size, modified, present));
+    }
+    if !present {
+        return None;
+    }
+    let extension = image_extension(&output.stdout)?;
+    Some((output.stdout, extension))
+}
+
+type EmbeddedCoverCache = Mutex<HashMap<PathBuf, (u64, i64, bool)>>;
+
+static EMBEDDED_COVER_CACHE: OnceLock<EmbeddedCoverCache> = OnceLock::new();
+
+fn cover_cache_key(path: &Path) -> Option<(u64, i64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    Some((metadata.len(), modified))
 }
 
 /// Track and disc numbers parsed from the audio filename and disc folder, as
@@ -911,7 +1002,10 @@ mod tests {
             .other_files
             .iter()
             .any(|file| file.rel_path.ends_with("cover.jpg")));
-        assert!(choose_cover(&books[0].path).is_some_and(|cover| cover.ends_with("cover.jpg")));
+        assert!(
+            cover_image(&books[0].path, "cover").is_some_and(|cover| cover.ends_with("cover.jpg"))
+        );
+        assert!(first_image(&books[0].path).is_some());
         fs::remove_dir_all(root).unwrap();
     }
 

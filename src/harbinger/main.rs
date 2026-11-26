@@ -64,7 +64,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocketUpgrade},
-        Form, FromRequestParts, Path, Query, RawForm, State,
+        DefaultBodyLimit, Form, FromRequestParts, Path, Query, RawForm, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode, Uri},
     middleware::{self, Next},
@@ -8228,10 +8228,13 @@ pub(crate) fn media_card_with_options(
             path.clone()
         }
     });
+    let book_card = watch_scope == "audiobook";
     let card_class = if episode_card {
         "media-card media-card-tv media-card-episode"
     } else if tv_card {
         "media-card media-card-tv"
+    } else if book_card {
+        "media-card media-card-book"
     } else {
         "media-card"
     };
@@ -8240,7 +8243,11 @@ pub(crate) fn media_card_with_options(
             let (label, aria) = if count == 0 {
                 (
                     "✓".to_owned(),
-                    "No unwatched episodes".to_owned(),
+                    if book_card {
+                        "Read".to_owned()
+                    } else {
+                        "No unwatched episodes".to_owned()
+                    },
                 )
             } else {
                 (
@@ -8285,8 +8292,18 @@ pub(crate) fn media_card_with_options(
     } else {
         String::new()
     };
+    let (watched_label, unwatched_label) = if book_card {
+        ("Mark as read", "Mark as unread")
+    } else {
+        ("Mark as watched", "Mark as unwatched")
+    };
+    let set_cover_action = if book_card {
+        r#"<button type="button" data-set-cover>Set cover image</button>"#
+    } else {
+        ""
+    };
     let menu = format!(
-        r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">Mark as watched</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">Mark as unwatched</button>{remove_action}{fix_match_action}</div></details>"#
+        r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">{watched_label}</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{unwatched_label}</button>{set_cover_action}{remove_action}{fix_match_action}</div></details>"#
     );
     let card = format!(
         r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a>{}</div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
@@ -9975,7 +9992,7 @@ fn html(value: &str) -> String {
 
 fn add_build_info_footer(mut document: String) -> String {
     let footer = format!(
-        r#"<aside class="harbinger-build-info" aria-label="Harbinger version and commit">Harbinger v{} · commit {}</aside><style>.harbinger-build-info{{position:fixed;left:.75rem;bottom:.65rem;z-index:30;padding:.35rem .55rem;border:1px solid rgba(148,163,184,.18);border-radius:.45rem;color:#9ca3af;background:rgba(11,16,32,.88);backdrop-filter:blur(8px);font:500 .68rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none;white-space:nowrap}}html{{scrollbar-gutter:stable}}.media-card-cover,.media-card-cover img{{display:block;box-sizing:border-box;width:100%;aspect-ratio:2/3}}.media-card-cover img{{object-fit:cover;border-radius:.35rem;background:#111827}}.media-cover-placeholder{{display:grid;box-sizing:border-box;width:100%;height:100%;place-items:center;border-radius:.35rem;color:#bfdbfe;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827);font-size:.9rem;padding:.7rem;text-align:center;overflow-wrap:anywhere}}@media(max-width:700px){{.harbinger-build-info{{display:none}}}}</style>"#,
+        r#"<aside class="harbinger-build-info" aria-label="Harbinger version and commit">Harbinger v{} · commit {}</aside><style>.harbinger-build-info{{position:fixed;left:.75rem;bottom:.65rem;z-index:30;padding:.35rem .55rem;border:1px solid rgba(148,163,184,.18);border-radius:.45rem;color:#9ca3af;background:rgba(11,16,32,.88);backdrop-filter:blur(8px);font:500 .68rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;pointer-events:none;white-space:nowrap}}html{{scrollbar-gutter:stable}}.media-card-cover,.media-card-cover img{{display:block;box-sizing:border-box;width:100%;aspect-ratio:2/3}}.media-card-cover img{{object-fit:cover;border-radius:.35rem;background:#111827}}.media-card-book .media-card-cover,.media-card-book .media-card-cover img{{aspect-ratio:1/1}}.media-cover-placeholder{{display:grid;box-sizing:border-box;width:100%;height:100%;place-items:center;border-radius:.35rem;color:#bfdbfe;background:linear-gradient(135deg,#1e3a8a,#312e81 55%,#111827);font-size:.9rem;padding:.7rem;text-align:center;overflow-wrap:anywhere}}@media(max-width:700px){{.harbinger-build-info{{display:none}}}}</style>"#,
         env!("CARGO_PKG_VERSION"),
         env!("HARBINGER_GIT_COMMIT"),
     );
