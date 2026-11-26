@@ -121,6 +121,9 @@ pub(crate) async fn persist_match(
             }
         }
     }
+    if let Some(cover) = scanner::stored_cover(&sidecar) {
+        super::catalog::store_cover_reference(&sidecar, &cover);
+    }
     true
 }
 

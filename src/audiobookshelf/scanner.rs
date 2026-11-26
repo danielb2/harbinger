@@ -310,7 +310,7 @@ pub(crate) fn file_stem(path: &Path) -> String {
 
 /// Find an image in `directory` whose filename stem matches `stem`.
 pub(crate) fn cover_image(directory: &Path, stem: &str) -> Option<PathBuf> {
-    image_files(directory).into_iter().find(|path| {
+    images_in_dir(directory).into_iter().find(|path| {
         path.file_stem()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.eq_ignore_ascii_case(stem))
@@ -319,7 +319,7 @@ pub(crate) fn cover_image(directory: &Path, stem: &str) -> Option<PathBuf> {
 
 /// Return the first supported image in `directory`, ordered by filename.
 pub(crate) fn first_image(directory: &Path) -> Option<PathBuf> {
-    image_files(directory).into_iter().next()
+    images_in_dir(directory).into_iter().next()
 }
 
 /// A user-selected or previously extracted cover stored in the item's cover
@@ -331,7 +331,7 @@ pub(crate) fn stored_cover(directory: &Path) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn image_files(directory: &Path) -> Vec<PathBuf> {
+pub(crate) fn images_in_dir(directory: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(directory) else {
         return Vec::new();
     };

@@ -46,6 +46,8 @@ pub(crate) fn router(state: crate::harbinger::AppState) -> Router {
         .route("/healthcheck", get(healthcheck))
         .route("/init", get(init))
         .route("/status", get(status))
+        .route("/socket.io/", get(super::socket::socket_io))
+        .route("/socket.io", get(super::socket::socket_io))
         .with_state(state.clone());
     let api = Router::new()
         .route("/authorize", post(authorize))
@@ -1058,7 +1060,10 @@ fn authenticate(
     Some(identity)
 }
 
-fn session_user(state: &crate::harbinger::AppState, token: &str) -> Option<UserIdentity> {
+pub(crate) fn session_user(
+    state: &crate::harbinger::AppState,
+    token: &str,
+) -> Option<UserIdentity> {
     state.db.lock().ok().and_then(|db| {
         db.query_row(
             "SELECT users.id, COALESCE(users.username, users.name),

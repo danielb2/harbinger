@@ -53,6 +53,7 @@ pub(crate) struct BookMetadata {
     pub(crate) language: String,
     pub(crate) explicit: bool,
     pub(crate) abridged: bool,
+    pub(crate) cover: Option<String>,
     pub(crate) chapters: Vec<BookChapter>,
 }
 
@@ -348,11 +349,11 @@ fn build_item(
     sort_audio_files(&mut audio_files);
 
     let metadata_path = stored_metadata_path(&book, &id, source_index, cover_settings);
-    let metadata_present = metadata_path.is_some();
     let mut metadata = metadata_path
         .as_deref()
         .map(read_book_metadata)
         .unwrap_or_default();
+    let metadata_present = metadata_has_content(&metadata);
     let fallback_title = if book.is_file {
         scanner::file_stem(&book.path)
     } else {
@@ -399,7 +400,14 @@ fn build_item(
     } else {
         metadata.authors.join(", ")
     };
-    let cover_path = resolve_cover(&book, &id, source_index, cover_settings);
+    let cover_path = resolve_cover(
+        &book,
+        &id,
+        source_index,
+        cover_settings,
+        metadata_path.as_deref(),
+        metadata.cover.as_deref(),
+    );
     let duration = audio_files.iter().map(|file| file.duration).sum();
     let size = audio_files.iter().map(|file| file.size).sum();
     let added_ms = audio_files
@@ -438,7 +446,23 @@ fn resolve_cover(
     item_id: &str,
     source_index: usize,
     settings: &CoverSettings,
+    metadata_path: Option<&Path>,
+    metadata_cover: Option<&str>,
 ) -> Option<PathBuf> {
+    if let (Some(metadata_path), Some(metadata_cover)) = (metadata_path, metadata_cover) {
+        let declared = Path::new(metadata_cover);
+        let candidate = if declared.is_absolute() {
+            declared.to_path_buf()
+        } else {
+            metadata_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(declared)
+        };
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
     let store = sidecar_dir(settings, source_index, item_id, &book.path, book.is_file);
     if let Some(cover) = scanner::stored_cover(&store) {
         return Some(cover);
@@ -459,6 +483,7 @@ fn resolve_cover(
     if let Some(file) = book.audio_files.first() {
         if let Some((bytes, extension)) = scanner::embedded_cover(&file.path) {
             if let Some(cover) = write_stored_cover(&store, &bytes, extension) {
+                store_cover_reference(&store, &cover);
                 return Some(cover);
             }
         }
@@ -588,6 +613,26 @@ pub(crate) fn write_cover_file(directory: &Path, bytes: &[u8], extension: &str) 
 
 fn write_stored_cover(directory: &Path, bytes: &[u8], extension: &str) -> Option<PathBuf> {
     write_cover_file(directory, bytes, extension)
+}
+
+pub(crate) fn store_cover_reference(directory: &Path, cover: &Path) -> bool {
+    let Some(name) = cover.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let path = directory.join("metadata.json");
+    let mut metadata = fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| Value::Object(Default::default()));
+    let Some(object) = metadata.as_object_mut() else {
+        return false;
+    };
+    object.insert("cover".to_owned(), Value::String(name.to_owned()));
+    serde_json::to_vec_pretty(&metadata)
+        .ok()
+        .and_then(|bytes| fs::write(&path, bytes).ok())
+        .is_some()
 }
 
 fn sort_audio_files(audio_files: &mut [AudioFile]) {
@@ -738,8 +783,29 @@ fn read_book_metadata(path: &Path) -> BookMetadata {
         language: string("language"),
         explicit: boolean("explicit"),
         abridged: boolean("abridged"),
+        cover: {
+            let cover = string("cover");
+            (!cover.trim().is_empty()).then_some(cover)
+        },
         chapters,
     }
+}
+
+fn metadata_has_content(metadata: &BookMetadata) -> bool {
+    metadata.title.is_some()
+        || !metadata.authors.is_empty()
+        || !metadata.narrators.is_empty()
+        || !metadata.series.is_empty()
+        || !metadata.genres.is_empty()
+        || !metadata.tags.is_empty()
+        || !metadata.published_year.is_empty()
+        || !metadata.published_date.is_empty()
+        || !metadata.publisher.is_empty()
+        || !metadata.description.is_empty()
+        || !metadata.isbn.is_empty()
+        || !metadata.asin.is_empty()
+        || !metadata.language.is_empty()
+        || !metadata.chapters.is_empty()
 }
 
 fn number_value(value: Option<&Value>) -> Option<f64> {
@@ -987,8 +1053,15 @@ mod tests {
 
         let books = scanner::scan_library(&root);
         assert_eq!(books.len(), 1);
-        let cover = resolve_cover(&books[0], "li_embedded", 0, &cover_settings(&root))
-            .expect("embedded cover is extracted");
+        let cover = resolve_cover(
+            &books[0],
+            "li_embedded",
+            0,
+            &cover_settings(&root),
+            None,
+            None,
+        )
+        .expect("embedded cover is extracted");
         assert!(cover.starts_with(book_dir.join(".hbgr")));
         let bytes = fs::read(&cover).unwrap();
         assert_eq!(
@@ -1012,16 +1085,16 @@ mod tests {
 
         let books = scanner::scan_library(&root);
         let settings = cover_settings(&root);
-        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings, None, None).unwrap();
         assert_eq!(cover, book_dir.join("Named Book.jpg"));
 
         fs::write(book_dir.join("cover.png"), b"cover-image").unwrap();
-        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings, None, None).unwrap();
         assert_eq!(cover, book_dir.join("cover.png"));
 
         fs::remove_file(book_dir.join("cover.png")).unwrap();
         fs::remove_file(book_dir.join("Named Book.jpg")).unwrap();
-        let cover = resolve_cover(&books[0], "li_named", 0, &settings).unwrap();
+        let cover = resolve_cover(&books[0], "li_named", 0, &settings, None, None).unwrap();
         assert_eq!(cover, book_dir.join("zzz.jpg"));
         fs::remove_dir_all(root).unwrap();
     }
@@ -1037,7 +1110,15 @@ mod tests {
         write_cover_file(&store, b"custom-cover", "png").unwrap();
 
         let books = scanner::scan_library(&root);
-        let cover = resolve_cover(&books[0], "li_stored", 0, &cover_settings(&root)).unwrap();
+        let cover = resolve_cover(
+            &books[0],
+            "li_stored",
+            0,
+            &cover_settings(&root),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(cover, store.join("cover.png"));
         fs::remove_dir_all(root).unwrap();
     }

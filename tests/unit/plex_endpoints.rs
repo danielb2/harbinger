@@ -2947,6 +2947,10 @@ async fn web_audiobook_cover_upload_replaces_the_card_cover() {
         std::fs::read(book_dir.join(".hbgr/cover.jpg")).unwrap(),
         upload
     );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(book_dir.join(".hbgr/metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["cover"], "cover.jpg");
 
     let response = send(
         &fixture.app,
@@ -2976,6 +2980,64 @@ async fn web_audiobook_cover_upload_replaces_the_card_cover() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn web_audiobook_cover_options_and_select_folder_image() {
+    let fixture = audiobook_web_fixture("audiobooks-web-cover-options");
+    let book_dir = fixture
+        .root
+        .join("audiobooks-web-cover-options")
+        .join("Author One")
+        .join("Book One");
+    std::fs::write(book_dir.join("cover.png"), b"\x89PNG\r\n\x1a\ncover-bytes").unwrap();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/audiobook-cover/options?library=0&folder=0&path=Author%20One%2FBook%20One",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let options: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(options["folder"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|choice| { choice["file"] == "cover.png" }));
+
+    let response = fixture
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/web/audiobook-cover/select")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "library": 0,
+                        "folder": 0,
+                        "path": "Author One/Book One",
+                        "source": "folder",
+                        "file": "cover.png"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        std::fs::read(book_dir.join(".hbgr/cover.png")).unwrap(),
+        b"\x89PNG\r\n\x1a\ncover-bytes"
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(book_dir.join(".hbgr/metadata.json")).unwrap())
+            .unwrap();
+    assert_eq!(metadata["cover"], "cover.png");
 }
 
 #[tokio::test]
@@ -3039,6 +3101,11 @@ async fn web_audiobook_cover_upload_respects_config_storage_mode() {
         .collect::<Vec<_>>();
     assert_eq!(config_covers.len(), 1);
     assert_eq!(std::fs::read(&config_covers[0]).unwrap(), upload);
+    let metadata: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(config_covers[0].parent().unwrap().join("metadata.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(metadata["cover"], "cover.png");
 }
 
 #[test]

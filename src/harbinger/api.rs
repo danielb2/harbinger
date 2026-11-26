@@ -78,6 +78,10 @@ pub(crate) fn web_routes() -> Router<AppState> {
             "/web/audiobook-cover",
             post(set_audiobook_cover).layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
         )
+        .route("/web/audiobook-cover/options", get(audiobook_cover_options))
+        .route("/web/audiobook-cover/image", get(audiobook_cover_image))
+        .route("/web/audiobook-cover/select", post(select_audiobook_cover))
+        .route("/web/audiobook-cover/url", post(set_audiobook_cover_url))
         .route("/web/audio-selection", post(update_web_audio_selection))
         .route(
             "/web/subtitle-selection",
@@ -1054,9 +1058,11 @@ pub(crate) async fn set_audiobook_cover(
         return StatusCode::NOT_FOUND.into_response();
     };
     let store = crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, item);
-    if crate::audiobookshelf::catalog::write_cover_file(&store, &body, extension).is_none() {
+    let Some(cover) = crate::audiobookshelf::catalog::write_cover_file(&store, &body, extension)
+    else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
+    };
+    crate::audiobookshelf::catalog::store_cover_reference(&store, &cover);
     crate::audiobookshelf::catalog::invalidate_cache();
     info!(
         path = %relative.display(),
@@ -1064,6 +1070,321 @@ pub(crate) async fn set_audiobook_cover(
         "Audiobook cover image saved"
     );
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AudiobookCoverQuery {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AudiobookCoverSelection {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: String,
+    pub(crate) source: String,
+    pub(crate) file: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AudiobookCoverUrl {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: String,
+    pub(crate) url: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AudiobookCoverImageQuery {
+    pub(crate) library: Option<usize>,
+    pub(crate) folder: Option<usize>,
+    pub(crate) path: Option<String>,
+    pub(crate) source: Option<String>,
+    pub(crate) file: Option<String>,
+}
+
+pub(crate) async fn audiobook_cover_options(
+    State(state): State<AppState>,
+    Query(query): Query<AudiobookCoverQuery>,
+) -> Response {
+    let Some(library_index) = query.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(item) = audiobook_item_for_match(&state, library_index, query.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let sidecar = crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, &item);
+    let folder = item
+        .path
+        .parent()
+        .filter(|_| item.is_file)
+        .unwrap_or(&item.path);
+    let stored = crate::audiobookshelf::scanner::images_in_dir(&sidecar)
+        .into_iter()
+        .filter_map(|path| {
+            let file = path.file_name()?.to_str()?.to_owned();
+            Some(serde_json::json!({
+                "file": file,
+                "label": format!("Stored: {file}"),
+                "url": audiobook_cover_image_url(library_index, query.folder, &relative, "stored", Some(&file))
+            }))
+        })
+        .collect::<Vec<_>>();
+    let mut folder_images = crate::audiobookshelf::scanner::images_in_dir(folder)
+        .into_iter()
+        .filter(|path| {
+            !item.is_file
+                || path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| {
+                        stem.eq_ignore_ascii_case("cover")
+                            || stem.eq_ignore_ascii_case(&crate::audiobookshelf::scanner::file_stem(
+                                &item.path,
+                            ))
+                    })
+        })
+        .filter_map(|path| {
+            let file = path.file_name()?.to_str()?.to_owned();
+            Some(serde_json::json!({
+                "file": file,
+                "label": file,
+                "url": audiobook_cover_image_url(library_index, query.folder, &relative, "folder", Some(&file))
+            }))
+        })
+        .collect::<Vec<_>>();
+    folder_images.sort_by(|left, right| left["file"].as_str().cmp(&right["file"].as_str()));
+    let embedded = item
+        .audio_files
+        .first()
+        .and_then(|file| crate::audiobookshelf::scanner::embedded_cover(&file.path))
+        .is_some();
+    Json(serde_json::json!({
+        "stored": stored,
+        "folder": folder_images,
+        "embedded": embedded,
+        "embeddedUrl": embedded.then(|| audiobook_cover_image_url(library_index, query.folder, &relative, "embedded", None))
+    }))
+    .into_response()
+}
+
+fn audiobook_cover_image_url(
+    library: usize,
+    folder: Option<usize>,
+    path: &std::path::Path,
+    source: &str,
+    file: Option<&str>,
+) -> String {
+    let mut url = format!(
+        "/web/audiobook-cover/image?library={library}&folder={}&path={}&source={source}",
+        folder.unwrap_or_default(),
+        url_encode(&path.to_string_lossy())
+    );
+    if let Some(file) = file {
+        url.push_str("&file=");
+        url.push_str(&url_encode(file));
+    }
+    url
+}
+
+pub(crate) async fn audiobook_cover_image(
+    State(state): State<AppState>,
+    Query(query): Query<AudiobookCoverImageQuery>,
+) -> Response {
+    let Some(library_index) = query.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(item) = audiobook_item_for_match(&state, library_index, query.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let source = query.source.as_deref().unwrap_or_default();
+    let selected = match source {
+        "embedded" => item
+            .audio_files
+            .first()
+            .and_then(|file| crate::audiobookshelf::scanner::embedded_cover(&file.path))
+            .map(|(bytes, extension)| {
+                (
+                    bytes,
+                    crate::audiobookshelf::catalog::image_content_type(std::path::Path::new(
+                        &format!("cover.{extension}"),
+                    )),
+                )
+            }),
+        "stored" => query.file.as_deref().and_then(|file| {
+            safe_cover_file(file).and_then(|file| {
+                let path =
+                    crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, &item)
+                        .join(file);
+                std::fs::read(&path).ok().map(|bytes| {
+                    (
+                        bytes,
+                        crate::audiobookshelf::catalog::image_content_type(&path),
+                    )
+                })
+            })
+        }),
+        "folder" => query.file.as_deref().and_then(|file| {
+            safe_cover_file(file).and_then(|file| {
+                let directory = item
+                    .path
+                    .parent()
+                    .filter(|_| item.is_file)
+                    .unwrap_or(&item.path);
+                let path = directory.join(file);
+                std::fs::read(&path).ok().map(|bytes| {
+                    (
+                        bytes,
+                        crate::audiobookshelf::catalog::image_content_type(&path),
+                    )
+                })
+            })
+        }),
+        _ => None,
+    };
+    let Some((bytes, content_type)) = selected else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+pub(crate) async fn select_audiobook_cover(
+    State(state): State<AppState>,
+    Json(selection): Json<AudiobookCoverSelection>,
+) -> Response {
+    let Some(library_index) = selection.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = clean_relative_path(&selection.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(item) =
+        audiobook_item_for_match(&state, library_index, selection.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let bytes = match selection.source.as_str() {
+        "embedded" => item
+            .audio_files
+            .first()
+            .and_then(|file| crate::audiobookshelf::scanner::embedded_cover(&file.path))
+            .map(|(bytes, _)| bytes),
+        "stored" => selection.file.as_deref().and_then(|file| {
+            safe_cover_file(file).and_then(|file| {
+                let path =
+                    crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, &item)
+                        .join(file);
+                std::fs::read(&path).ok()
+            })
+        }),
+        "folder" => selection.file.as_deref().and_then(|file| {
+            safe_cover_file(file).and_then(|file| {
+                let directory = item
+                    .path
+                    .parent()
+                    .filter(|_| item.is_file)
+                    .unwrap_or(&item.path);
+                std::fs::read(directory.join(file)).ok()
+            })
+        }),
+        _ => None,
+    };
+    let Some(bytes) = bytes else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(extension) = crate::audiobookshelf::scanner::image_extension(&bytes) else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    let store = crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, &item);
+    let Some(cover) = crate::audiobookshelf::catalog::write_cover_file(&store, &bytes, extension)
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    crate::audiobookshelf::catalog::store_cover_reference(&store, &cover);
+    crate::audiobookshelf::catalog::invalidate_cache();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub(crate) async fn set_audiobook_cover_url(
+    State(state): State<AppState>,
+    Json(request): Json<AudiobookCoverUrl>,
+) -> Response {
+    let Some(library_index) = request.library else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(relative) = clean_relative_path(&request.path) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let parsed = match reqwest::Url::parse(request.url.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let Some(item) =
+        audiobook_item_for_match(&state, library_index, request.folder, &relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!("harbinger/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let response = match client.get(parsed).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Could not download that cover image." })),
+            )
+                .into_response()
+        }
+    };
+    let bytes = match response.bytes().await {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024 => bytes.to_vec(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "The cover image is empty or too large." })),
+            )
+                .into_response()
+        }
+    };
+    let Some(extension) = crate::audiobookshelf::scanner::image_extension(&bytes) else {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    };
+    let store = crate::audiobookshelf::catalog::item_sidecar_dir(&state, library_index, &item);
+    let Some(cover) = crate::audiobookshelf::catalog::write_cover_file(&store, &bytes, extension)
+    else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    crate::audiobookshelf::catalog::store_cover_reference(&store, &cover);
+    crate::audiobookshelf::catalog::invalidate_cache();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+fn safe_cover_file(name: &str) -> Option<&str> {
+    let path = std::path::Path::new(name);
+    (path.components().count() == 1 && !name.starts_with('.')).then_some(name)
 }
 
 pub(crate) async fn web_subtitle_selection(
@@ -3599,7 +3920,11 @@ pub(crate) async fn home_client(State(state): State<AppState>, search: Option<St
         continue_watching,
         recent,
         libraries,
-        fix_match_dialog_markup(),
+        format!(
+            "{}{}",
+            fix_match_dialog_markup(),
+            book_cover_dialog_markup()
+        ),
         media_card_action_script(),
         spa_navigation_script()
     );
@@ -5917,7 +6242,7 @@ pub(crate) async fn web_client(
         page_heading,
         info_panel,
         items,
-        fix_match_dialog_markup(),
+        format!("{}{}", fix_match_dialog_markup(), book_cover_dialog_markup()),
         media_card_action_script(),
         spa_navigation_script()
         ))),
@@ -7327,6 +7652,22 @@ pub(crate) fn fix_match_dialog_markup() -> &'static str {
 </style><dialog id="tv-fix-match-dialog" aria-labelledby="tv-fix-match-heading"><button class="fix-match-close" type="button" aria-label="Close Fix Match dialog" title="Close">×</button><h2 id="tv-fix-match-heading">Fix TV Show Match</h2><p id="tv-fix-match-show" class="note"></p><div class="fix-match-search-row"><select id="tv-fix-match-provider" class="fix-match-provider" aria-label="Metadata provider" hidden><option value="audible">Audible</option><option value="itunes">iTunes</option><option value="google">Google Books</option><option value="openlibrary">OpenLibrary</option><option value="fantlab">FantLab</option></select><input id="tv-fix-match-query" type="search" aria-label="Search TV shows" autocomplete="off"><input id="tv-fix-match-author" type="search" aria-label="Author (optional)" placeholder="Author (optional)" autocomplete="off" hidden><button id="tv-fix-match-search" type="button">Search</button></div><p id="tv-fix-match-status" class="fix-match-status" role="status" aria-live="polite"></p><div id="tv-fix-match-results" class="fix-match-results"></div></dialog>"#
 }
 
+pub(crate) fn book_cover_dialog_markup() -> &'static str {
+    r#"<style>
+#book-cover-dialog { position: fixed; inset: 0; width: min(760px, calc(100vw - 2rem)); max-height: calc(100vh - 2rem); margin: auto; padding: 1.25rem; overflow: auto; color: #f9fafb; border: 1px solid #4b5563; border-radius: .75rem; background: #111827; }
+#book-cover-dialog::backdrop { background: rgba(0,0,0,.7); }
+.book-cover-close { position: absolute; top: .65rem; right: .65rem; min-width: 2.4rem; padding: .3rem .55rem; }
+.book-cover-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: .7rem; margin-bottom: 1rem; }
+.book-cover-choice { display: grid; gap: .35rem; padding: .4rem; border: 1px solid #374151; border-radius: .5rem; color: #e5e7eb; background: #1f2937; font: inherit; font-size: .72rem; text-align: left; cursor: pointer; overflow-wrap: anywhere; }
+.book-cover-choice:hover { border-color: #60a5fa; }
+.book-cover-choice img { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: .35rem; background: #0b1220; }
+.book-cover-url-row { display: flex; flex-wrap: wrap; gap: .5rem; margin: 1rem 0; }
+.book-cover-url-row input { flex: 1 1 18rem; min-width: 0; padding: .6rem .7rem; border: 1px solid #4b5563; border-radius: .4rem; color: #fff; background: #0b1220; font: inherit; }
+#book-cover-url-use, #book-cover-upload { padding: .6rem .8rem; }
+.book-cover-status { min-height: 1.4rem; color: #cbd5e1; }
+</style><dialog id="book-cover-dialog" aria-labelledby="book-cover-heading"><button class="book-cover-close" type="button" aria-label="Close cover dialog" title="Close">×</button><h2 id="book-cover-heading">Choose cover</h2><p id="book-cover-status" class="book-cover-status" role="status" aria-live="polite"></p><h3>Stored in .hbgr</h3><div id="book-cover-stored" class="book-cover-grid"></div><h3>Embedded in audiobook</h3><div id="book-cover-embedded" class="book-cover-grid"></div><h3>Images in book folder</h3><div id="book-cover-folder" class="book-cover-grid"></div><div class="book-cover-url-row"><input id="book-cover-url" type="url" placeholder="https://example.com/cover.jpg" aria-label="Cover image URL"><button id="book-cover-url-use" type="button">Use URL</button><button id="book-cover-upload" type="button">Upload image</button></div><input id="book-cover-upload-input" type="file" accept="image/png,image/jpeg,image/webp" hidden></dialog>"#
+}
+
 pub(crate) fn media_card_action_script() -> &'static str {
     r##"<script>
 window.__mplexCardActionsCleanup?.();
@@ -7351,6 +7692,15 @@ const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
 const fixMatchProvider = document.querySelector("#tv-fix-match-provider");
 const fixMatchQuery = document.querySelector("#tv-fix-match-query");
 const fixMatchAuthor = document.querySelector("#tv-fix-match-author");
+const bookCoverDialog = document.querySelector("#book-cover-dialog");
+const bookCoverStatus = document.querySelector("#book-cover-status");
+const bookCoverStored = document.querySelector("#book-cover-stored");
+const bookCoverEmbedded = document.querySelector("#book-cover-embedded");
+const bookCoverFolder = document.querySelector("#book-cover-folder");
+const bookCoverUrl = document.querySelector("#book-cover-url");
+const bookCoverUrlUse = document.querySelector("#book-cover-url-use");
+const bookCoverUpload = document.querySelector("#book-cover-upload");
+const bookCoverUploadInput = document.querySelector("#book-cover-upload-input");
 const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
 const fixMatchStatus = document.querySelector("#tv-fix-match-status");
 const fixMatchResults = document.querySelector("#tv-fix-match-results");
@@ -7520,6 +7870,142 @@ bindCardAction(document.querySelector(".fix-match-close"), "click", () => fixMat
 bindCardAction(fixMatchDialog, "click", event => {
   if (event.target === fixMatchDialog) fixMatchDialog.close();
 });
+const refreshPage = () => {
+  if (window.__mplexRefresh) window.__mplexRefresh();
+  else window.location.reload();
+};
+const chooseBookCover = async (source, file) => {
+  const response = await fetch("/web/audiobook-cover/select", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      library: Number(bookCoverDialog.dataset.library),
+      folder: Number(bookCoverDialog.dataset.folder || 0),
+      path: bookCoverDialog.dataset.path,
+      source,
+      file
+    })
+  });
+  if (!response.ok) throw new Error("Could not save that cover.");
+  bookCoverDialog.close();
+  refreshPage();
+};
+const addCoverChoices = (container, choices, source) => {
+  choices.forEach(choice => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "book-cover-choice";
+    const image = document.createElement("img");
+    image.alt = "";
+    image.loading = "lazy";
+    image.src = choice.url;
+    const label = document.createElement("span");
+    label.textContent = choice.label || choice.file || "Cover";
+    button.append(image, label);
+    button.addEventListener("click", async () => {
+      button.disabled = true;
+      try {
+        await chooseBookCover(source, choice.file);
+      } catch (error) {
+        button.disabled = false;
+        bookCoverStatus.textContent = error.message || "Could not save that cover.";
+      }
+    });
+    container.append(button);
+  });
+};
+const openBookCoverDialog = async trigger => {
+  if (!bookCoverDialog) return;
+  const scope = trigger.closest(".media-card") || trigger.closest(".audiobook-detail");
+  const library = scope?.dataset.library;
+  const path = scope?.dataset.mediaPath || scope?.dataset.path;
+  if (!library || !path) return;
+  bookCoverDialog.dataset.library = library;
+  bookCoverDialog.dataset.folder = scope?.dataset.folder || "0";
+  bookCoverDialog.dataset.path = path;
+  bookCoverStored.replaceChildren();
+  bookCoverEmbedded.replaceChildren();
+  bookCoverFolder.replaceChildren();
+  bookCoverUrl.value = "";
+  bookCoverStatus.textContent = "Loading cover choices…";
+  bookCoverDialog.showModal();
+  try {
+    const params = new URLSearchParams({ library, folder: bookCoverDialog.dataset.folder, path });
+    const response = await fetch(`/web/audiobook-cover/options?${params}`, { cache: "no-store" });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload.error || "Could not load cover choices.");
+    addCoverChoices(bookCoverStored, payload.stored || [], "stored");
+    if (payload.embedded) {
+      addCoverChoices(bookCoverEmbedded, [{ url: payload.embeddedUrl, label: "Embedded cover" }], "embedded");
+    }
+    addCoverChoices(bookCoverFolder, payload.folder || [], "folder");
+    const hasChoices = bookCoverStored.children.length
+      || bookCoverEmbedded.children.length
+      || bookCoverFolder.children.length;
+    bookCoverStatus.textContent = hasChoices
+      ? "Choose a cover source, load a URL, or upload an image."
+      : "No images found. Load a URL or upload an image.";
+  } catch (error) {
+    bookCoverStatus.textContent = error.message || "Could not load cover choices.";
+  }
+};
+const saveBookCoverUrl = async () => {
+  const url = bookCoverUrl.value.trim();
+  if (!url) {
+    bookCoverStatus.textContent = "Enter an image URL.";
+    return;
+  }
+  bookCoverUrlUse.disabled = true;
+  bookCoverStatus.textContent = "Downloading cover…";
+  try {
+    const response = await fetch("/web/audiobook-cover/url", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        library: Number(bookCoverDialog.dataset.library),
+        folder: Number(bookCoverDialog.dataset.folder || 0),
+        path: bookCoverDialog.dataset.path,
+        url
+      })
+    });
+    if (!response.ok) throw new Error("Could not download that cover.");
+    bookCoverDialog.close();
+    refreshPage();
+  } catch (error) {
+    bookCoverStatus.textContent = error.message || "Could not download that cover.";
+  } finally {
+    bookCoverUrlUse.disabled = false;
+  }
+};
+const uploadBookCover = async file => {
+  if (!file) return;
+  bookCoverStatus.textContent = "Saving cover…";
+  try {
+    const response = await fetch(
+      `/web/audiobook-cover?library=${encodeURIComponent(bookCoverDialog.dataset.library)}&folder=${encodeURIComponent(bookCoverDialog.dataset.folder || "0")}&path=${encodeURIComponent(bookCoverDialog.dataset.path)}`,
+      { method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: await file.arrayBuffer() }
+    );
+    if (!response.ok) throw new Error("Could not save that cover.");
+    bookCoverDialog.close();
+    refreshPage();
+  } catch (error) {
+    bookCoverStatus.textContent = error.message || "Could not save that cover.";
+  }
+};
+bindCardAction(bookCoverUrlUse, "click", saveBookCoverUrl);
+bindCardAction(bookCoverUrl, "keydown", event => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    saveBookCoverUrl();
+  }
+});
+bindCardAction(bookCoverUpload, "click", () => bookCoverUploadInput?.click());
+bindCardAction(bookCoverUploadInput, "change", () => uploadBookCover(bookCoverUploadInput.files?.[0]));
+bindCardAction(document.querySelector(".book-cover-close"), "click", () => bookCoverDialog.close());
+bindCardAction(bookCoverDialog, "click", event => {
+  if (event.target === bookCoverDialog) bookCoverDialog.close();
+});
+
 bindCardAction(document, "click", async event => {
   const menu = event.target.closest(".media-card-menu");
   if (menu && event.target.closest("summary")) {
@@ -7536,34 +8022,8 @@ bindCardAction(document, "click", async event => {
   const refreshMetadataButton = event.target.closest("[data-refresh-metadata]");
   if (setCoverButton) {
     event.preventDefault();
-    const card = setCoverButton.closest(".media-card");
-    const input = document.createElement("input");
-    input.type = "file";
-    input.accept = "image/png,image/jpeg,image/webp";
-    input.addEventListener("change", async () => {
-      const file = input.files?.[0];
-      if (!file || !card) return;
-      let status = setCoverButton.closest(".media-card-menu")?.querySelector(".media-card-menu-status");
-      try {
-        const response = await fetch(
-          `/web/audiobook-cover?library=${encodeURIComponent(card.dataset.library || "")}&folder=${encodeURIComponent(card.dataset.folder || "0")}&path=${encodeURIComponent(card.dataset.mediaPath || "")}`,
-          { method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: await file.arrayBuffer() }
-        );
-        if (!response.ok) throw new Error("Could not save cover image.");
-        if (window.__mplexRefresh) window.__mplexRefresh();
-        else window.location.reload();
-      } catch (error) {
-        if (!status) {
-          status = document.createElement("span");
-          status.className = "media-card-menu-status";
-          status.setAttribute("role", "status");
-          status.style.cssText = "padding:.45rem .65rem;color:#fca5a5;font-size:.72rem";
-          setCoverButton.closest(".media-card-menu-items")?.append(status);
-        }
-        status.textContent = error.message || "Could not save cover image.";
-      }
-    });
-    input.click();
+    document.querySelectorAll(".media-card-menu[open]").forEach(openMenu => openMenu.removeAttribute("open"));
+    openBookCoverDialog(setCoverButton);
     return;
   }
   if (refreshMetadataButton) {
@@ -8236,6 +8696,7 @@ fn audiobook_detail(
     <div class="audiobook-description">{description}</div>
     <dl class="audiobook-facts">{fact_markup}</dl>
     <button type="button" class="button-secondary audiobook-match" data-book-match>Match audiobook</button>
+    <button type="button" class="button-secondary audiobook-match" data-set-cover>Set cover image</button>
   </section>
 </article>"#,
         library = library,

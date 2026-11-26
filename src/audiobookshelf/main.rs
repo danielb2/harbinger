@@ -12,6 +12,8 @@ pub(crate) mod matching;
 pub(crate) mod providers;
 #[path = "scanner.rs"]
 pub(crate) mod scanner;
+#[path = "socket.rs"]
+pub(crate) mod socket;
 
 pub(crate) use api::router;
 
