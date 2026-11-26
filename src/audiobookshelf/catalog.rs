@@ -3,7 +3,7 @@ use crate::harbinger::{database_media_key, is_audiobook_library, is_hidden_path,
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -135,6 +135,8 @@ struct CacheEntry {
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+type AudioDurationCache = Mutex<HashMap<PathBuf, (u64, i64, Option<f64>)>>;
+static AUDIO_DURATION_CACHE: OnceLock<AudioDurationCache> = OnceLock::new();
 
 impl Catalog {
     pub(crate) fn load(state: &AppState) -> Catalog {
@@ -340,7 +342,12 @@ fn build_item(
                 mime: mime.to_owned(),
                 size: metadata.len(),
                 modified_ms: timestamp_ms(metadata.modified().ok()),
-                duration: sidecar_duration(&file.path).unwrap_or(0.0),
+                duration: audio_duration(
+                    &file.path,
+                    metadata.len(),
+                    timestamp_ms(metadata.modified().ok()),
+                )
+                .unwrap_or(0.0),
                 track_number,
                 disc_number,
             })
@@ -878,6 +885,34 @@ pub(crate) fn image_content_type(path: &Path) -> &'static str {
     }
 }
 
+fn audio_duration(path: &Path, size: u64, modified: i64) -> Option<f64> {
+    if let Some(duration) = sidecar_duration(path).filter(|duration| *duration > 0.0) {
+        return Some(duration);
+    }
+    let cache = AUDIO_DURATION_CACHE.get_or_init(Default::default);
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_size, cached_modified, duration)) = guard.get(path) {
+            if *cached_size == size && *cached_modified == modified {
+                return *duration;
+            }
+        }
+    }
+    let duration = vuio_media_info::inspect(path)
+        .ok()
+        .and_then(|report| {
+            report
+                .general
+                .duration_ms
+                .or_else(|| report.audios.iter().find_map(|audio| audio.duration_ms))
+        })
+        .map(|milliseconds| milliseconds / 1000.0)
+        .filter(|duration| duration.is_finite() && *duration > 0.0);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(path.to_path_buf(), (size, modified, duration));
+    }
+    duration
+}
+
 fn sidecar_duration(path: &Path) -> Option<f64> {
     let sidecar = path.parent()?.join(".hbgr/data.json");
     let raw = fs::read_to_string(sidecar).ok()?;
@@ -1030,6 +1065,24 @@ mod tests {
             read_book_metadata(&path).title.as_deref(),
             Some("Config Sidecar")
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn audio_duration_is_probed_when_no_sidecar_exists() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let root = catalog_temp_dir("audio-duration");
+        let path = root.join("track.mp3");
+        fs::write(&path, STANDARD.decode(EMBEDDED_COVER_MP3).unwrap()).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        let duration = audio_duration(
+            &path,
+            metadata.len(),
+            timestamp_ms(metadata.modified().ok()),
+        )
+        .expect("duration is probed");
+        assert!(duration > 0.0, "duration {duration}");
         fs::remove_dir_all(root).unwrap();
     }
 

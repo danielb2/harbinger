@@ -342,11 +342,7 @@ pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
             .iter()
             .map(|file| audio_file_json(file))
             .collect::<Vec<_>>());
-        media["tracks"] = json!(item
-            .audio_files
-            .iter()
-            .map(|file| audio_track_json(file, &item.id))
-            .collect::<Vec<_>>());
+        media["tracks"] = json!(audio_tracks_json(item));
         media["chapters"] = json!(chapters.iter().map(chapter_json).collect::<Vec<_>>());
     }
     let mut result = json!({
@@ -418,11 +414,7 @@ pub(crate) fn media_progress_json(
 
 pub(crate) fn playback_session_json(session: &PlaybackSession, item: &Item) -> Value {
     let now = chrono::Local::now();
-    let mut audio_tracks = item
-        .audio_files
-        .iter()
-        .map(|file| audio_track_json(file, &item.id))
-        .collect::<Vec<_>>();
+    let mut audio_tracks = audio_tracks_json(item);
     for track in &mut audio_tracks {
         let index = track["index"].as_u64().unwrap_or(1);
         track["contentUrl"] = json!(format!("/public/session/{}/track/{index}", session.id));
@@ -511,10 +503,22 @@ fn audio_file_json(file: &AudioFile) -> Value {
     })
 }
 
-fn audio_track_json(file: &AudioFile, item_id: &str) -> Value {
+fn audio_tracks_json(item: &Item) -> Vec<Value> {
+    let mut start_offset = 0.0;
+    item.audio_files
+        .iter()
+        .map(|file| {
+            let track = audio_track_json(file, &item.id, start_offset);
+            start_offset += file.duration.max(0.0);
+            track
+        })
+        .collect()
+}
+
+fn audio_track_json(file: &AudioFile, item_id: &str, start_offset: f64) -> Value {
     json!({
         "index": file.index,
-        "startOffset": 0,
+        "startOffset": start_offset,
         "duration": file.duration,
         "title": file.title,
         "contentUrl": format!("/api/items/{item_id}/file/{}", file.index),
@@ -634,4 +638,55 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audiobookshelf::catalog::BookMetadata;
+    use std::path::PathBuf;
+
+    fn audio_file(index: usize, duration: f64) -> AudioFile {
+        AudioFile {
+            index,
+            path: PathBuf::from(format!("/tmp/{index}.mp3")),
+            rel_path: format!("Book/{index}.mp3"),
+            title: format!("Track {index}"),
+            mime: "audio/mpeg".to_owned(),
+            size: 0,
+            modified_ms: 0,
+            duration,
+            track_number: None,
+            disc_number: None,
+        }
+    }
+
+    #[test]
+    fn audio_track_offsets_are_cumulative() {
+        let item = Item {
+            id: "li_test".to_owned(),
+            library_id: "lib_test".to_owned(),
+            folder_id: "fol_test".to_owned(),
+            path: PathBuf::from("/tmp/Book"),
+            rel_path: "Book".to_owned(),
+            is_file: false,
+            title: "Book".to_owned(),
+            author: "Author".to_owned(),
+            description: String::new(),
+            cover_path: None,
+            audio_files: vec![audio_file(1, 10.0), audio_file(2, 20.5)],
+            duration: 30.5,
+            size: 0,
+            added_ms: 0,
+            updated_ms: 0,
+            metadata: BookMetadata::default(),
+            metadata_present: true,
+        };
+        let tracks = audio_tracks_json(&item);
+        assert_eq!(tracks[0]["startOffset"], 0.0);
+        assert_eq!(tracks[0]["duration"], 10.0);
+        assert_eq!(tracks[1]["startOffset"], 10.0);
+        assert_eq!(tracks[1]["duration"], 20.5);
+        assert_eq!(item_json(&item, false)["media"]["duration"], 30.5);
+    }
 }
