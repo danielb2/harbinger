@@ -838,6 +838,72 @@ async fn folder_structure_scan_matches_abs_book_layout() {
 }
 
 #[tokio::test]
+async fn library_items_use_zero_based_pages_and_limit_zero_means_all() {
+    let fixture = fixture();
+    let library = fixture.root.join("library");
+    for name in [
+        "Paged One.m4b",
+        "Paged Two.m4b",
+        "Paged Three.m4b",
+        "Paged Four.m4b",
+    ] {
+        std::fs::write(library.join(name), b"audio").unwrap();
+    }
+    Catalog::clear_cache();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+
+    let first = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?limit=2&page=0&minified=1"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::OK);
+    let first: Value = serde_json::from_slice(&first.1).unwrap();
+    assert_eq!(first["page"], 0);
+    assert_eq!(first["results"].as_array().unwrap().len(), 2);
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?limit=2&page=1&minified=1"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(second.0, StatusCode::OK);
+    let second: Value = serde_json::from_slice(&second.1).unwrap();
+    assert_eq!(second["page"], 1);
+    assert_eq!(second["results"].as_array().unwrap().len(), 2);
+    assert_ne!(
+        first["results"][0]["id"], second["results"][0]["id"],
+        "page 1 must not repeat page 0"
+    );
+
+    let all = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?limit=0&minified=1"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(all.0, StatusCode::OK);
+    let all: Value = serde_json::from_slice(&all.1).unwrap();
+    assert_eq!(all["limit"], 0);
+    assert_eq!(
+        all["results"].as_array().unwrap().len(),
+        all["total"].as_u64().unwrap() as usize
+    );
+}
+
+#[tokio::test]
 async fn playback_streams_ranges_and_syncs_progress() {
     let fixture = fixture();
     let token = login(&fixture).await;

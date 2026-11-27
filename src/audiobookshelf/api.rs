@@ -382,13 +382,10 @@ async fn library_items(
     };
     let page = query_value(&uri, "page")
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(1);
+        .unwrap_or(0);
     let limit = query_value(&uri, "limit")
         .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(50)
-        .min(500);
+        .filter(|value| *value > 0);
     let sort_desc = query_value(&uri, "sortDesc")
         .or_else(|| query_value(&uri, "desc"))
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "True"));
@@ -413,8 +410,12 @@ async fn library_items(
         }
     });
     let total = items.len();
-    let start = (page - 1).saturating_mul(limit).min(total);
-    let end = start.saturating_add(limit).min(total);
+    let start = limit
+        .map(|limit| page.saturating_mul(limit).min(total))
+        .unwrap_or(0);
+    let end = limit
+        .map(|limit| start.saturating_add(limit).min(total))
+        .unwrap_or(total);
     let results = items[start..end]
         .iter()
         .map(|item| item_json(item, minified))
@@ -422,7 +423,7 @@ async fn library_items(
     Json(json!({
         "results": results,
         "total": total,
-        "limit": limit,
+        "limit": limit.unwrap_or(0),
         "page": page,
         "sortBy": sort_by,
         "sortDesc": sort_desc,
@@ -492,10 +493,21 @@ async fn cover(
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Some(path) = &item.cover_path else {
+    let source_index = catalog
+        .item_library(item)
+        .map(|library| library.source_index)
+        .unwrap_or_default();
+    let path = item
+        .cover_path
+        .clone()
+        .filter(|path| path.is_file())
+        .or_else(|| {
+            crate::audiobookshelf::catalog::ensure_embedded_cover(&state, source_index, item)
+        });
+    let Some(path) = path else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(bytes) = std::fs::read(path) else {
+    let Ok(bytes) = std::fs::read(&path) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let content_type = image_content_type(path.as_path());

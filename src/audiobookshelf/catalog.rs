@@ -135,6 +135,7 @@ struct CacheEntry {
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+static CATALOG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type AudioDurationCache = Mutex<HashMap<PathBuf, (u64, i64, Option<f64>)>>;
 static AUDIO_DURATION_CACHE: OnceLock<AudioDurationCache> = OnceLock::new();
 
@@ -161,6 +162,18 @@ impl Catalog {
             .collect::<Vec<_>>()
             .join(";");
         let cache = CATALOG_CACHE.get_or_init(Default::default);
+        if let Ok(guard) = cache.lock() {
+            if let Some(entry) = guard.as_ref() {
+                if entry.key == key && entry.created.elapsed() < CATALOG_TTL {
+                    return entry.catalog.clone();
+                }
+            }
+        }
+        let build_lock = CATALOG_BUILD_LOCK.get_or_init(Default::default);
+        let _build_guard = match build_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Ok(guard) = cache.lock() {
             if let Some(entry) = guard.as_ref() {
                 if entry.key == key && entry.created.elapsed() < CATALOG_TTL {
@@ -487,14 +500,6 @@ fn resolve_cover(
     if let Some(cover) = scanner::stored_cover(&fallback_store) {
         return Some(cover);
     }
-    if let Some(file) = book.audio_files.first() {
-        if let Some((bytes, extension)) = scanner::embedded_cover(&file.path) {
-            if let Some(cover) = write_stored_cover(&store, &bytes, extension) {
-                store_cover_reference(&store, &cover);
-                return Some(cover);
-            }
-        }
-    }
     let directory = if book.is_file {
         book.path.parent()?
     } else {
@@ -618,8 +623,24 @@ pub(crate) fn write_cover_file(directory: &Path, bytes: &[u8], extension: &str) 
     Some(path)
 }
 
-fn write_stored_cover(directory: &Path, bytes: &[u8], extension: &str) -> Option<PathBuf> {
-    write_cover_file(directory, bytes, extension)
+/// Extract an embedded cover on demand and cache it in the item sidecar. This
+/// deliberately stays out of catalog construction so browsing a large library
+/// never starts one FFmpeg process per book.
+pub(crate) fn ensure_embedded_cover(
+    state: &AppState,
+    source_index: usize,
+    item: &Item,
+) -> Option<PathBuf> {
+    let sidecar = item_sidecar_dir(state, source_index, item);
+    if let Some(cover) = scanner::stored_cover(&sidecar) {
+        return Some(cover);
+    }
+    let file = item.audio_files.first()?;
+    let (bytes, extension) = scanner::embedded_cover(&file.path)?;
+    let cover = write_cover_file(&sidecar, &bytes, extension)?;
+    store_cover_reference(&sidecar, &cover);
+    invalidate_cache();
+    Some(cover)
 }
 
 pub(crate) fn store_cover_reference(directory: &Path, cover: &Path) -> bool {
@@ -1087,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_cover_precedes_folder_images() {
+    fn folder_cover_is_used_and_embedded_cover_is_a_choice() {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
         if !ffmpeg_available() {
@@ -1114,16 +1135,11 @@ mod tests {
             None,
             None,
         )
-        .expect("embedded cover is extracted");
-        assert!(cover.starts_with(book_dir.join(".hbgr")));
-        let bytes = fs::read(&cover).unwrap();
-        assert_eq!(
-            bytes,
-            scanner::embedded_cover(&book_dir.join("Chapter 01.mp3"))
-                .unwrap()
-                .0
-        );
-        assert_ne!(bytes, b"folder-cover");
+        .expect("folder cover is used");
+        assert_eq!(cover, book_dir.join("cover.jpg"));
+        let embedded = scanner::embedded_cover(&book_dir.join("Chapter 01.mp3"))
+            .expect("embedded cover can still be extracted as a choice");
+        assert!(embedded.0.starts_with(&[0xFF, 0xD8, 0xFF]));
         fs::remove_dir_all(root).unwrap();
     }
 

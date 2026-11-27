@@ -1057,6 +1057,18 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             }
         }
     });
+    let has_audiobooks = state.config.lock().is_ok_and(|config| {
+        config
+            .libraries
+            .iter()
+            .any(|library| is_audiobook_library(&library.kind))
+    });
+    if has_audiobooks {
+        let warm_state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = crate::audiobookshelf::catalog::Catalog::load(&warm_state);
+        });
+    }
     let plex_app = build_plex_listener_app(state.clone());
     let web_app = build_web_listener_app(state.clone());
     let abs_app = crate::audiobookshelf::router(state.clone());

@@ -6759,7 +6759,7 @@ pub(crate) async fn web_artwork(
         let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
         let requested_canonical =
             std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
-        let cover = catalog
+        let item = catalog
             .libraries
             .iter()
             .find(|entry| entry.source_index == library_index)
@@ -6768,8 +6768,15 @@ pub(crate) async fn web_artwork(
                     std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
                         == requested_canonical
                 })
-            })
-            .and_then(|item| item.cover_path.clone());
+            });
+        let cover = item.and_then(|item| {
+            item.cover_path
+                .clone()
+                .filter(|path| path.is_file())
+                .or_else(|| {
+                    crate::audiobookshelf::catalog::ensure_embedded_cover(&s, library_index, item)
+                })
+        });
         if let Some(cover) = cover {
             if let Ok(bytes) = tokio::fs::read(&cover).await {
                 let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
@@ -8421,10 +8428,12 @@ fn audiobook_media_card(
             item.metadata.narrators.join(", ")
         )
     };
-    let cover_url = item
-        .cover_path
-        .as_ref()
-        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+    let cover_url = Some(artwork_url_with_folder(
+        relative,
+        Some(library),
+        folder,
+        "cover",
+    ));
     let (position, duration, watched) = audiobook_saved_progress(state, &item.id);
     let progress = if watched {
         1.0
@@ -8502,10 +8511,12 @@ fn audiobook_detail(
 ) -> String {
     let book = &item.metadata;
     let folder_index = folder.unwrap_or_default();
-    let cover_url = item
-        .cover_path
-        .as_ref()
-        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+    let cover_url = Some(artwork_url_with_folder(
+        relative,
+        Some(library),
+        folder,
+        "cover",
+    ));
     let cover = match cover_url.as_deref() {
         Some(url) => format!(
             r#"<img src="{}" alt="Cover for {}">"#,
