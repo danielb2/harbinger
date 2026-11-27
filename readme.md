@@ -120,5 +120,3 @@ Removing a folder from a library only detaches it. It does not delete the media 
 Harbinger is under active development. Plex Desktop and [Plezy](https://github.com/edde746/plezy) work well. Plex Web and Plex for Android have issues.
 
 The Audiobookshelf-compatible API covers library browsing, item detail, covers, playback, and progress. Audiobookshelf administration, uploads, podcasts, and e-reader features are not implemented.
-
-[`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work
