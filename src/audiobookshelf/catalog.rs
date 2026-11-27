@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -136,7 +136,7 @@ pub(crate) struct Catalog {
 struct CacheEntry {
     key: String,
     created: Instant,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
@@ -156,6 +156,9 @@ fn refresh_catalog_in_background(state: AppState) {
 }
 
 fn catalog_cache_key(config: &crate::harbinger::Config) -> String {
+    // Use the configured paths rather than canonicalizing them. This runs on
+    // every catalog read, including each cover request, and canonicalizing a
+    // network-mounted folder per request can stall the runtime.
     config
         .libraries
         .iter()
@@ -164,7 +167,7 @@ fn catalog_cache_key(config: &crate::harbinger::Config) -> String {
             let folders = library
                 .folders
                 .iter()
-                .map(|folder| canonical_or_absolute(folder).to_string_lossy().into_owned())
+                .map(|folder| folder.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join(",");
             format!("{}|{}|{}", library.name, library.kind, folders)
@@ -177,7 +180,7 @@ impl Catalog {
     /// Load the catalog without blocking the async runtime. Catalog construction
     /// walks media folders and probes files; doing that on a Tokio worker can
     /// starve the entire server for a large library.
-    pub(crate) async fn load_async(state: &AppState) -> Catalog {
+    pub(crate) async fn load_async(state: &AppState) -> Arc<Catalog> {
         let config = state
             .config
             .lock()
@@ -202,14 +205,14 @@ impl Catalog {
             Ok(catalog) => catalog,
             Err(error) => {
                 tracing::error!(error = %error, "audiobook catalog build task failed");
-                Catalog {
+                Arc::new(Catalog {
                     libraries: Vec::new(),
-                }
+                })
             }
         }
     }
 
-    pub(crate) fn load(state: &AppState) -> Catalog {
+    pub(crate) fn load(state: &AppState) -> Arc<Catalog> {
         let config = state
             .config
             .lock()
@@ -244,7 +247,7 @@ impl Catalog {
                 .unwrap_or(state.subtitle_checkpoints_dir.as_path())
                 .to_path_buf(),
         };
-        let catalog = build_catalog(&config.libraries, &cover_settings);
+        let catalog = Arc::new(build_catalog(&config.libraries, &cover_settings));
         if let Ok(mut guard) = cache.lock() {
             *guard = Some(CacheEntry {
                 key,
@@ -714,6 +717,24 @@ pub(crate) fn ensure_embedded_cover(
     store_cover_reference(&sidecar, &cover);
     invalidate_cache();
     Some(cover)
+}
+
+static EMBEDDED_COVER_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+/// Serialize embedded-cover extraction and keep the synchronous FFmpeg work off
+/// the async runtime. Opening a large audiobook library requests hundreds of
+/// covers at once, so doing this inline can stall the whole server.
+pub(crate) async fn ensure_embedded_cover_async(
+    state: AppState,
+    source_index: usize,
+    item: Item,
+) -> Option<PathBuf> {
+    let lock = EMBEDDED_COVER_LOCK.get_or_init(|| tokio::sync::Mutex::new(()));
+    let _guard = lock.lock().await;
+    tokio::task::spawn_blocking(move || ensure_embedded_cover(&state, source_index, &item))
+        .await
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn store_cover_reference(directory: &Path, cover: &Path) -> bool {

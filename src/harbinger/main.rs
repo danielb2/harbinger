@@ -86,7 +86,7 @@ use std::{
     path::{Component, PathBuf},
     process::Command,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -96,19 +96,22 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
 };
 use tokio_util::io::ReaderStream;
-use tower_http::trace::TraceLayer;
 use tracing::{
     debug,
     field::{Field, Visit},
-    info, warn, Event, Span, Subscriber,
+    info, warn, Event, Subscriber,
 };
 use tracing_subscriber::{
+    filter::EnvFilter,
     fmt::{
         format::{FormatEvent, FormatFields, Writer},
         time::FormatTime,
         FmtContext,
     },
+    layer::SubscriberExt,
     registry::LookupSpan,
+    reload,
+    util::SubscriberInitExt,
 };
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
@@ -724,9 +727,14 @@ where
 }
 
 const MAX_LOG_LINES: usize = 1000;
+/// The UI keeps a short live buffer; downloads retain a much longer history so
+/// a slow startup is still available after the live buffer has rolled over.
+const MAX_LOG_HISTORY_LINES: usize = 20_000;
 const MAX_LOG_LINE_BYTES: usize = 4096;
 static LOG_BUFFER: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+static LOG_HISTORY: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
 static LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static HTTP_REQUEST_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static LOG_BROADCAST: OnceLock<tokio::sync::broadcast::Sender<LogEvent>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -837,6 +845,14 @@ fn push_log_line(line: String) {
         logs.pop_front();
     }
     logs.push_back(line.clone());
+    let mut history = LOG_HISTORY
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if history.len() == MAX_LOG_HISTORY_LINES {
+        history.pop_front();
+    }
+    history.push_back(line.clone());
     let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = log_broadcast().send(LogEvent::Entry(sequence, line));
 }
@@ -847,12 +863,26 @@ pub(crate) fn clear_log_lines() {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
+    if let Some(history) = LOG_HISTORY.get() {
+        history
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
     let sequence = LOG_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1;
     let _ = log_broadcast().send(LogEvent::Cleared(sequence));
 }
 
 fn recent_log_lines() -> Vec<String> {
     LOG_BUFFER
+        .get_or_init(|| Mutex::new(VecDeque::new()))
+        .lock()
+        .map(|logs| logs.iter().cloned().collect())
+        .unwrap_or_default()
+}
+
+pub(crate) fn recent_log_history() -> Vec<String> {
+    LOG_HISTORY
         .get_or_init(|| Mutex::new(VecDeque::new()))
         .lock()
         .map(|logs| logs.iter().cloned().collect())
@@ -870,14 +900,45 @@ fn recent_log_snapshot() -> (u64, Vec<String>) {
     )
 }
 
+type LogFilterHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+static LOG_FILTER: OnceLock<LogFilterHandle> = OnceLock::new();
+static DEBUG_LOGGING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_log_level(level: &str) -> Result<(), String> {
+    let (level, debug_enabled) = match level.trim().to_ascii_lowercase().as_str() {
+        "debug" => ("debug", true),
+        "info" | "" => ("info", false),
+        _ => return Err("Unknown log level".to_owned()),
+    };
+    DEBUG_LOGGING.store(debug_enabled, Ordering::Relaxed);
+    let Some(handle) = LOG_FILTER.get() else {
+        return Ok(());
+    };
+    handle
+        .modify(|filter| *filter = EnvFilter::new(level))
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn debug_logging_enabled() -> bool {
+    DEBUG_LOGGING.load(Ordering::Relaxed)
+}
+
 pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(LogBufferMakeWriter)
-        .event_format(LogfmtFormat {
-            timer: LocalSecondTimer,
-        })
+    let (filter, handle) = reload::Layer::new(
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+    );
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(LogBufferMakeWriter)
+                .event_format(LogfmtFormat {
+                    timer: LocalSecondTimer,
+                }),
+        )
         .init();
+    let _ = LOG_FILTER.set(handle);
     if let Ok(build_date) = std::env::var("IMAGE_BUILD_DATE") {
         if build_date != "unknown" {
             info!(image_build_date = %build_date, "image build date");
@@ -906,6 +967,7 @@ fn config_path_in_dir(config_dir: &std::path::Path) -> Result<PathBuf, std::io::
 }
 
 async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>> {
+    let startup_started = Instant::now();
     let config_arg = args.config.unwrap_or_else(|| PathBuf::from("config"));
     let config_path = if config_arg
         .extension()
@@ -930,6 +992,9 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
     }
     let (db, machine_identifier) = open_database(&config_path)?;
     apply_stored_settings(&db, &mut config);
+    if let Some(level) = explicit_setting_from_db(&db, "log_level") {
+        let _ = set_log_level(&level);
+    }
     save_config(&config_path, &config)?;
     let server_name = db
         .query_row(
@@ -952,7 +1017,11 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
                 .to_path_buf()
         });
     let media = load_cached_media(&db, &config)?;
-    info!(items = media.len(), "loaded cached media inventory");
+    info!(
+        items = media.len(),
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        "loaded cached media inventory"
+    );
 
     let gdm_machine_identifier = machine_identifier.clone();
     let cert_dir = config_path
@@ -991,7 +1060,12 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
 
         plex_tls,
     };
+    let migration_started = Instant::now();
     migrate_legacy_database_metadata(&state);
+    info!(
+        elapsed_ms = migration_started.elapsed().as_millis(),
+        "startup metadata migration finished"
+    );
     let scan_state = state.clone();
     let inventory_scan_task = tokio::spawn(library_scan_scheduler(scan_state));
     let metrics_task = tokio::spawn(metrics::run_sampler(state.metrics.clone()));
@@ -1084,6 +1158,10 @@ async fn run_server(args: Args) -> Result<RunOutcome, Box<dyn std::error::Error>
             None
         }
     };
+    info!(
+        elapsed_ms = startup_started.elapsed().as_millis(),
+        "startup listeners are ready"
+    );
     let gdm_task = tokio::spawn(run_gdm_responder(
         gdm_machine_identifier,
         address.port(),
@@ -1223,61 +1301,120 @@ fn build_tagged_app(state: AppState, tag: &'static str) -> Router {
         .fallback(log_not_found)
         .layer(middleware::from_fn(plex_cors))
         .layer(middleware::from_fn_with_state(state.clone(), web_auth_gate))
-        .layer(
-            TraceLayer::new_for_http()
-                .on_request(move |request: &Request<Body>, _span: &Span| {
-                    if request.uri().path() == "/settings/logs/socket" {
-                        return;
-                    }
-                    let remote_ip = request
-                        .extensions()
-                        .get::<SocketAddr>()
-                        .map(|addr| addr.ip().to_string())
-                        .unwrap_or_else(|| "unknown".to_owned());
-                    let plex_product = request
-                        .headers()
-                        .get("X-Plex-Product")
-                        .and_then(|value| value.to_str().ok())
-                        .or_else(|| plex_query_value(request.uri(), "X-Plex-Product"));
-                    let client_profile = request
-                        .headers()
-                        .get("X-Plex-Client-Profile-Name")
-                        .and_then(|value| value.to_str().ok())
-                        .or_else(|| {
-                            plex_query_value(request.uri(), "X-Plex-Client-Profile-Name")
-                        });
-                    let client_platform = request
-                        .headers()
-                        .get("X-Plex-Platform")
-                        .and_then(|value| value.to_str().ok())
-                        .or_else(|| plex_query_value(request.uri(), "X-Plex-Platform"));
-                    info!(
-                        tag,
-                        event = "http_request",
-                        remote_ip = %remote_ip,
-                        method = %request.method(),
-                        path = %request.uri().path(),
-                        query = ?sanitized_query(request.uri()),
-                        accept = ?request.headers().get(header::ACCEPT),
-                        plex_product = ?plex_product,
-                        client_profile = ?client_profile,
-                        client_platform = ?client_platform,
-                        token_present = plex_request_token(request.headers(), request.uri()).is_some()
-                    );
-                })
-                .on_response(move |response: &Response, latency: Duration, _span: &Span| {
-                    if response.extensions().get::<SuppressHttpResponseLog>().is_some() {
-                        return;
-                    }
-                    info!(
-                        tag,
-                        event = "http_response",
-                        status = %response.status(),
-                        latency_ms = latency.as_millis()
-                    );
-                }),
-        )
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| async move {
+                log_http_exchange(tag, request, next).await
+            },
+        ))
         .with_state(state)
+}
+
+pub(crate) fn next_http_request_id() -> u64 {
+    HTTP_REQUEST_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next) -> Response {
+    if request.uri().path() == "/settings/logs/socket" {
+        return next.run(request).await;
+    }
+    let request_id = next_http_request_id();
+    let remote_ip = request
+        .extensions()
+        .get::<SocketAddr>()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let query = sanitized_query(request.uri());
+    let accept = request.headers().get(header::ACCEPT).cloned();
+    let plex_product = request
+        .headers()
+        .get("X-Plex-Product")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| plex_query_value(request.uri(), "X-Plex-Product"))
+        .map(str::to_owned);
+    let client_profile = request
+        .headers()
+        .get("X-Plex-Client-Profile-Name")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| plex_query_value(request.uri(), "X-Plex-Client-Profile-Name"))
+        .map(str::to_owned);
+    let client_platform = request
+        .headers()
+        .get("X-Plex-Platform")
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| plex_query_value(request.uri(), "X-Plex-Platform"))
+        .map(str::to_owned);
+    let token_present = plex_request_token(request.headers(), request.uri()).is_some();
+    // Artwork and favicon requests are high-volume and rarely useful at the
+    // default level; keep them available when debug logging is enabled.
+    let noisy = path == "/favicon.ico"
+        || path == "/web/artwork"
+        || path.starts_with("/web/artwork/")
+        || path.starts_with("/web/episode-artwork/");
+    if noisy {
+        debug!(
+            tag,
+            event = "http_request",
+            request_id,
+            remote_ip = %remote_ip,
+            method = %method,
+            path = %path,
+            query = ?query,
+            accept = ?accept,
+            plex_product = ?plex_product,
+            client_profile = ?client_profile,
+            client_platform = ?client_platform,
+            token_present
+        );
+    } else {
+        info!(
+            tag,
+            event = "http_request",
+            request_id,
+            remote_ip = %remote_ip,
+            method = %method,
+            path = %path,
+            query = ?query,
+            accept = ?accept,
+            plex_product = ?plex_product,
+            client_profile = ?client_profile,
+            client_platform = ?client_platform,
+            token_present
+        );
+    }
+    let started = Instant::now();
+    let response = next.run(request).await;
+    if response
+        .extensions()
+        .get::<SuppressHttpResponseLog>()
+        .is_none()
+    {
+        if noisy {
+            debug!(
+                tag,
+                event = "http_response",
+                request_id,
+                method = %method,
+                path = %path,
+                query = ?query,
+                status = response.status().as_u16(),
+                latency_ms = started.elapsed().as_millis()
+            );
+        } else {
+            info!(
+                tag,
+                event = "http_response",
+                request_id,
+                method = %method,
+                path = %path,
+                query = ?query,
+                status = response.status().as_u16(),
+                latency_ms = started.elapsed().as_millis()
+            );
+        }
+    }
+    response
 }
 
 #[derive(Clone, Copy)]
@@ -1631,6 +1768,10 @@ fn assign_media_ids(
     transaction.commit()
 }
 
+/// Give the web UI and Plex endpoints a chance to serve the cached inventory
+/// before the first automatic scan starts touching media storage.
+const AUTOMATIC_SCAN_STARTUP_GRACE: Duration = Duration::from_secs(30);
+
 fn library_scan_interval(library: &ConfigLibrary) -> Duration {
     let value = u64::from(library.scan_interval_value.max(1));
     let seconds = match library.scan_interval_unit.as_str() {
@@ -1768,7 +1909,15 @@ pub(crate) async fn scan_library_inventory(
         .into_iter()
         .flat_map(|(_, _, media)| media)
         .collect::<Vec<_>>();
-    sync_marker_sidecars(state, &scanned);
+    let sidecar_state = state.clone();
+    let sidecar_items = scanned.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        sync_marker_sidecars(&sidecar_state, &sidecar_items);
+    })
+    .await
+    {
+        warn!(library = %library.name, %error, "skip marker sidecar sync failed");
+    }
     let scanned_count = scanned.len();
     let belongs_to_library = |media: &Media| {
         roots.iter().any(|(configured_root, canonical_root)| {
@@ -1933,6 +2082,11 @@ pub(crate) async fn scan_library_inventory(
 }
 
 async fn library_scan_scheduler(state: AppState) {
+    info!(
+        delay_seconds = AUTOMATIC_SCAN_STARTUP_GRACE.as_secs(),
+        "automatic library scans deferred after startup"
+    );
+    tokio::time::sleep(AUTOMATIC_SCAN_STARTUP_GRACE).await;
     let mut ticker = tokio::time::interval(Duration::from_secs(5));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_scans = HashMap::<usize, tokio::time::Instant>::new();
@@ -9090,17 +9244,6 @@ fn current_sidecar_stamp(path: &std::path::Path) -> SidecarStamp {
     }
 }
 
-fn stored_sidecar_stamp(db: &Connection, path: &std::path::Path) -> SidecarStamp {
-    let Ok((modified_ns, len)) = db.query_row(
-        "SELECT modified_ns, len FROM marker_sidecar_state WHERE path = ?1",
-        [path.to_string_lossy().as_ref()],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-    ) else {
-        return SidecarStamp::Missing;
-    };
-    SidecarStamp::Present { modified_ns, len }
-}
-
 fn set_stored_sidecar_stamp(db: &Connection, path: &std::path::Path, stamp: SidecarStamp) {
     let path = path.to_string_lossy();
     let result = match stamp {
@@ -9132,16 +9275,6 @@ fn cached_current_stamp(
         .or_insert_with(|| current_sidecar_stamp(path))
 }
 
-fn cached_stored_stamp(
-    db: &Connection,
-    cache: &mut HashMap<PathBuf, SidecarStamp>,
-    path: &std::path::Path,
-) -> SidecarStamp {
-    *cache
-        .entry(path.to_path_buf())
-        .or_insert_with(|| stored_sidecar_stamp(db, path))
-}
-
 fn ensure_marker_sidecar<'a>(
     cache: &'a mut HashMap<PathBuf, markers::MarkerSidecar>,
     loaded: &mut HashSet<PathBuf>,
@@ -9157,15 +9290,38 @@ fn ensure_marker_sidecar<'a>(
 }
 
 pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
-    let Ok(db) = state.db.lock() else {
-        return;
+    // Load the stored stamps in one query and drop the database lock before
+    // touching the filesystem. Holding the lock across per-item sidecar stats
+    // blocks every request that needs the connection (including admin session
+    // checks) for as long as the media storage takes to answer.
+    let stored_stamps = match state.db.lock() {
+        Ok(db) => db
+            .prepare("SELECT path, modified_ns, len FROM marker_sidecar_state")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            PathBuf::from(row.get::<_, String>(0)?),
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .map(|rows| {
+                        rows.filter_map(Result::ok)
+                            .map(|(path, modified_ns, len)| {
+                                (path, SidecarStamp::Present { modified_ns, len })
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+            })
+            .unwrap_or_default(),
+        Err(_) => return,
     };
     let mut sidecars: HashMap<PathBuf, markers::MarkerSidecar> = HashMap::new();
     let mut loaded = HashSet::new();
     let mut season_fingerprints = SeasonFingerprintCache::new();
     let mut dirty = HashSet::new();
     let mut current_stamps = HashMap::<PathBuf, SidecarStamp>::new();
-    let mut stored_stamps = HashMap::<PathBuf, SidecarStamp>::new();
     let mut prepared = Vec::new();
     let mut imported_count = 0usize;
     let mut exported_count = 0usize;
@@ -9190,13 +9346,19 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
         let fallback = locations.fallback.clone();
         let primary_changed = !sidecar_stamp_unchanged(
             cached_current_stamp(&mut current_stamps, &path),
-            cached_stored_stamp(&db, &mut stored_stamps, &path),
+            stored_stamps
+                .get(&path)
+                .copied()
+                .unwrap_or(SidecarStamp::Missing),
             false,
         );
         let fallback_changed = fallback.as_ref().is_some_and(|(fallback_path, _)| {
             !sidecar_stamp_unchanged(
                 cached_current_stamp(&mut current_stamps, fallback_path),
-                cached_stored_stamp(&db, &mut stored_stamps, fallback_path),
+                stored_stamps
+                    .get(fallback_path)
+                    .copied()
+                    .unwrap_or(SidecarStamp::Missing),
                 true,
             )
         });
@@ -9210,6 +9372,10 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
         let root_path = root.clone();
         prepared.push((media, library_key, library, root_path, path, key, fallback));
     }
+
+    let Ok(db) = state.db.lock() else {
+        return;
+    };
 
     for (media, library_key, library, root, path, key, fallback) in &prepared {
         let imported = sidecars
@@ -9363,6 +9529,8 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
         }
     }
 
+    drop(db);
+
     let mut failed_writes = HashSet::new();
     for path in &dirty {
         if let Some(sidecar) = sidecars.get(path) {
@@ -9376,6 +9544,7 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
             }
         }
     }
+    let mut updated_stamps = Vec::new();
     for (path, stamp) in current_stamps {
         if failed_writes.contains(&path) {
             continue;
@@ -9385,7 +9554,23 @@ pub(crate) fn sync_marker_sidecars(state: &AppState, items: &[Media]) {
         } else {
             stamp
         };
-        set_stored_sidecar_stamp(&db, &path, stamp);
+        if stored_stamps
+            .get(&path)
+            .copied()
+            .unwrap_or(SidecarStamp::Missing)
+            == stamp
+        {
+            continue;
+        }
+        updated_stamps.push((path, stamp));
+    }
+    if !updated_stamps.is_empty() {
+        let Ok(db) = state.db.lock() else {
+            return;
+        };
+        for (path, stamp) in updated_stamps {
+            set_stored_sidecar_stamp(&db, &path, stamp);
+        }
     }
     info!(
         items = items.len(),
@@ -9688,7 +9873,7 @@ pub(crate) async fn detect_markers_for_library(
         return Ok(0);
     }
 
-    let mut groups = BTreeMap::<(String, u32), Media>::new();
+    let mut groups = BTreeMap::<(String, u32), (Media, HashSet<u32>)>::new();
     for media in media_snapshot(&state).iter() {
         let Some(root) = library
             .folders
@@ -9702,11 +9887,23 @@ pub(crate) async fn detect_markers_for_library(
         };
         groups
             .entry((tv_show_title(root, &media.path), info.season))
-            .or_insert_with(|| (*media).clone());
+            .or_insert_with(|| ((*media).clone(), HashSet::new()))
+            .1
+            .insert(info.episode);
     }
 
     let mut updated = 0usize;
-    for ((show, season), media) in groups {
+    for ((show, season), (media, episodes)) in groups {
+        if episodes.len() < 2 {
+            debug!(
+                library_id,
+                %show,
+                season,
+                episodes = episodes.len(),
+                "marker detection skipped; at least two episodes are required"
+            );
+            continue;
+        }
         for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {
             let key = format!("{}|{}|{}|{}", library_id, show, season, kind.as_str());
             let Some(_detection_activity) = begin_marker_detection_group(

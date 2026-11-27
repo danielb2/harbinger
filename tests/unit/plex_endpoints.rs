@@ -1104,6 +1104,11 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
     assert!(body.contains("id=\"settings-logs-copy\" type=\"button\""));
     assert!(body.contains("id=\"settings-logs-copy-status\""));
+    assert!(body.contains("id=\"settings-logs-download\""));
+    assert!(body.contains("href=\"/settings/logs/download\""));
+    assert!(body.contains("Download the recent log history as a text file"));
+    assert!(body.contains("action=\"/settings/logs/level\""));
+    assert!(body.contains("id=\"settings-logs-download\""));
     assert!(body.contains("id=\"settings-logs-clear\""));
     assert!(body.contains("action=\"/settings/logs/clear\""));
     assert!(body.contains("visibleLogLines.slice()"));
@@ -1170,6 +1175,122 @@ async fn settings_logs_can_clear_the_in_memory_buffer() {
     }
     assert!(cleared);
     assert!(!super::recent_log_snapshot().1.contains(&token));
+}
+
+#[tokio::test]
+async fn library_refresh_updates_only_changed_cards() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("window.document.visibilityState !== \"visible\""));
+    assert!(body.contains("currentCard.outerHTML !== nextCard.outerHTML"));
+    assert!(body.contains("currentCard.replaceWith(nextCard)"));
+    assert!(body.contains("const currentCards = [...current.children]"));
+}
+
+#[tokio::test]
+async fn settings_log_download_keeps_history_beyond_the_live_buffer() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    super::clear_log_lines();
+    let token = "event=history_marker";
+    super::push_log_line(token.to_owned());
+    for index in 0..super::MAX_LOG_LINES {
+        super::push_log_line(format!("event=history_filler_{index}"));
+    }
+    let (_, live) = super::recent_log_snapshot();
+    assert!(!live.contains(&token.to_owned()));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings/logs/download",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(token));
+}
+
+#[tokio::test]
+async fn settings_logs_can_toggle_debug_level() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let _ = super::set_log_level("info");
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/logs/level",
+        "level=debug",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION].to_str().unwrap(),
+        "/settings?tab=logs"
+    );
+    assert!(super::debug_logging_enabled());
+    let page = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?tab=logs",
+        Body::empty(),
+    )
+    .await;
+    let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Disable debug"));
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/logs/level",
+        "level=info",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(!super::debug_logging_enabled());
+}
+
+#[tokio::test]
+async fn settings_logs_can_be_downloaded_as_a_text_file() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let token = format!(
+        "event=download_log_test_{}",
+        NEXT_FIXTURE.load(Ordering::Relaxed)
+    );
+    super::push_log_line(token.clone());
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings/logs/download",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+        "no-store"
+    );
+    let disposition = response.headers()[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap();
+    assert!(disposition.starts_with("attachment; filename=\"harbinger-logs-"));
+    assert!(disposition.ends_with(".log\""));
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(&token));
+    assert!(body.ends_with('\n'));
 }
 
 #[tokio::test]

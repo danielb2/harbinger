@@ -112,6 +112,8 @@ pub(crate) fn web_routes() -> Router<AppState> {
         )
         .route("/settings/skipping", post(save_skip_settings))
         .route("/settings/logs/socket", get(settings_logs_socket))
+        .route("/settings/logs/download", get(download_logs))
+        .route("/settings/logs/level", post(update_log_level))
         .route("/settings/logs/clear", post(clear_logs))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
@@ -490,6 +492,54 @@ pub(crate) async fn favicon_handler() -> Response {
         FAVICON,
     )
         .into_response()
+}
+
+pub(crate) async fn download_logs() -> Response {
+    let mut body = recent_log_history().join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let filename = format!(
+        "harbinger-logs-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LogLevelForm {
+    level: String,
+}
+
+pub(crate) async fn update_log_level(
+    State(state): State<AppState>,
+    Form(form): Form<LogLevelForm>,
+) -> Response {
+    let level = match form.level.trim() {
+        "debug" => "debug",
+        "info" => "info",
+        _ => return settings_error("Unknown log level"),
+    };
+    if let Err(error) = set_log_level(level) {
+        return settings_error(&error);
+    }
+    store_explicit_setting(&state, "log_level", level);
+    let mut response = Redirect::to("/settings?tab=logs").into_response();
+    response.extensions_mut().insert(SuppressHttpResponseLog);
+    response
 }
 
 pub(crate) async fn clear_logs() -> Response {
@@ -2065,8 +2115,16 @@ pub(crate) async fn settings_page(
         } else {
             "<p id=\"settings-logs-empty\" class=\"note\" hidden>No log entries yet.</p>"
         };
+        let (next_level, level_label, level_title) = if debug_logging_enabled() {
+            ("info", "Disable debug", "Return logging to the info level")
+        } else {
+            ("debug", "Enable debug", "Show debug-level diagnostic logs")
+        };
+        let log_level_control = format!(
+            "<form method=\"post\" action=\"/settings/logs/level\" style=\"margin:0\"><input type=\"hidden\" name=\"level\" value=\"{next_level}\"><button class=\"button-secondary\" type=\"submit\" title=\"{level_title}\">{level_label}</button></form>"
+        );
         format!(
-            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><form method=\"post\" action=\"/settings/logs/clear\" style=\"margin:0\"><button class=\"button-secondary\" id=\"settings-logs-clear\" type=\"submit\" title=\"Clear the in-memory log buffer\">Clear log</button></form><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The live view keeps up to 1000 entries; downloads include up to 20000.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><a class=\"button-link button-secondary\" id=\"settings-logs-download\" href=\"/settings/logs/download\" download title=\"Download the recent log history as a text file\">Download log</a>{log_level_control}<form method=\"post\" action=\"/settings/logs/clear\" style=\"margin:0\"><button class=\"button-secondary\" id=\"settings-logs-clear\" type=\"submit\" title=\"Clear the in-memory log buffer\">Clear log</button></form><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
         )
     } else {
         String::new()
@@ -6216,6 +6274,7 @@ pub(crate) async fn web_client(
     let refreshing = false;
     async function refreshLibrary() {{
       if (refreshing) return;
+      if (window.document.visibilityState !== "visible") return;
       refreshing = true;
       try {{
         const response = await fetch(window.location.href, {{ cache: "no-store" }});
@@ -6237,7 +6296,18 @@ pub(crate) async fn web_client(
         const hasAudiobookPlayback = [...window.document.querySelectorAll(".audiobook-audio")]
           .some(audio => !audio.paused || audio.currentTime > 0);
         if (!hasPlaybackState && !hasPlayer && !hasAudiobookPlayback && current && next && current.innerHTML !== next.innerHTML) {{
-          current.replaceWith(next);
+          const currentCards = [...current.children];
+          const nextCards = [...next.children];
+          if (currentCards.length !== nextCards.length) {{
+            current.replaceWith(next);
+          }} else {{
+            nextCards.forEach((nextCard, index) => {{
+              const currentCard = currentCards[index];
+              if (currentCard && currentCard.outerHTML !== nextCard.outerHTML) {{
+                currentCard.replaceWith(nextCard);
+              }}
+            }});
+          }}
           window.__mplexSelectedVideo = null;
         }}
       }} catch (_) {{
@@ -6776,24 +6846,34 @@ pub(crate) async fn web_artwork(
         let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
         let requested_canonical =
             std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
+        let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+        let relative_string = relative.to_string_lossy();
         let item = catalog
             .libraries
             .iter()
             .find(|entry| entry.source_index == library_index)
             .and_then(|library| {
                 library.items.iter().find(|item| {
-                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                        == requested_canonical
+                    item.path == requested_path
+                        || item.path == requested_canonical
+                        || (item.rel_path == relative_string
+                            && item.path.starts_with(&root_canonical))
                 })
             });
-        let cover = item.and_then(|item| {
-            item.cover_path
-                .clone()
-                .filter(|path| path.is_file())
-                .or_else(|| {
-                    crate::audiobookshelf::catalog::ensure_embedded_cover(&s, library_index, item)
-                })
-        });
+        let Some(item) = item else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let cover = match item.cover_path.clone().filter(|path| path.is_file()) {
+            Some(cover) => Some(cover),
+            None => {
+                crate::audiobookshelf::catalog::ensure_embedded_cover_async(
+                    s.clone(),
+                    library_index,
+                    item.clone(),
+                )
+                .await
+            }
+        };
         if let Some(cover) = cover {
             if let Ok(bytes) = tokio::fs::read(&cover).await {
                 let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
