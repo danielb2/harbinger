@@ -4276,6 +4276,9 @@ pub(crate) fn plex_section_metadata(
         return metadata;
     };
     let media_index = media_snapshot(state);
+    let config_mode = config.metadata_storage == "config";
+    let mut group_metadata = HashMap::<PathBuf, Option<serde_json::Value>>::new();
+    let mut config_metadata = HashMap::<String, Option<serde_json::Value>>::new();
     for media in media_index
         .iter()
         .filter(|media| media_in_library(media, &library))
@@ -4289,10 +4292,37 @@ pub(crate) fn plex_section_metadata(
         };
         let group_path = metadata_group_path(root, &media.path, &library.kind);
         let media_key = database_media_key(section, &media.id);
-        let item = read_metadata_sidecar(state, &media_key, &group_path);
+        // Read each group sidecar once per section instead of once per
+        // episode. A 350-episode library otherwise performs hundreds of
+        // repeated file reads while building a single response.
+        let item = if config_mode {
+            config_metadata
+                .entry(media_key.clone())
+                .or_insert_with(|| read_config_metadata(state, &media_key))
+                .clone()
+                .or_else(|| {
+                    group_metadata
+                        .entry(group_path.clone())
+                        .or_insert_with(|| read_sidecar_metadata(&group_path))
+                        .clone()
+                })
+        } else {
+            group_metadata
+                .entry(group_path.clone())
+                .or_insert_with(|| read_sidecar_metadata(&group_path))
+                .clone()
+                .or_else(|| {
+                    config_metadata
+                        .entry(media_key.clone())
+                        .or_insert_with(|| read_config_metadata(state, &media_key))
+                        .clone()
+                })
+        };
+        let episode_details = (library.kind == "tv")
+            .then(|| read_tv_episode_sidecar_metadata(root, media))
+            .flatten();
         let Some(mut item) = item.or_else(|| {
-            (library.kind == "tv" && read_tv_episode_sidecar_metadata(root, media).is_some())
-                .then(|| serde_json::json!({}))
+            (library.kind == "tv" && episode_details.is_some()).then(|| serde_json::json!({}))
         }) else {
             continue;
         };
@@ -4310,7 +4340,7 @@ pub(crate) fn plex_section_metadata(
                     if let Some(title) = episode.episode_title {
                         object.insert("mplex_episode_title".to_owned(), serde_json::json!(title));
                     }
-                    if let Some(details) = read_tv_episode_sidecar_metadata(root, media) {
+                    if let Some(details) = episode_details {
                         object.insert("mplex_episode_metadata".to_owned(), details);
                     }
                 }

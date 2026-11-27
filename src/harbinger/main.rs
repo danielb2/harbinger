@@ -1985,9 +1985,16 @@ pub(crate) async fn scan_library_inventory(
         updated.extend(scanned);
         updated.extend(retained_media);
     }
+    // Only warm inspection for files discovered by this scan. Existing items
+    // are inspected lazily on demand, so a routine scan must not walk the
+    // whole library again.
     let warm_media = updated
         .iter()
-        .filter(|media| belongs_to_library(media) && media_type(&media.path).is_some())
+        .filter(|media| {
+            belongs_to_library(media)
+                && media_type(&media.path).is_some()
+                && newly_found.contains(&media.path)
+        })
         .cloned()
         .collect::<Vec<_>>();
     {
@@ -2025,22 +2032,24 @@ pub(crate) async fn scan_library_inventory(
         });
         let _ = state.plex_notifications.send(notification.to_string());
     }
-    let warm_state = state.clone();
-    let warm_library_name = library.name.clone();
-    tokio::spawn(async move {
-        let mut inspected = 0usize;
-        for media in &warm_media {
-            if ensure_media_info(&warm_state, media).await.is_some() {
-                inspected += 1;
+    if !warm_media.is_empty() {
+        let warm_state = state.clone();
+        let warm_library_name = library.name.clone();
+        tokio::spawn(async move {
+            let mut inspected = 0usize;
+            for media in &warm_media {
+                if ensure_media_info(&warm_state, media).await.is_some() {
+                    inspected += 1;
+                }
             }
-        }
-        debug!(
-            library = %warm_library_name,
-            items = warm_media.len(),
-            inspected,
-            "background media inspection warm-up completed"
-        );
-    });
+            debug!(
+                library = %warm_library_name,
+                items = warm_media.len(),
+                inspected,
+                "background media inspection warm-up completed"
+            );
+        });
+    }
     if is_metadata_library(&library.kind) {
         let assets_only = metadata_scan_assets_only(newly_found.len(), match_unmatched);
         if !assets_only {
@@ -5068,7 +5077,7 @@ fn parse_sidecar_metadata(contents: &str) -> Option<serde_json::Value> {
         .map(|metadata| serde_json::Value::Object(metadata.clone()))
 }
 
-fn read_sidecar_metadata(group_path: &std::path::Path) -> Option<serde_json::Value> {
+pub(crate) fn read_sidecar_metadata(group_path: &std::path::Path) -> Option<serde_json::Value> {
     std::fs::read_to_string(metadata_sidecar_info_path(group_path))
         .ok()
         .and_then(|contents| parse_sidecar_metadata(&contents))
@@ -5093,7 +5102,7 @@ pub(crate) fn config_metadata_sidecar_path(state: &AppState, media_key: &str) ->
         .join("data.json")
 }
 
-fn read_config_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
+pub(crate) fn read_config_metadata(state: &AppState, media_key: &str) -> Option<serde_json::Value> {
     let contents = std::fs::read_to_string(config_metadata_sidecar_path(state, media_key)).ok()?;
     parse_sidecar_metadata(&contents)
 }
@@ -7210,7 +7219,12 @@ pub(crate) async fn cached_media_info(
     {
         return Some(info);
     }
-    let info = sidecar_media_info(state, media)?;
+    let read_state = state.clone();
+    let read_media = media.clone();
+    let info = tokio::task::spawn_blocking(move || sidecar_media_info(&read_state, &read_media))
+        .await
+        .ok()
+        .flatten()?;
     store_media_info(state, media, info.clone());
     Some(info)
 }

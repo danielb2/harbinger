@@ -1,5 +1,6 @@
 use super::scanner::{self, BookFiles, ParsedBookPath};
 use crate::harbinger::{database_media_key, is_audiobook_library, is_hidden_path, AppState};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
@@ -143,7 +144,76 @@ static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
 static CATALOG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type AudioDurationCache = Mutex<HashMap<PathBuf, (u64, i64, Option<f64>)>>;
 static AUDIO_DURATION_CACHE: OnceLock<AudioDurationCache> = OnceLock::new();
+static AUDIO_DURATION_CACHE_LOADED: Mutex<Option<PathBuf>> = Mutex::new(None);
+static AUDIO_DURATION_CACHE_DIRTY: AtomicBool = AtomicBool::new(false);
 static CATALOG_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+#[derive(Serialize, Deserialize)]
+struct StoredAudioDuration {
+    size: u64,
+    modified: i64,
+    duration: Option<f64>,
+}
+
+fn audio_duration_cache_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("audio-durations.json")
+}
+
+fn load_audio_duration_cache(path: &Path) {
+    let already_loaded = AUDIO_DURATION_CACHE_LOADED
+        .lock()
+        .ok()
+        .is_some_and(|loaded| loaded.as_deref() == Some(path));
+    if already_loaded {
+        return;
+    }
+    let parsed = fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, StoredAudioDuration>>(&raw).ok())
+        .unwrap_or_default();
+    let cache = AUDIO_DURATION_CACHE.get_or_init(Default::default);
+    if let Ok(mut guard) = cache.lock() {
+        for (path, entry) in parsed {
+            guard.insert(
+                PathBuf::from(path),
+                (entry.size, entry.modified, entry.duration),
+            );
+        }
+    }
+    if let Ok(mut loaded) = AUDIO_DURATION_CACHE_LOADED.lock() {
+        *loaded = Some(path.to_path_buf());
+    }
+}
+
+fn save_audio_duration_cache(path: &Path) {
+    if !AUDIO_DURATION_CACHE_DIRTY.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let cache = AUDIO_DURATION_CACHE.get_or_init(Default::default);
+    let snapshot = match cache.lock() {
+        Ok(guard) => guard
+            .iter()
+            .map(|(path, (size, modified, duration))| {
+                (
+                    path.to_string_lossy().into_owned(),
+                    StoredAudioDuration {
+                        size: *size,
+                        modified: *modified,
+                        duration: *duration,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>(),
+        Err(_) => return,
+    };
+    let Ok(bytes) = serde_json::to_vec(&snapshot) else {
+        return;
+    };
+    let temporary = path.with_extension("json.tmp");
+    if fs::write(&temporary, bytes).is_ok() {
+        let _ = fs::rename(&temporary, path);
+    }
+}
 
 fn refresh_catalog_in_background(state: AppState) {
     if CATALOG_REFRESH_RUNNING.swap(true, Ordering::AcqRel) {
@@ -180,6 +250,44 @@ impl Catalog {
     /// Load the catalog without blocking the async runtime. Catalog construction
     /// walks media folders and probes files; doing that on a Tokio worker can
     /// starve the entire server for a large library.
+    /// Find an item by its library-relative path without canonicalizing every
+    /// item in the catalog. Direct path comparison is enough for the normal
+    /// case; fall back to the relative path and one canonicalized root.
+    pub(crate) fn find_item_path(
+        &self,
+        source_index: usize,
+        relative: &Path,
+        root: &Path,
+        requested: &Path,
+    ) -> Option<&Item> {
+        let requested_canonical =
+            fs::canonicalize(requested).unwrap_or_else(|_| requested.to_path_buf());
+        let root_canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let relative_string = relative.to_string_lossy();
+        self.libraries
+            .iter()
+            .find(|library| library.source_index == source_index)?
+            .items
+            .iter()
+            .find(|item| {
+                item.path == requested
+                    || item.path == requested_canonical
+                    || (item.rel_path == relative_string && item.path.starts_with(&root_canonical))
+            })
+    }
+
+    /// Return the cached catalog without starting a build. Use this on hot
+    /// paths such as artwork and dashboard counters, where waiting for a cold
+    /// catalog build would stall the request for minutes.
+    pub(crate) fn cached(state: &AppState) -> Option<Arc<Catalog>> {
+        let config = state.config.lock().ok()?.clone();
+        let key = catalog_cache_key(&config);
+        let cache = CATALOG_CACHE.get_or_init(Default::default);
+        let guard = cache.lock().ok()?;
+        let entry = guard.as_ref()?;
+        (entry.key == key).then(|| entry.catalog.clone())
+    }
+
     pub(crate) async fn load_async(state: &AppState) -> Arc<Catalog> {
         let config = state
             .config
@@ -247,7 +355,10 @@ impl Catalog {
                 .unwrap_or(state.subtitle_checkpoints_dir.as_path())
                 .to_path_buf(),
         };
+        let duration_cache = audio_duration_cache_path(&cover_settings.config_dir);
+        load_audio_duration_cache(&duration_cache);
         let catalog = Arc::new(build_catalog(&config.libraries, &cover_settings));
+        save_audio_duration_cache(&duration_cache);
         if let Ok(mut guard) = cache.lock() {
             *guard = Some(CacheEntry {
                 key,
@@ -1009,9 +1120,8 @@ pub(crate) fn image_content_type(path: &Path) -> &'static str {
 }
 
 fn audio_duration(path: &Path, size: u64, modified: i64) -> Option<f64> {
-    if let Some(duration) = sidecar_duration(path).filter(|duration| *duration > 0.0) {
-        return Some(duration);
-    }
+    // The in-memory/persisted cache is checked before the sidecar so routine
+    // catalog refreshes do not stat or read one sidecar per audio file.
     let cache = AUDIO_DURATION_CACHE.get_or_init(Default::default);
     if let Ok(guard) = cache.lock() {
         if let Some((cached_size, cached_modified, duration)) = guard.get(path) {
@@ -1019,6 +1129,13 @@ fn audio_duration(path: &Path, size: u64, modified: i64) -> Option<f64> {
                 return *duration;
             }
         }
+    }
+    if let Some(duration) = sidecar_duration(path).filter(|duration| *duration > 0.0) {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(path.to_path_buf(), (size, modified, Some(duration)));
+        }
+        AUDIO_DURATION_CACHE_DIRTY.store(true, Ordering::Release);
+        return Some(duration);
     }
     let duration = vuio_media_info::inspect(path)
         .ok()
@@ -1033,6 +1150,7 @@ fn audio_duration(path: &Path, size: u64, modified: i64) -> Option<f64> {
     if let Ok(mut guard) = cache.lock() {
         guard.insert(path.to_path_buf(), (size, modified, duration));
     }
+    AUDIO_DURATION_CACHE_DIRTY.store(true, Ordering::Release);
     duration
 }
 

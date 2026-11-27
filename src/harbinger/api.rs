@@ -879,15 +879,8 @@ async fn audiobook_media_key_for_web_path(
     let path = web_path(state, &root, relative).await.ok()?;
     let catalog = crate::audiobookshelf::catalog::Catalog::load_async(state).await;
     catalog
-        .libraries
-        .iter()
-        .find(|entry| entry.source_index == library.unwrap_or_default())?
-        .items
-        .iter()
-        .find_map(|item| {
-            let item_path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
-            (item_path == path).then(|| item.id.clone())
-        })
+        .find_item_path(library.unwrap_or_default(), relative, &root, &path)
+        .map(|item| item.id.clone())
 }
 
 pub(crate) async fn web_progress(
@@ -1091,19 +1084,8 @@ pub(crate) async fn set_audiobook_cover(
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    let requested_canonical =
-        std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
     let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&state).await;
-    let Some(item) = catalog
-        .libraries
-        .iter()
-        .find(|library| library.source_index == library_index)
-        .and_then(|library| {
-            library.items.iter().find(|item| {
-                std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                    == requested_canonical
-            })
-        })
+    let Some(item) = catalog.find_item_path(library_index, &relative, &root, &requested_path)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2656,17 +2638,9 @@ async fn audiobook_item_for_match(
 ) -> Option<crate::audiobookshelf::catalog::Item> {
     let root = selected_library_folder_root(state, Some(library_index), folder);
     let requested = web_path(state, &root, relative).await.ok()?;
-    let requested = std::fs::canonicalize(&requested).unwrap_or(requested);
     crate::audiobookshelf::catalog::Catalog::load_async(state)
         .await
-        .libraries
-        .iter()
-        .find(|library| library.source_index == library_index)?
-        .items
-        .iter()
-        .find(|item| {
-            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone()) == requested
-        })
+        .find_item_path(library_index, relative, &root, &requested)
         .cloned()
 }
 
@@ -4268,18 +4242,13 @@ pub(crate) async fn web_client(
     };
     let audiobook_detail_item = if audiobook_request {
         let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-        let requested_canonical =
-            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
         catalog
-            .libraries
-            .iter()
-            .find(|entry| Some(entry.source_index) == query.library)
-            .and_then(|library| {
-                library.items.iter().find(|item| {
-                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                        == requested_canonical
-                })
-            })
+            .find_item_path(
+                query.library.unwrap_or_default(),
+                &relative,
+                &library_root,
+                &requested_path,
+            )
             .cloned()
     } else {
         None
@@ -4757,10 +4726,7 @@ pub(crate) async fn web_client(
                 web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
             });
             let mut seen_paths = std::collections::HashSet::new();
-            media.retain(|item| {
-                let path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
-                seen_paths.insert(path)
-            });
+            media.retain(|item| seen_paths.insert(item.path.clone()));
             if is_audiobook_library(&library.kind) {
                 let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
                 if let Some(abs_library) = catalog
@@ -4768,32 +4734,31 @@ pub(crate) async fn web_client(
                     .iter()
                     .find(|entry| entry.source_index == library_index)
                 {
+                    let saved_progress = audiobook_progress_map(&s);
                     for item in &abs_library.items {
-                        let Some((folder_index, source_root, _)) = library
+                        let Some((folder_index, item_relative)) = abs_library
                             .folders
                             .iter()
                             .enumerate()
-                            .find_map(|(index, root)| {
-                                let canonical =
-                                    std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+                            .find_map(|(index, folder)| {
                                 item.path
-                                    .strip_prefix(&canonical)
+                                    .strip_prefix(std::path::Path::new(&folder.full_path))
                                     .ok()
-                                    .map(|path| (index, canonical, path.to_path_buf()))
+                                    .map(|path| (index, path.to_path_buf()))
                             })
                         else {
                             continue;
                         };
-                        let item_relative = item
-                            .path
-                            .strip_prefix(&source_root)
-                            .unwrap_or(std::path::Path::new(&item.rel_path));
+                        let progress = saved_progress
+                            .get(&item.id)
+                            .copied()
+                            .unwrap_or((0, None, false));
                         folder_cards.push_str(&audiobook_media_card(
-                            &s,
                             item,
                             &item_relative,
                             library_index,
                             (folder_index > 0).then_some(folder_index),
+                            progress,
                         ));
                     }
                 }
@@ -6844,22 +6809,7 @@ pub(crate) async fn web_artwork(
     };
     if is_audiobook_library(&library.kind) && kind == "cover" {
         let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-        let requested_canonical =
-            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
-        let root_canonical = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-        let relative_string = relative.to_string_lossy();
-        let item = catalog
-            .libraries
-            .iter()
-            .find(|entry| entry.source_index == library_index)
-            .and_then(|library| {
-                library.items.iter().find(|item| {
-                    item.path == requested_path
-                        || item.path == requested_canonical
-                        || (item.rel_path == relative_string
-                            && item.path.starts_with(&root_canonical))
-                })
-            });
+        let item = catalog.find_item_path(library_index, &relative, &root, &requested_path);
         let Some(item) = item else {
             return StatusCode::NOT_FOUND.into_response();
         };
@@ -8497,6 +8447,38 @@ fn audiobook_saved_progress(state: &AppState, item_id: &str) -> (i64, Option<i64
         .unwrap_or((0, None, false))
 }
 
+/// Load all saved progress for a library page in one query. Rendering a
+/// 700-book grid must not issue 700 individual database queries.
+fn audiobook_progress_map(state: &AppState) -> HashMap<String, (i64, Option<i64>, bool)> {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            let mut statement = db
+                .prepare(
+                    "SELECT media_key, position_ms, duration_ms, watched
+                       FROM watch_progress
+                      WHERE user_id = ?1",
+                )
+                .ok()?;
+            let rows = statement
+                .query_map([USER_ID], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, bool>(3)?,
+                        ),
+                    ))
+                })
+                .ok()?;
+            Some(rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default()
+}
+
 fn series_display_label(value: &str) -> String {
     let (name, sequence) = crate::audiobookshelf::scanner::split_series_label(value);
     match sequence {
@@ -8506,11 +8488,11 @@ fn series_display_label(value: &str) -> String {
 }
 
 fn audiobook_media_card(
-    state: &AppState,
     item: &crate::audiobookshelf::catalog::Item,
     relative: &std::path::Path,
     library: usize,
     folder: Option<usize>,
+    saved_progress: (i64, Option<i64>, bool),
 ) -> String {
     let folder_query = folder
         .map(|index| format!("folder={index}&"))
@@ -8543,7 +8525,7 @@ fn audiobook_media_card(
         folder,
         "cover",
     ));
-    let (position, duration, watched) = audiobook_saved_progress(state, &item.id);
+    let (position, duration, watched) = saved_progress;
     let progress = if watched {
         1.0
     } else {
@@ -9112,12 +9094,15 @@ pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
             }
         }
     }
-    let audiobooks = crate::audiobookshelf::catalog::Catalog::load_async(&state)
-        .await
-        .libraries
-        .iter()
-        .map(|library| library.items.len())
-        .sum::<usize>();
+    let audiobooks = crate::audiobookshelf::catalog::Catalog::cached(&state)
+        .map(|catalog| {
+            catalog
+                .libraries
+                .iter()
+                .map(|library| library.items.len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
     let (markers_total, markers_last_24h) = state
         .db
         .lock()
