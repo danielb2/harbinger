@@ -1,17 +1,18 @@
 <img src="./assets/logo.avif" width="100" alt="Logo">
 
-Harbinger is a self-hosted media server for organizing and streaming your personal video library. It scans folders on your computer or NAS, organizes movies and TV shows into libraries, and adds available metadata and artwork. You can browse and play supported media in its built-in web client or connect compatible Plex clients.
+Harbinger is a self-hosted media server for organizing and streaming your personal video and audiobook library. It scans folders on your computer or NAS, organizes movies, TV shows, and audiobooks into libraries, and adds available metadata and artwork. You can browse and play supported media in its built-in web client, connect compatible Plex clients, or connect Audiobookshelf apps to your audiobook libraries.
 
 Harbinger is an alternative, independent implementation of Plex Media Server. It is not affiliated with Plex, Inc. Harbinger is under active development: its supported media formats, playback options, and client compatibility are still limited. See [Current limitations](#current-limitations) for details.
 
 ## What you can do
 
 - Watch movies/tv media with [Plezy](https://github.com/edde746/plezy) or Plex desktop
-- Create movie, TV, and other libraries from folders on your server.
+- Listen to audiobooks with an Audiobookshelf app or the built-in web player, including chapters, playback speed, and saved progress.
+- Create movie, TV, audiobook, and other libraries from folders on your server.
 - Browse cover artwork and folders in the built-in web client.
-- Connect compatible Plex clients to your server.
+- Connect compatible Plex clients and Audiobookshelf apps to your server.
 - Scan libraries manually or on a schedule.
-- Match movie and TV titles with TMDB metadata.
+- Match movie and TV titles with TMDB metadata, and audiobooks with Audible, iTunes, Google Books, OpenLibrary, and FantLab.
 - Store matched metadata in the server database or beside your media files as portable sidecars.
 - Play supported files directly, with seeking and playback progress.
 - Use Plex Desktop for playback of supported H.264 Matroska media, including optional AAC audio.
@@ -25,9 +26,9 @@ Install Rust, then run:
 cargo run
 ```
 
-Harbinger reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, the Plex API listens on port `32400` and the Harbinger web client listens on port `4826`. At startup, it prints both addresses.
+Harbinger reads its settings from `./config/config.toml` and creates its state database in the same directory. By default, the Plex API listens on port `32400`, the Harbinger web client listens on port `4826`, and the Audiobookshelf-compatible API listens on port `13378`. At startup, it prints all three addresses.
 
-Open `http://<server>:4826/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
+Open `http://<server>:4826/` in a browser on your network. Use **Settings** to create a library and add a folder on the server. Choose **Audiobooks** as the content type for an audiobook library. Run **Scan all libraries** to index the files, or leave automatic scanning enabled.
 
 ### Reset the web admin password
 
@@ -53,6 +54,7 @@ services:
     ports:
       - "32400:32400"
       - "4826:4826"
+      - "13378:13378"
     volumes:
       - ./config:/config
       - ./media:/media:ro
@@ -62,7 +64,7 @@ services:
 Or run it directly without Compose:
 
 ```sh
-docker run --name harbinger -p 32400:32400 -p 4826:4826 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbinger:latest
+docker run --name harbinger -p 32400:32400 -p 4826:4826 -p 13378:13378 -v "./config:/config" -v "./media:/media:ro" ghcr.io/danielb2/harbinger:latest
 ```
 
 Open `http://localhost:4826/`. In **Settings**, add `/media` as a library folder.
@@ -83,14 +85,40 @@ http://<server>:32400
 
 Replace `<server>` with the hostname or IP address of the machine running Harbinger. You can link a Plex.tv account from Settings if the app needs account discovery.
 
+## Connect an Audiobookshelf app
+
+Harbinger includes an Audiobookshelf-compatible API for audiobook libraries. In an Audiobookshelf app, set the server address to:
+
+```text
+http://<server>:13378
+```
+
+Sign in with a Harbinger user account. The administrator account created for the web client works, and additional accounts can be added under **Settings → Users**. Audiobook libraries appear in the app as book libraries with covers, chapters, playback progress, and Continue Listening. Progress is shared with the built-in web player.
+
+## Audiobook libraries
+
+Create a library with the **Audiobooks** content type. Harbinger follows the Audiobookshelf book library layout:
+
+- `Author/Series/Book`
+- `Author/Book`
+- A book folder directly under the library root
+
+Audio files directly under the library root are treated as single-file books. `Disc`, `CD`, and `Disk` subfolders belong to their parent book. Folder names supply the title, author, series and sequence, publication year, narrator, and ASIN when present.
+
+Harbinger indexes MP3, M4A/M4B, AAC, FLAC, Ogg/Opus, WAV, WMA, and AIFF audio. A book's audio files become its chapters, and stored chapter metadata is used when available.
+
+Books without stored metadata are matched automatically during a scan against Audible (through Audnexus), iTunes, Google Books, OpenLibrary, and FantLab, with AudiobookCovers as a cover fallback. Automatic matching never overwrites existing metadata or a chosen cover. Use a book's menu to match it manually or to choose a cover from stored images, the embedded cover, images in the book folder, a URL, or an upload. Matched metadata and covers are stored in `.hbgr` folders beside the books, or under the config directory when metadata storage is set to config mode.
+
 ## Metadata and files
 
-TMDB matching is available for movie and TV libraries. Other libraries are not matched. To keep metadata with your media when moving it, select sidecar metadata storage; Harbinger stores it in `.harbinger` folders beside media files. Back up the `config` directory to keep server settings, identity, and database-backed state.
+TMDB matching is available for movie and TV libraries, and audiobooks use the provider matching described above. Other libraries are not matched. To keep metadata with your media when moving it, select sidecar metadata storage; Harbinger stores it in `.harbinger` folders beside media files. Audiobook metadata and covers use the `.hbgr` folders described above. Back up the `config` directory to keep server settings, identity, and database-backed state.
 
 Removing a folder from a library only detaches it. It does not delete the media files. Removing media from a folder is detected by a later scan.
 
 ## Current limitations
 
 Harbinger is under active development. Plex Desktop and [Plezy](https://github.com/edde746/plezy) work well. Plex Web and Plex for Android have issues.
+
+The Audiobookshelf-compatible API covers library browsing, item detail, covers, playback, and progress. Audiobookshelf administration, uploads, podcasts, and e-reader features are not implemented.
 
 [`ROADMAP.md`](ROADMAP.md) for the compatibility status and remaining work
