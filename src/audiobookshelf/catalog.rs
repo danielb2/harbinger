@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -54,6 +57,8 @@ pub(crate) struct BookMetadata {
     pub(crate) explicit: bool,
     pub(crate) abridged: bool,
     pub(crate) cover: Option<String>,
+    pub(crate) match_provider: Option<String>,
+    pub(crate) match_provider_id: Option<String>,
     pub(crate) chapters: Vec<BookChapter>,
 }
 
@@ -135,32 +140,95 @@ struct CacheEntry {
 }
 
 static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+static CATALOG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type AudioDurationCache = Mutex<HashMap<PathBuf, (u64, i64, Option<f64>)>>;
 static AUDIO_DURATION_CACHE: OnceLock<AudioDurationCache> = OnceLock::new();
+static CATALOG_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn refresh_catalog_in_background(state: AppState) {
+    if CATALOG_REFRESH_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let _ = Catalog::load(&state);
+        CATALOG_REFRESH_RUNNING.store(false, Ordering::Release);
+    });
+}
+
+fn catalog_cache_key(config: &crate::harbinger::Config) -> String {
+    config
+        .libraries
+        .iter()
+        .filter(|library| is_audiobook_library(&library.kind))
+        .map(|library| {
+            let folders = library
+                .folders
+                .iter()
+                .map(|folder| canonical_or_absolute(folder).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}|{}|{}", library.name, library.kind, folders)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
 
 impl Catalog {
+    /// Load the catalog without blocking the async runtime. Catalog construction
+    /// walks media folders and probes files; doing that on a Tokio worker can
+    /// starve the entire server for a large library.
+    pub(crate) async fn load_async(state: &AppState) -> Catalog {
+        let config = state
+            .config
+            .lock()
+            .map(|config| (*config).clone())
+            .unwrap_or_else(|poison| (*poison.into_inner()).clone());
+        let key = catalog_cache_key(&config);
+        let cache = CATALOG_CACHE.get_or_init(Default::default);
+        let cached = cache.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|entry| {
+                (entry.key == key)
+                    .then(|| (entry.catalog.clone(), entry.created.elapsed() < CATALOG_TTL))
+            })
+        });
+        if let Some((catalog, fresh)) = cached {
+            if !fresh {
+                refresh_catalog_in_background(state.clone());
+            }
+            return catalog;
+        }
+        let state = state.clone();
+        match tokio::task::spawn_blocking(move || Catalog::load(&state)).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                tracing::error!(error = %error, "audiobook catalog build task failed");
+                Catalog {
+                    libraries: Vec::new(),
+                }
+            }
+        }
+    }
+
     pub(crate) fn load(state: &AppState) -> Catalog {
         let config = state
             .config
             .lock()
             .map(|config| (*config).clone())
             .unwrap_or_else(|poison| (*poison.into_inner()).clone());
-        let key = config
-            .libraries
-            .iter()
-            .filter(|library| is_audiobook_library(&library.kind))
-            .map(|library| {
-                let folders = library
-                    .folders
-                    .iter()
-                    .map(|folder| canonical_or_absolute(folder).to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("{}|{}|{}", library.name, library.kind, folders)
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+        let key = catalog_cache_key(&config);
         let cache = CATALOG_CACHE.get_or_init(Default::default);
+        if let Ok(guard) = cache.lock() {
+            if let Some(entry) = guard.as_ref() {
+                if entry.key == key && entry.created.elapsed() < CATALOG_TTL {
+                    return entry.catalog.clone();
+                }
+            }
+        }
+        let build_lock = CATALOG_BUILD_LOCK.get_or_init(Default::default);
+        let _build_guard = match build_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if let Ok(guard) = cache.lock() {
             if let Some(entry) = guard.as_ref() {
                 if entry.key == key && entry.created.elapsed() < CATALOG_TTL {
@@ -249,7 +317,16 @@ fn build_catalog(
     config_libraries: &[crate::harbinger::ConfigLibrary],
     cover_settings: &CoverSettings,
 ) -> Catalog {
-    let libraries = config_libraries
+    let started = Instant::now();
+    let audiobook_libraries = config_libraries
+        .iter()
+        .filter(|library| is_audiobook_library(&library.kind))
+        .count();
+    tracing::info!(
+        libraries = audiobook_libraries,
+        "audiobook catalog build started"
+    );
+    let libraries: Vec<Library> = config_libraries
         .iter()
         .enumerate()
         .filter(|(_, configured)| is_audiobook_library(&configured.kind))
@@ -305,6 +382,15 @@ fn build_catalog(
             }
         })
         .collect();
+    let items = libraries
+        .iter()
+        .map(|library| library.items.len())
+        .sum::<usize>();
+    tracing::info!(
+        items,
+        elapsed_ms = started.elapsed().as_millis(),
+        "audiobook catalog build finished"
+    );
     Catalog { libraries }
 }
 
@@ -487,14 +573,6 @@ fn resolve_cover(
     if let Some(cover) = scanner::stored_cover(&fallback_store) {
         return Some(cover);
     }
-    if let Some(file) = book.audio_files.first() {
-        if let Some((bytes, extension)) = scanner::embedded_cover(&file.path) {
-            if let Some(cover) = write_stored_cover(&store, &bytes, extension) {
-                store_cover_reference(&store, &cover);
-                return Some(cover);
-            }
-        }
-    }
     let directory = if book.is_file {
         book.path.parent()?
     } else {
@@ -618,8 +696,24 @@ pub(crate) fn write_cover_file(directory: &Path, bytes: &[u8], extension: &str) 
     Some(path)
 }
 
-fn write_stored_cover(directory: &Path, bytes: &[u8], extension: &str) -> Option<PathBuf> {
-    write_cover_file(directory, bytes, extension)
+/// Extract an embedded cover on demand and cache it in the item sidecar. This
+/// deliberately stays out of catalog construction so browsing a large library
+/// never starts one FFmpeg process per book.
+pub(crate) fn ensure_embedded_cover(
+    state: &AppState,
+    source_index: usize,
+    item: &Item,
+) -> Option<PathBuf> {
+    let sidecar = item_sidecar_dir(state, source_index, item);
+    if let Some(cover) = scanner::stored_cover(&sidecar) {
+        return Some(cover);
+    }
+    let file = item.audio_files.first()?;
+    let (bytes, extension) = scanner::embedded_cover(&file.path)?;
+    let cover = write_cover_file(&sidecar, &bytes, extension)?;
+    store_cover_reference(&sidecar, &cover);
+    invalidate_cache();
+    Some(cover)
 }
 
 pub(crate) fn store_cover_reference(directory: &Path, cover: &Path) -> bool {
@@ -793,6 +887,14 @@ fn read_book_metadata(path: &Path) -> BookMetadata {
         cover: {
             let cover = string("cover");
             (!cover.trim().is_empty()).then_some(cover)
+        },
+        match_provider: {
+            let provider = string("matchProvider");
+            (!provider.trim().is_empty()).then_some(provider)
+        },
+        match_provider_id: {
+            let provider_id = string("matchProviderId");
+            (!provider_id.trim().is_empty()).then_some(provider_id)
         },
         chapters,
     }
@@ -1087,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_cover_precedes_folder_images() {
+    fn folder_cover_is_used_and_embedded_cover_is_a_choice() {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
 
         if !ffmpeg_available() {
@@ -1114,16 +1216,11 @@ mod tests {
             None,
             None,
         )
-        .expect("embedded cover is extracted");
-        assert!(cover.starts_with(book_dir.join(".hbgr")));
-        let bytes = fs::read(&cover).unwrap();
-        assert_eq!(
-            bytes,
-            scanner::embedded_cover(&book_dir.join("Chapter 01.mp3"))
-                .unwrap()
-                .0
-        );
-        assert_ne!(bytes, b"folder-cover");
+        .expect("folder cover is used");
+        assert_eq!(cover, book_dir.join("cover.jpg"));
+        let embedded = scanner::embedded_cover(&book_dir.join("Chapter 01.mp3"))
+            .expect("embedded cover can still be extracted as a choice");
+        assert!(embedded.0.starts_with(&[0xFF, 0xD8, 0xFF]));
         fs::remove_dir_all(root).unwrap();
     }
 

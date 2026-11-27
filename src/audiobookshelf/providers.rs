@@ -43,7 +43,9 @@ impl MatchedBook {
             "asin": self.asin,
             "language": self.language,
             "explicit": self.explicit,
-            "abridged": self.abridged
+            "abridged": self.abridged,
+            "matchProvider": (!self.provider.trim().is_empty()).then_some(self.provider.as_str()),
+            "matchProviderId": (!self.provider_id.trim().is_empty()).then_some(self.provider_id.as_str())
         })
     }
 }
@@ -76,6 +78,16 @@ impl Provider {
             "openlibrary" => Some(Self::OpenLibrary),
             "fantlab" => Some(Self::FantLab),
             _ => None,
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Self::Audible => "Audible",
+            Self::ITunes => "iTunes",
+            Self::GoogleBooks => "Google Books",
+            Self::OpenLibrary => "Open Library",
+            Self::FantLab => "FantLab",
         }
     }
 }

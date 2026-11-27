@@ -477,6 +477,8 @@ mod tests {
         assert_eq!(metadata["series"][0], "Sword of Truth #1");
         assert_eq!(metadata["publishedYear"], "1994");
         assert_eq!(metadata["authors"][0], "Terry Goodkind");
+        assert_eq!(metadata["matchProvider"], "audible");
+        assert_eq!(metadata["matchProviderId"], "B002V0QK4C");
     }
 
     #[test]

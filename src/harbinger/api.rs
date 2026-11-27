@@ -827,7 +827,7 @@ async fn audiobook_media_key_for_web_path(
     }
     let root = selected_library_folder_root(state, library, folder);
     let path = web_path(state, &root, relative).await.ok()?;
-    let catalog = crate::audiobookshelf::catalog::Catalog::load(state);
+    let catalog = crate::audiobookshelf::catalog::Catalog::load_async(state).await;
     catalog
         .libraries
         .iter()
@@ -1043,7 +1043,7 @@ pub(crate) async fn set_audiobook_cover(
     };
     let requested_canonical =
         std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
-    let catalog = crate::audiobookshelf::catalog::Catalog::load(&state);
+    let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&state).await;
     let Some(item) = catalog
         .libraries
         .iter()
@@ -2599,7 +2599,8 @@ async fn audiobook_item_for_match(
     let root = selected_library_folder_root(state, Some(library_index), folder);
     let requested = web_path(state, &root, relative).await.ok()?;
     let requested = std::fs::canonicalize(&requested).unwrap_or(requested);
-    crate::audiobookshelf::catalog::Catalog::load(state)
+    crate::audiobookshelf::catalog::Catalog::load_async(state)
+        .await
         .libraries
         .iter()
         .find(|library| library.source_index == library_index)?
@@ -4208,7 +4209,7 @@ pub(crate) async fn web_client(
         return StatusCode::NOT_FOUND.into_response();
     };
     let audiobook_detail_item = if audiobook_request {
-        let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+        let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
         let requested_canonical =
             std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
         catalog
@@ -4703,7 +4704,7 @@ pub(crate) async fn web_client(
                 seen_paths.insert(path)
             });
             if is_audiobook_library(&library.kind) {
-                let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+                let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
                 if let Some(abs_library) = catalog
                     .libraries
                     .iter()
@@ -5210,11 +5211,27 @@ pub(crate) async fn web_client(
     .audiobook-audio {{ display: none; }}
     .audiobook-info {{ margin-top: 1.25rem; padding: 1.25rem 1.5rem; border: 1px solid rgba(148,163,184,.18); border-radius: 1rem; background: #1f2937; }}
     .audiobook-info h3 {{ margin: 0 0 .5rem; }}
-    .audiobook-match {{ margin-top: 1rem; }}
+    .audiobook-actions {{ display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: 1rem; }}
+    .audiobook-match {{ margin-top: 0; }}
+    .audiobook-matched {{ flex: 0 1 auto; }}
+    .audiobook-matched[open] {{ flex-basis: 100%; }}
+    .audiobook-matched summary {{ display: inline-flex; align-items: center; gap: .35rem; padding: .4rem .6rem; border: 1px solid rgba(34,197,94,.45); border-radius: 999px; color: #86efac; background: rgba(22,101,52,.25); cursor: pointer; list-style: none; font-size: .8rem; }}
+    .audiobook-matched summary::-webkit-details-marker {{ display: none; }}
+    .audiobook-matched-check {{ color: #4ade80; font-weight: 700; }}
+    .audiobook-match-detail {{ margin-top: .6rem; padding: .75rem .9rem; border: 1px solid rgba(34,197,94,.3); border-radius: .6rem; background: rgba(22,101,52,.12); }}
+    .audiobook-match-detail dl {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .5rem .9rem; margin: 0; }}
+    .audiobook-match-detail dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
+    .audiobook-match-detail dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
     .audiobook-description {{ max-width: 85ch; margin: 0; color: #d7dde7; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }}
     .audiobook-facts {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: .75rem 1rem; margin: 1rem 0 0; padding-top: .85rem; border-top: 1px solid rgba(148,163,184,.18); }}
     .audiobook-fact dt {{ color: #9ca3af; font-size: .7rem; letter-spacing: .06em; text-transform: uppercase; }}
     .audiobook-fact dd {{ margin: .15rem 0 0; overflow-wrap: anywhere; }}
+    .audiobook-track-fact {{ grid-column: 1 / -1; }}
+    .audiobook-track-list summary {{ color: #93c5fd; cursor: pointer; }}
+    .audiobook-track-list ul {{ display: grid; gap: .3rem; margin: .5rem 0 0; padding: 0; list-style: none; }}
+    .audiobook-track-list li {{ display: flex; justify-content: space-between; gap: .75rem; padding: .35rem .5rem; border-radius: .35rem; background: rgba(15,23,42,.55); font-size: .8rem; }}
+    .audiobook-track-name {{ overflow-wrap: anywhere; }}
+    .audiobook-track-meta {{ color: #9ca3af; white-space: nowrap; font-variant-numeric: tabular-nums; }}
     @media (max-width: 640px) {{ .metadata-panel-layout {{ grid-template-columns: minmax(84px, 26vw) minmax(0, 1fr); gap: .8rem; }} .metadata-panel {{ padding: 1rem; }} }}
     @media (max-width: 600px) {{
       .audiobook-player-shell {{ padding: 1rem; }}
@@ -6756,10 +6773,10 @@ pub(crate) async fn web_artwork(
         return StatusCode::NOT_FOUND.into_response();
     };
     if is_audiobook_library(&library.kind) && kind == "cover" {
-        let catalog = crate::audiobookshelf::catalog::Catalog::load(&s);
+        let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
         let requested_canonical =
             std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
-        let cover = catalog
+        let item = catalog
             .libraries
             .iter()
             .find(|entry| entry.source_index == library_index)
@@ -6768,8 +6785,15 @@ pub(crate) async fn web_artwork(
                     std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
                         == requested_canonical
                 })
-            })
-            .and_then(|item| item.cover_path.clone());
+            });
+        let cover = item.and_then(|item| {
+            item.cover_path
+                .clone()
+                .filter(|path| path.is_file())
+                .or_else(|| {
+                    crate::audiobookshelf::catalog::ensure_embedded_cover(&s, library_index, item)
+                })
+        });
         if let Some(cover) = cover {
             if let Ok(bytes) = tokio::fs::read(&cover).await {
                 let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
@@ -8393,6 +8417,14 @@ fn audiobook_saved_progress(state: &AppState, item_id: &str) -> (i64, Option<i64
         .unwrap_or((0, None, false))
 }
 
+fn series_display_label(value: &str) -> String {
+    let (name, sequence) = crate::audiobookshelf::scanner::split_series_label(value);
+    match sequence {
+        Some(sequence) => format!("#{sequence} · {name}"),
+        None => name.to_owned(),
+    }
+}
+
 fn audiobook_media_card(
     state: &AppState,
     item: &crate::audiobookshelf::catalog::Item,
@@ -8407,24 +8439,30 @@ fn audiobook_media_card(
         "/?library={library}&{folder_query}path={}",
         url_encode(&relative.to_string_lossy())
     );
-    let track_label = format!(
-        "{} track{}",
-        item.audio_files.len(),
-        if item.audio_files.len() == 1 { "" } else { "s" }
-    );
-    let details = if item.metadata.narrators.is_empty() {
-        track_label
-    } else {
-        format!(
-            "{} · Narrated by {}",
-            track_label,
+    let mut details_parts = Vec::new();
+    if !item.metadata.series.is_empty() {
+        details_parts.push(
+            item.metadata
+                .series
+                .iter()
+                .map(|series| series_display_label(series))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
+    if !item.metadata.narrators.is_empty() {
+        details_parts.push(format!(
+            "Narrated by {}",
             item.metadata.narrators.join(", ")
-        )
-    };
-    let cover_url = item
-        .cover_path
-        .as_ref()
-        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+        ));
+    }
+    let details = details_parts.join(" · ");
+    let cover_url = Some(artwork_url_with_folder(
+        relative,
+        Some(library),
+        folder,
+        "cover",
+    ));
     let (position, duration, watched) = audiobook_saved_progress(state, &item.id);
     let progress = if watched {
         1.0
@@ -8439,7 +8477,7 @@ fn audiobook_media_card(
         &href,
         &item.title,
         Some(&item.author),
-        Some(&details),
+        (!details.is_empty()).then_some(details.as_str()),
         progress,
         watched.then_some(0),
         relative,
@@ -8502,10 +8540,12 @@ fn audiobook_detail(
 ) -> String {
     let book = &item.metadata;
     let folder_index = folder.unwrap_or_default();
-    let cover_url = item
-        .cover_path
-        .as_ref()
-        .map(|_| artwork_url_with_folder(relative, Some(library), folder, "cover"));
+    let cover_url = Some(artwork_url_with_folder(
+        relative,
+        Some(library),
+        folder,
+        "cover",
+    ));
     let cover = match cover_url.as_deref() {
         Some(url) => format!(
             r#"<img src="{}" alt="Cover for {}">"#,
@@ -8632,24 +8672,75 @@ fn audiobook_detail(
         facts.push(("ASIN", book.asin.clone()));
     }
     facts.push(("Length", clock_duration(duration)));
-    facts.push((
-        "Tracks",
-        format!(
-            "{} track{}",
-            item.audio_files.len(),
-            if item.audio_files.len() == 1 { "" } else { "s" }
-        ),
-    ));
-    let fact_markup = facts
-        .into_iter()
-        .map(|(label, value)| {
+    let track_count = item.audio_files.len();
+    let track_items = item
+        .audio_files
+        .iter()
+        .map(|file| {
+            let name = std::path::Path::new(&file.rel_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&file.title);
+            let mut meta = vec![clock_duration(file.duration)];
+            if file.size > 0 {
+                meta.push(format_file_size(file.size));
+            }
             format!(
-                r#"<div class="audiobook-fact"><dt>{}</dt><dd>{}</dd></div>"#,
-                html(label),
-                html(&value)
+                r#"<li><span class="audiobook-track-name">{}</span><span class="audiobook-track-meta">{}</span></li>"#,
+                html(name),
+                html(&meta.join(" · "))
             )
         })
         .collect::<String>();
+    let track_fact = format!(
+        r#"<div class="audiobook-fact audiobook-track-fact"><dt>Tracks</dt><dd><details class="audiobook-track-list"><summary>{} track{}</summary><ul>{}</ul></details></dd></div>"#,
+        track_count,
+        if track_count == 1 { "" } else { "s" },
+        track_items
+    );
+    let fact_markup = format!(
+        "{}{}",
+        facts
+            .into_iter()
+            .map(|(label, value)| {
+                format!(
+                    r#"<div class="audiobook-fact"><dt>{}</dt><dd>{}</dd></div>"#,
+                    html(label),
+                    html(&value)
+                )
+            })
+            .collect::<String>(),
+        track_fact
+    );
+    let matched_markup = book
+        .match_provider
+        .as_deref()
+        .filter(|provider| !provider.trim().is_empty())
+        .map(|provider| {
+            let provider_name = crate::audiobookshelf::providers::Provider::from_key(provider)
+                .map(|provider| provider.display_name())
+                .unwrap_or(provider);
+            let provider_id = book
+                .match_provider_id
+                .as_deref()
+                .filter(|provider_id| !provider_id.trim().is_empty())
+                .map(|provider_id| {
+                    format!(
+                        r#"<div><dt>Provider ID</dt><dd>{}</dd></div>"#,
+                        html(provider_id)
+                    )
+                })
+                .unwrap_or_default();
+            format!(
+                r#"<details class="audiobook-matched"><summary title="Matched from {}"><span class="audiobook-matched-check" aria-hidden="true">✓</span><span>Matched from {}</span></summary><div class="audiobook-match-detail"><dl><div><dt>Provider</dt><dd>{}</dd></div>{}<div><dt>Matched title</dt><dd>{}</dd></div></dl></div></details>"#,
+                html(provider_name),
+                html(provider_name),
+                html(provider_name),
+                provider_id,
+                html(book.title.as_deref().unwrap_or(&item.title))
+            )
+        })
+        .unwrap_or_default();
     let description_source = if item.description.trim().is_empty() {
         "No book description is available in metadata.json."
     } else {
@@ -8695,8 +8786,11 @@ fn audiobook_detail(
     <h3>About this book</h3>
     <div class="audiobook-description">{description}</div>
     <dl class="audiobook-facts">{fact_markup}</dl>
-    <button type="button" class="button-secondary audiobook-match" data-book-match>Match audiobook</button>
-    <button type="button" class="button-secondary audiobook-match" data-set-cover>Set cover image</button>
+    <div class="audiobook-actions">
+      <button type="button" class="button-secondary audiobook-match" data-book-match>Match audiobook</button>
+      {matched_markup}
+      <button type="button" class="button-secondary audiobook-match" data-set-cover>Set cover image</button>
+    </div>
   </section>
 </article>"#,
         library = library,
@@ -8714,6 +8808,7 @@ fn audiobook_detail(
         chapter_options = chapter_options,
         description = description,
         fact_markup = fact_markup,
+        matched_markup = matched_markup,
     )
 }
 
@@ -8727,6 +8822,20 @@ fn clock_duration(seconds: f64) -> String {
     } else {
         format!("{minutes}:{remainder:02}")
     }
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
 }
 
 fn web_media_type(path: &std::path::Path) -> Option<(&'static str, &'static str)> {
@@ -8886,12 +8995,49 @@ pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    let library_count = state
+    let config = state
         .config
         .lock()
-        .map(|config| config.libraries.len())
-        .unwrap_or_default();
-    let media_count = media_snapshot(&state).len();
+        .map(|config| config.clone())
+        .unwrap_or_else(|poison| poison.into_inner().clone());
+    let library_count = config.libraries.len();
+    let media = media_snapshot(&state);
+    let media_count = media.len();
+    let movies = config
+        .libraries
+        .iter()
+        .filter(|library| library.kind == "movie")
+        .map(|library| {
+            media
+                .iter()
+                .filter(|item| {
+                    library
+                        .folders
+                        .iter()
+                        .any(|root| item.path.starts_with(root))
+                })
+                .count()
+        })
+        .sum::<usize>();
+    let mut series = std::collections::BTreeSet::new();
+    for (index, library) in config
+        .libraries
+        .iter()
+        .enumerate()
+        .filter(|(_, library)| library.kind == "tv")
+    {
+        for root in &library.folders {
+            for item in media.iter().filter(|item| item.path.starts_with(root)) {
+                series.insert((index, tv_show_title(root, &item.path)));
+            }
+        }
+    }
+    let audiobooks = crate::audiobookshelf::catalog::Catalog::load_async(&state)
+        .await
+        .libraries
+        .iter()
+        .map(|library| library.items.len())
+        .sum::<usize>();
     let (markers_total, markers_last_24h) = state
         .db
         .lock()
@@ -8921,6 +9067,9 @@ pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
         "library": {
             "libraries": library_count,
             "media_items": media_count,
+            "audiobooks": audiobooks,
+            "movies": movies,
+            "series": series.len(),
             "markers_total": markers_total,
             "markers_last_24h": markers_last_24h,
         },
@@ -8955,7 +9104,7 @@ fn dashboard_markup() -> &'static str {
 </div>
 <div class="dashboard-grid">
 <section class="settings-card" aria-labelledby="activity-heading"><div class="section-heading"><div><h2 id="activity-heading">Active work</h2><p class="section-description">Library scans and intro/credit detection currently running.</p></div></div><table id="dashboard-activities-table"><thead><tr><th>Type</th><th>Item</th><th>Location</th><th>Elapsed</th></tr></thead><tbody id="dashboard-activities-body"></tbody></table><p id="dashboard-activities-empty" class="empty-note">No active scans or detection tasks.</p></section>
-<section class="settings-card" aria-labelledby="library-heading"><div class="section-heading"><div><h2 id="library-heading">Library</h2><p class="section-description">Configured content and stored skip markers.</p></div></div><dl class="stat-list"><div class="stat-row"><dt>Libraries</dt><dd id="dashboard-library-count">—</dd></div><div class="stat-row"><dt>Media items</dt><dd id="dashboard-media-count">—</dd></div><div class="stat-row"><dt>Stored markers</dt><dd id="dashboard-marker-count">—</dd></div><div class="stat-row"><dt>Markers added in 24h</dt><dd id="dashboard-marker-recent">—</dd></div><div class="stat-row"><dt>Last sample</dt><dd id="dashboard-updated">—</dd></div></dl></section>
+<section class="settings-card" aria-labelledby="library-heading"><div class="section-heading"><div><h2 id="library-heading">Library</h2><p class="section-description">Configured content and stored skip markers.</p></div></div><dl class="stat-list"><div class="stat-row"><dt>Libraries</dt><dd id="dashboard-library-count">—</dd></div><div class="stat-row"><dt>Audiobooks</dt><dd id="dashboard-audiobook-count">—</dd></div><div class="stat-row"><dt>Movies</dt><dd id="dashboard-movie-count">—</dd></div><div class="stat-row"><dt>TV series</dt><dd id="dashboard-series-count">—</dd></div><div class="stat-row"><dt>Media items</dt><dd id="dashboard-media-count">—</dd></div><div class="stat-row"><dt>Stored markers</dt><dd id="dashboard-marker-count">—</dd></div><div class="stat-row"><dt>Markers added in 24h</dt><dd id="dashboard-marker-recent">—</dd></div><div class="stat-row"><dt>Last sample</dt><dd id="dashboard-updated">—</dd></div></dl></section>
 </div>
 <section class="settings-card" aria-labelledby="disks-heading"><div class="section-heading"><div><h2 id="disks-heading">Filesystems</h2><p class="section-description">Capacity of mounted disks visible to Harbinger.</p></div></div><table id="dashboard-disks-table"><thead><tr><th>Disk</th><th>Mount</th><th>Used</th><th>Capacity</th></tr></thead><tbody id="dashboard-disks-body"></tbody></table><p id="dashboard-disks-empty" class="empty-note">No filesystem information is available.</p></section>
 </div>
@@ -9080,6 +9229,9 @@ fn dashboard_script() -> &'static str {
     setText("#dashboard-network-summary", `↓ ${formatRate(current.network_received_bytes_per_sec)} · ↑ ${formatRate(current.network_transmitted_bytes_per_sec)}`);
     setText("#dashboard-disk-summary", `↓ ${formatRate(current.disk_read_bytes_per_sec)} · ↑ ${formatRate(current.disk_write_bytes_per_sec)}`);
     setText("#dashboard-library-count", String(library.libraries ?? 0));
+    setText("#dashboard-audiobook-count", String(library.audiobooks ?? 0));
+    setText("#dashboard-movie-count", String(library.movies ?? 0));
+    setText("#dashboard-series-count", String(library.series ?? 0));
     setText("#dashboard-media-count", String(library.media_items ?? 0));
     setText("#dashboard-marker-count", String(library.markers_total ?? 0));
     setText("#dashboard-marker-recent", String(library.markers_last_24h ?? 0));

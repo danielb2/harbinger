@@ -301,6 +301,22 @@ pub(crate) fn series_label(name: &str, sequence: Option<&str>) -> String {
     }
 }
 
+/// Split an Audiobookshelf series label (`"Series #1"`) into its name and
+/// sequence, ignoring whitespace-only sequences.
+pub(crate) fn split_series_label(value: &str) -> (&str, Option<&str>) {
+    if let Some(index) = value.rfind(" #") {
+        let sequence = &value[index + 2..];
+        if !sequence.is_empty()
+            && sequence
+                .chars()
+                .all(|character| !character.is_whitespace() && character != '#')
+        {
+            return (value[..index].trim_end(), Some(sequence));
+        }
+    }
+    (value, None)
+}
+
 pub(crate) fn file_stem(path: &Path) -> String {
     path.file_stem()
         .and_then(|name| name.to_str())
@@ -781,6 +797,24 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn splits_series_labels_into_name_and_index() {
+        assert_eq!(
+            split_series_label("Stormbound #2"),
+            ("Stormbound", Some("2"))
+        );
+        assert_eq!(
+            split_series_label("Stormbound #2.5"),
+            ("Stormbound", Some("2.5"))
+        );
+        assert_eq!(split_series_label("Stormbound"), ("Stormbound", None));
+        assert_eq!(split_series_label("Stormbound #"), ("Stormbound #", None));
+        assert_eq!(
+            split_series_label("Stormbound # 2"),
+            ("Stormbound # 2", None)
+        );
     }
 
     #[test]

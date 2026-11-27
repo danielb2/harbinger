@@ -2535,7 +2535,7 @@ async fn web_library_root_shows_audiobook_cards() {
     let body = body_string(response).await;
     assert!(body.contains("Book One"));
     assert!(body.contains("Author One"));
-    assert!(body.contains("1 track"));
+    assert!(!body.contains("1 track"));
     assert!(body.contains(&format!(
         "path={}",
         super::url_encode("Author One/Book One")
@@ -2566,6 +2566,22 @@ async fn web_library_root_shows_audiobook_cards() {
     assert!(body.contains(".media-card-book .media-card-cover,.media-card-book .media-card-cover img{aspect-ratio:1/1}"));
     assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
+}
+
+#[tokio::test]
+async fn web_audiobook_card_shows_series_instead_of_track_count() {
+    let fixture = audiobook_web_fixture_with_metadata(
+        "audiobooks-web-card-series",
+        "A harbor town keeps a dangerous secret.",
+    );
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains("#2 · Stormbound"));
+    assert!(body.contains("title=\"#2 · Stormbound · Narrated by Iris Quinn\""));
+    assert!(body.contains("Narrated by Iris Quinn"));
+    assert!(!body.contains("Stormbound #2"));
+    assert!(!body.contains("1 track"));
 }
 
 #[tokio::test]
@@ -2649,6 +2665,9 @@ async fn web_library_book_folder_renders_audiobook_player() {
     assert!(body.contains("input, select, textarea { font-size: 16px; }"));
     assert!(body.contains("About this book"));
     assert!(body.contains("Chapter 01"));
+    assert!(body.contains(r#"<details class="audiobook-track-list"><summary>1 track</summary>"#));
+    assert!(body.contains(r#"<span class="audiobook-track-name">Chapter 01.m4b</span>"#));
+    assert!(body.contains("16 B"));
     assert!(body.contains(
         "/web/stream?library=0&amp;folder=0&amp;path=Author%20One%2FBook%20One%2FChapter%2001.m4b"
     ));
@@ -2835,6 +2854,66 @@ async fn web_audiobook_detail_uses_abs_metadata_and_saves_progress() {
     assert!(resumed.contains(r#"window.addEventListener("pagehide", flushProgress)"#));
     assert!(resumed.contains("keepalive: true"));
     assert!(resumed.contains("if (hasStarted && !pageClosing) save(false)"));
+}
+
+#[tokio::test]
+async fn web_audiobook_detail_shows_provider_match_indicator() {
+    let fixture = audiobook_web_fixture("audiobooks-web-match-indicator");
+    let book_dir = fixture
+        .root
+        .join("audiobooks-web-match-indicator")
+        .join("Author One")
+        .join("Book One");
+    std::fs::write(
+        book_dir.join("metadata.json"),
+        serde_json::json!({
+            "title": "The Silent Harbor",
+            "authors": ["Nora Vale"],
+            "matchProvider": "audible",
+            "matchProviderId": "B002V0QK4C"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/?library=0&path={}",
+            super::url_encode("Author One/Book One")
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(body.contains(r#"<details class="audiobook-matched">"#));
+    assert!(body.contains(r#"class="audiobook-matched-check""#));
+    assert!(body.contains(">✓</span>"));
+    assert!(body.contains("Matched from Audible"));
+    assert!(body.contains("B002V0QK4C"));
+    assert!(body.contains("<dt>Matched title</dt><dd>The Silent Harbor</dd>"));
+}
+
+#[tokio::test]
+async fn web_audiobook_detail_hides_match_indicator_without_provider() {
+    let fixture = audiobook_web_fixture("audiobooks-web-no-match-indicator");
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        &format!(
+            "/?library=0&path={}",
+            super::url_encode("Author One/Book One")
+        ),
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_string(response).await;
+    assert!(!body.contains(r#"<details class="audiobook-matched">"#));
+    assert!(!body.contains("Matched from"));
 }
 
 #[tokio::test]
@@ -6170,7 +6249,9 @@ async fn tv_season_navigation_renders_episode_cover_cards() {
     assert!(body.contains("Cover for Pilot"));
     assert!(body.contains("class=\"media-card-title\" title=\"Pilot\""));
     assert!(body.contains("class=\"media-card-subtitle\">S1 · E1</span>"));
-    assert!(body.contains("class=\"media-card-details\">Example Show</span>"));
+    assert!(
+        body.contains("class=\"media-card-details\" title=\"Example Show\">Example Show</span>")
+    );
     assert!(body.contains(
         "data-watch-scope=\"item\" data-watch-key=\"Example Show/Season 01/Example.Show.S01E01.Pilot.mkv\""
     ));
@@ -7272,7 +7353,7 @@ fn media_cards_use_the_selected_media_cover_and_path() {
     assert!(tv_card.contains(
         "class=\"media-card-title\" title=\"Example Show\" style=\"height:auto;margin:0;white-space:nowrap;text-overflow:ellipsis\">Example Show</span>"
     ));
-    assert!(tv_card.contains("class=\"media-card-details\">S2 · E4</span>"));
+    assert!(tv_card.contains("class=\"media-card-details\" title=\"S2 · E4\">S2 · E4</span>"));
     assert!(tv_card.contains("class=\"media-card media-card-tv\""));
     assert!(tv_card.contains("class=\"media-card-progress\""));
 
