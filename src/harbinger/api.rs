@@ -4728,39 +4728,44 @@ pub(crate) async fn web_client(
             let mut seen_paths = std::collections::HashSet::new();
             media.retain(|item| seen_paths.insert(item.path.clone()));
             if is_audiobook_library(&library.kind) {
-                let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-                if let Some(abs_library) = catalog
-                    .libraries
-                    .iter()
-                    .find(|entry| entry.source_index == library_index)
-                {
-                    let saved_progress = audiobook_progress_map(&s);
-                    for item in &abs_library.items {
-                        let Some((folder_index, item_relative)) = abs_library
-                            .folders
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, folder)| {
-                                item.path
-                                    .strip_prefix(std::path::Path::new(&folder.full_path))
-                                    .ok()
-                                    .map(|path| (index, path.to_path_buf()))
-                            })
-                        else {
-                            continue;
-                        };
-                        let progress = saved_progress
-                            .get(&item.id)
-                            .copied()
-                            .unwrap_or((0, None, false));
-                        folder_cards.push_str(&audiobook_media_card(
-                            item,
-                            &item_relative,
-                            library_index,
-                            (folder_index > 0).then_some(folder_index),
-                            progress,
-                        ));
+                if let Some(catalog) = crate::audiobookshelf::catalog::Catalog::cached(&s) {
+                    if let Some(abs_library) = catalog
+                        .libraries
+                        .iter()
+                        .find(|entry| entry.source_index == library_index)
+                    {
+                        let saved_progress = audiobook_progress_map(&s);
+                        for item in &abs_library.items {
+                            let Some((folder_index, item_relative)) =
+                                abs_library.folders.iter().enumerate().find_map(
+                                    |(index, folder)| {
+                                        item.path
+                                            .strip_prefix(std::path::Path::new(&folder.full_path))
+                                            .ok()
+                                            .map(|path| (index, path.to_path_buf()))
+                                    },
+                                )
+                            else {
+                                continue;
+                            };
+                            let progress = saved_progress
+                                .get(&item.id)
+                                .copied()
+                                .unwrap_or((0, None, false));
+                            folder_cards.push_str(&audiobook_media_card(
+                                item,
+                                &item_relative,
+                                library_index,
+                                (folder_index > 0).then_some(folder_index),
+                                progress,
+                            ));
+                        }
                     }
+                } else {
+                    crate::audiobookshelf::catalog::refresh_catalog_in_background(s.clone());
+                    folder_cards.push_str(
+                        "<p class=\"note\">Preparing the audiobook catalog. This page will refresh automatically.</p>",
+                    );
                 }
             } else if library.kind == "tv" {
                 let mut shows =
@@ -6816,18 +6821,23 @@ pub(crate) async fn web_artwork(
         let cover = match item.cover_path.clone().filter(|path| path.is_file()) {
             Some(cover) => Some(cover),
             None => {
-                crate::audiobookshelf::catalog::ensure_embedded_cover_async(
+                crate::audiobookshelf::catalog::spawn_embedded_cover_extraction(
                     s.clone(),
                     library_index,
                     item.clone(),
-                )
-                .await
+                );
+                None
             }
         };
         if let Some(cover) = cover {
             if let Ok(bytes) = tokio::fs::read(&cover).await {
                 let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
-                return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
+                let cache_seconds = if query.version.is_some() {
+                    31_536_000
+                } else {
+                    300
+                };
+                return image_response(content_type, bytes, cache_seconds);
             }
         }
         return StatusCode::NOT_FOUND.into_response();
@@ -6916,7 +6926,7 @@ pub(crate) async fn web_episode_artwork(
         .is_ok_and(|config| config.metadata_storage == "media");
     if let Some(path) = tv_episode_artwork_path(&state, library_key, root, &media, sidecar_mode) {
         if let Ok(bytes) = tokio::fs::read(path).await {
-            return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+            return image_response("image/jpeg", bytes, 300);
         }
     }
     plex_artwork(&state, &id, "cover.jpg").await
@@ -6956,6 +6966,20 @@ pub(crate) fn artwork_url(
     kind: &str,
 ) -> String {
     artwork_url_with_folder(relative, library, None, kind)
+}
+
+fn artwork_url_with_version(
+    relative: &std::path::Path,
+    library: Option<usize>,
+    folder: Option<usize>,
+    kind: &str,
+    version: Option<i64>,
+) -> String {
+    let mut url = artwork_url_with_folder(relative, library, folder, kind);
+    if let Some(version) = version {
+        url.push_str(&format!("&v={version}"));
+    }
+    url
 }
 
 fn artwork_url_with_folder(
@@ -7525,6 +7549,32 @@ pub(crate) fn folder_card(
 
 pub(crate) fn media_cover_url(media_id: &str) -> String {
     format!("/web/artwork/media/{}/cover", url_encode(media_id))
+}
+
+/// Serve image bytes with a short private cache. Versioned cover URLs may be
+/// cached much longer because replacing the file changes the URL.
+pub(crate) fn image_response(
+    content_type: &'static str,
+    bytes: Vec<u8>,
+    cache_seconds: u32,
+) -> Response {
+    let value = if cache_seconds >= 86_400 {
+        // Versioned URLs never need revalidation: a changed cover gets a new
+        // URL, so the browser can keep this image until its cache evicts it.
+        format!("private, max-age={cache_seconds}, immutable")
+    } else {
+        format!("private, max-age={cache_seconds}")
+    };
+    let cache = HeaderValue::from_str(&value)
+        .unwrap_or_else(|_| HeaderValue::from_static("private, max-age=60"));
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, cache),
+        ],
+        bytes,
+    )
+        .into_response()
 }
 
 pub(crate) fn media_card(
@@ -8519,11 +8569,12 @@ fn audiobook_media_card(
         ));
     }
     let details = details_parts.join(" · ");
-    let cover_url = Some(artwork_url_with_folder(
+    let cover_url = Some(artwork_url_with_version(
         relative,
         Some(library),
         folder,
         "cover",
+        item.cover_version,
     ));
     let (position, duration, watched) = saved_progress;
     let progress = if watched {
@@ -8602,11 +8653,12 @@ fn audiobook_detail(
 ) -> String {
     let book = &item.metadata;
     let folder_index = folder.unwrap_or_default();
-    let cover_url = Some(artwork_url_with_folder(
+    let cover_url = Some(artwork_url_with_version(
         relative,
         Some(library),
         folder,
         "cover",
+        item.cover_version,
     ));
     let cover = match cover_url.as_deref() {
         Some(url) => format!(

@@ -541,11 +541,7 @@ async fn cover(
         return StatusCode::NOT_FOUND.into_response();
     };
     let content_type = image_content_type(path.as_path());
-    (
-        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-        Body::from(bytes),
-    )
-        .into_response()
+    crate::harbinger::image_response(content_type, bytes, 300)
 }
 
 async fn play(

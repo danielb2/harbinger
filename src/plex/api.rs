@@ -8871,11 +8871,7 @@ pub(crate) async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> 
     };
     for artwork in &artwork_paths {
         if let Ok(bytes) = tokio::fs::read(artwork).await {
-            return (
-                [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-                bytes,
-            )
-                .into_response();
+            return image_response("image/jpeg", bytes, 300);
         }
     }
     if matches!(library.kind.as_str(), "movie" | "tv") {
@@ -8897,22 +8893,14 @@ pub(crate) async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> 
             }
             for artwork in &artwork_paths {
                 if let Ok(bytes) = tokio::fs::read(artwork).await {
-                    return (
-                        [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-                        bytes,
-                    )
-                        .into_response();
+                    return image_response("image/jpeg", bytes, 300);
                 }
             }
         }
     }
     if filename == "cover.jpg" {
         if let Some(bytes) = plex_frame_cover(state, &media).await {
-            return (
-                [(header::CONTENT_TYPE, HeaderValue::from_static("image/jpeg"))],
-                bytes,
-            )
-                .into_response();
+            return image_response("image/jpeg", bytes, 300);
         }
     }
     info!(

@@ -662,6 +662,7 @@ mod tests {
             author: "Author".to_owned(),
             description: String::new(),
             cover_path: None,
+            cover_version: None,
             audio_files: vec![audio_file(1, 10.0), audio_file(2, 20.5)],
             duration: 30.5,
             size: 0,

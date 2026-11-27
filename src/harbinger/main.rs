@@ -6,8 +6,8 @@ pub(crate) mod metrics;
 mod subtitles;
 
 pub(crate) use api::{
-    clean_relative_path, is_hidden_path, media_cover_url, media_progress_markup, settings_error,
-    stream_for_id, web_auth_gate,
+    clean_relative_path, image_response, is_hidden_path, media_cover_url, media_progress_markup,
+    settings_error, stream_for_id, web_auth_gate,
 };
 #[cfg(test)]
 pub(crate) use api::{
@@ -7112,6 +7112,8 @@ pub(crate) struct WebPath {
     pub(crate) library: Option<usize>,
     pub(crate) folder: Option<usize>,
     pub(crate) kind: Option<String>,
+    #[serde(alias = "v")]
+    pub(crate) version: Option<i64>,
     pub(crate) stream: Option<usize>,
     pub(crate) play: Option<String>,
     pub(crate) episode: Option<String>,

@@ -2613,6 +2613,7 @@ fn audiobook_web_fixture(name: &str) -> Fixture {
         config.libraries[0].folders = vec![root];
     }
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
     fixture
 }
 
@@ -2640,6 +2641,7 @@ fn audiobook_web_fixture_with_metadata(name: &str, description: &str) -> Fixture
     )
     .unwrap();
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
     fixture
 }
 
@@ -2661,9 +2663,9 @@ async fn web_library_root_shows_audiobook_cards() {
         "path={}",
         super::url_encode("Author One/Book One")
     )));
-    assert!(
-        body.contains("/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover")
-    );
+    assert!(body.contains(
+        "/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover&amp;v="
+    ));
     assert!(body.contains("<div class=\"media-card media-card-book\""));
     assert!(body.contains("</details></div><a class=\"media-card-info\""));
     assert_eq!(
@@ -2801,6 +2803,7 @@ async fn web_single_file_audiobook_renders_player() {
     let root = fixture.root.join("audiobooks-web-single-file");
     std::fs::write(root.join("Ender's Game.m4b"), b"0123456789abcdef").unwrap();
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
 
     let home = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
     assert_eq!(home.status(), StatusCode::OK);
@@ -3115,8 +3118,25 @@ async fn web_artwork_serves_local_audiobook_cover() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=300"
+    );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&bytes[..], b"cover-bytes");
+
+    let versioned = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover&v=123",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(versioned.status(), StatusCode::OK);
+    assert_eq!(
+        versioned.headers()[header::CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
 }
 
 #[tokio::test]

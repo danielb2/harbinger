@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -75,6 +75,7 @@ pub(crate) struct Item {
     pub(crate) author: String,
     pub(crate) description: String,
     pub(crate) cover_path: Option<PathBuf>,
+    pub(crate) cover_version: Option<i64>,
     pub(crate) audio_files: Vec<AudioFile>,
     pub(crate) duration: f64,
     pub(crate) size: u64,
@@ -215,7 +216,7 @@ fn save_audio_duration_cache(path: &Path) {
     }
 }
 
-fn refresh_catalog_in_background(state: AppState) {
+pub(crate) fn refresh_catalog_in_background(state: AppState) {
     if CATALOG_REFRESH_RUNNING.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -615,6 +616,11 @@ fn build_item(
         metadata_path.as_deref(),
         metadata.cover.as_deref(),
     );
+    let cover_version = cover_path
+        .as_deref()
+        .and_then(|path| fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .map(|modified| timestamp_ms(Some(modified)));
     let duration = audio_files.iter().map(|file| file.duration).sum();
     let size = audio_files.iter().map(|file| file.size).sum();
     let added_ms = audio_files
@@ -638,6 +644,7 @@ fn build_item(
         author,
         description: metadata.description.clone(),
         cover_path,
+        cover_version,
         audio_files,
         duration,
         size,
@@ -826,11 +833,47 @@ pub(crate) fn ensure_embedded_cover(
     let (bytes, extension) = scanner::embedded_cover(&file.path)?;
     let cover = write_cover_file(&sidecar, &bytes, extension)?;
     store_cover_reference(&sidecar, &cover);
-    invalidate_cache();
     Some(cover)
 }
 
 static EMBEDDED_COVER_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static EMBEDDED_COVER_IN_FLIGHT: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static EMBEDDED_COVER_LIMIT: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+
+/// Extract a missing cover in the background and return immediately. The
+/// artwork response can then fail fast so the browser shows the no-cover
+/// placeholder instead of leaving the image request pending behind FFmpeg.
+pub(crate) fn spawn_embedded_cover_extraction(state: AppState, source_index: usize, item: Item) {
+    let key = item.path.clone();
+    {
+        let in_flight = EMBEDDED_COVER_IN_FLIGHT.get_or_init(Default::default);
+        let Ok(mut in_flight) = in_flight.lock() else {
+            return;
+        };
+        if !in_flight.insert(key.clone()) {
+            return;
+        }
+    }
+    tokio::spawn(async move {
+        let limit = EMBEDDED_COVER_LIMIT.get_or_init(|| tokio::sync::Semaphore::new(2));
+        let Ok(_permit) = limit.acquire().await else {
+            if let Some(in_flight) = EMBEDDED_COVER_IN_FLIGHT.get() {
+                if let Ok(mut in_flight) = in_flight.lock() {
+                    in_flight.remove(&key);
+                }
+            }
+            return;
+        };
+        let _ =
+            tokio::task::spawn_blocking(move || ensure_embedded_cover(&state, source_index, &item))
+                .await;
+        if let Some(in_flight) = EMBEDDED_COVER_IN_FLIGHT.get() {
+            if let Ok(mut in_flight) = in_flight.lock() {
+                in_flight.remove(&key);
+            }
+        }
+    });
+}
 
 /// Serialize embedded-cover extraction and keep the synchronous FFmpeg work off
 /// the async runtime. Opening a large audiobook library requests hundreds of
