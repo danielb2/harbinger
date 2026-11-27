@@ -1,4 +1,8 @@
 .git
 .voidleap
+.github
 target
 config
+*.log
+*.7z
+.DS_Store

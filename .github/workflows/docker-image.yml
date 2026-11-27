@@ -14,5 +14,14 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: docker/setup-buildx-action@v3
     - name: Build the Docker image
-      run: docker build . --file Dockerfile --build-arg GIT_COMMIT=$GITHUB_SHA --tag harbinger:$(date +%s)
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        file: Dockerfile
+        build-args: GIT_COMMIT=${{ github.sha }}
+        tags: harbinger:ci
+        load: true
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
