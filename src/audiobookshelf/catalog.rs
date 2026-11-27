@@ -57,6 +57,8 @@ pub(crate) struct BookMetadata {
     pub(crate) explicit: bool,
     pub(crate) abridged: bool,
     pub(crate) cover: Option<String>,
+    pub(crate) match_provider: Option<String>,
+    pub(crate) match_provider_id: Option<String>,
     pub(crate) chapters: Vec<BookChapter>,
 }
 
@@ -885,6 +887,14 @@ fn read_book_metadata(path: &Path) -> BookMetadata {
         cover: {
             let cover = string("cover");
             (!cover.trim().is_empty()).then_some(cover)
+        },
+        match_provider: {
+            let provider = string("matchProvider");
+            (!provider.trim().is_empty()).then_some(provider)
+        },
+        match_provider_id: {
+            let provider_id = string("matchProviderId");
+            (!provider_id.trim().is_empty()).then_some(provider_id)
         },
         chapters,
     }

@@ -235,21 +235,9 @@ fn author_json(name: &str, library_id: &str) -> Value {
 }
 
 fn series_json(value: &str, library_id: &str) -> Value {
-    let mut name = value.to_owned();
-    let mut sequence = None;
-    if let Some(index) = value.rfind(" #") {
-        let candidate = &value[index + 2..];
-        if !candidate.is_empty()
-            && candidate
-                .chars()
-                .all(|character| !character.is_whitespace() && character != '#')
-        {
-            name = value[..index].to_owned();
-            sequence = Some(candidate.to_owned());
-        }
-    }
+    let (name, sequence) = super::scanner::split_series_label(value);
     json!({
-        "id": named_id("series", &name),
+        "id": named_id("series", name),
         "name": name,
         "libraryId": library_id,
         "books": [],

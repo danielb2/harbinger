@@ -8249,7 +8249,13 @@ pub(crate) fn media_card_with_options(
         .map(|value| format!("<span class=\"media-card-subtitle\">{}</span>", html(value)))
         .unwrap_or_default();
     let details = details
-        .map(|value| format!("<span class=\"media-card-details\">{}</span>", html(value)))
+        .map(|value| {
+            format!(
+                "<span class=\"media-card-details\" title=\"{}\">{}</span>",
+                html(value),
+                html(value)
+            )
+        })
         .unwrap_or_default();
     let episode_card = href.contains("&episode=");
     let cover = if let Some(url) = cover_url {
