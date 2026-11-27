@@ -15,6 +15,9 @@ dev bind="0.0.0.0:32400":
 test:
     cargo test
 
+commit:
+    opencode run  -m 'opencode/beam-free#low' "/commit"
+
 release TYPE="minor":
     opencode run  -m 'opencode/beam-free#low' "do a {{ TYPE }} version bump in cargo.toml. tag the repo with vX.X.X format"
     # git push --tags
