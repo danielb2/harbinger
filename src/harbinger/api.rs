@@ -67,6 +67,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/web/dashboard/stats", get(dashboard_stats))
+        .route("/web/ping", get(web_ping))
         .route("/web/search", get(web_search))
         .route("/web/stream", any(web_stream))
         .route("/web/index.html", get(web_index_redirect))
@@ -112,6 +113,8 @@ pub(crate) fn web_routes() -> Router<AppState> {
         )
         .route("/settings/skipping", post(save_skip_settings))
         .route("/settings/logs/socket", get(settings_logs_socket))
+        .route("/settings/logs/download", get(download_logs))
+        .route("/settings/logs/level", post(update_log_level))
         .route("/settings/logs/clear", post(clear_logs))
         .route("/settings/libraries", post(create_library))
         .route("/settings/libraries/:id/rename", post(rename_library))
@@ -492,6 +495,54 @@ pub(crate) async fn favicon_handler() -> Response {
         .into_response()
 }
 
+pub(crate) async fn download_logs() -> Response {
+    let mut body = recent_log_history().join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let filename = format!(
+        "harbinger-logs-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    let disposition = HeaderValue::from_str(&format!("attachment; filename=\"{filename}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"));
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LogLevelForm {
+    level: String,
+}
+
+pub(crate) async fn update_log_level(
+    State(state): State<AppState>,
+    Form(form): Form<LogLevelForm>,
+) -> Response {
+    let level = match form.level.trim() {
+        "debug" => "debug",
+        "info" => "info",
+        _ => return settings_error("Unknown log level"),
+    };
+    if let Err(error) = set_log_level(level) {
+        return settings_error(&error);
+    }
+    store_explicit_setting(&state, "log_level", level);
+    let mut response = Redirect::to("/settings?tab=logs").into_response();
+    response.extensions_mut().insert(SuppressHttpResponseLog);
+    response
+}
+
 pub(crate) async fn clear_logs() -> Response {
     clear_log_lines();
     let mut response = Redirect::to("/settings?tab=logs").into_response();
@@ -829,15 +880,8 @@ async fn audiobook_media_key_for_web_path(
     let path = web_path(state, &root, relative).await.ok()?;
     let catalog = crate::audiobookshelf::catalog::Catalog::load_async(state).await;
     catalog
-        .libraries
-        .iter()
-        .find(|entry| entry.source_index == library.unwrap_or_default())?
-        .items
-        .iter()
-        .find_map(|item| {
-            let item_path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
-            (item_path == path).then(|| item.id.clone())
-        })
+        .find_item_path(library.unwrap_or_default(), relative, &root, &path)
+        .map(|item| item.id.clone())
 }
 
 pub(crate) async fn web_progress(
@@ -1041,19 +1085,8 @@ pub(crate) async fn set_audiobook_cover(
         Ok(path) => path,
         Err(status) => return status.into_response(),
     };
-    let requested_canonical =
-        std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
     let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&state).await;
-    let Some(item) = catalog
-        .libraries
-        .iter()
-        .find(|library| library.source_index == library_index)
-        .and_then(|library| {
-            library.items.iter().find(|item| {
-                std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                    == requested_canonical
-            })
-        })
+    let Some(item) = catalog.find_item_path(library_index, &relative, &root, &requested_path)
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -2065,8 +2098,16 @@ pub(crate) async fn settings_page(
         } else {
             "<p id=\"settings-logs-empty\" class=\"note\" hidden>No log entries yet.</p>"
         };
+        let (next_level, level_label, level_title) = if debug_logging_enabled() {
+            ("info", "Disable debug", "Return logging to the info level")
+        } else {
+            ("debug", "Enable debug", "Show debug-level diagnostic logs")
+        };
+        let log_level_control = format!(
+            "<form method=\"post\" action=\"/settings/logs/level\" style=\"margin:0\"><input type=\"hidden\" name=\"level\" value=\"{next_level}\"><button class=\"button-secondary\" type=\"submit\" title=\"{level_title}\">{level_label}</button></form>"
+        );
         format!(
-            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The server keeps up to 1000 entries in memory.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><form method=\"post\" action=\"/settings/logs/clear\" style=\"margin:0\"><button class=\"button-secondary\" id=\"settings-logs-clear\" type=\"submit\" title=\"Clear the in-memory log buffer\">Clear log</button></form><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
+            "<section class=\"settings-card\" aria-labelledby=\"logs-heading\"><div class=\"section-heading\"><div><h2 id=\"logs-heading\">Logs</h2><p class=\"section-description\">Recent server and request events. The live view keeps up to 1000 entries; downloads include up to 20000.</p></div><span id=\"settings-logs-live\" role=\"status\">Live</span></div><div class=\"log-filters\"><label for=\"settings-logs-search\">Search log entries <input id=\"settings-logs-search\" type=\"search\" placeholder=\"Search log entries…\" autocomplete=\"off\"></label><label><input id=\"settings-logs-reverse\" type=\"checkbox\"> Reverse filter (show non-matching)</label><span id=\"settings-logs-count\" role=\"status\" aria-live=\"polite\"></span><button class=\"button-secondary\" id=\"settings-logs-copy\" type=\"button\" title=\"Copy the visible filtered log entries\">Copy visible</button><span id=\"settings-logs-copy-status\" role=\"status\" aria-live=\"polite\"></span><a class=\"button-link button-secondary\" id=\"settings-logs-download\" href=\"/settings/logs/download\" download title=\"Download the recent log history as a text file\">Download log</a>{log_level_control}<form method=\"post\" action=\"/settings/logs/clear\" style=\"margin:0\"><button class=\"button-secondary\" id=\"settings-logs-clear\" type=\"submit\" title=\"Clear the in-memory log buffer\">Clear log</button></form><button class=\"button-secondary log-follow\" id=\"settings-logs-follow\" type=\"button\" aria-label=\"Scroll to latest log entries\" title=\"Scroll to latest log entries\" hidden>↓ Latest</button></div>{empty_notice}{output}</section>"
         )
     } else {
         String::new()
@@ -2598,17 +2639,9 @@ async fn audiobook_item_for_match(
 ) -> Option<crate::audiobookshelf::catalog::Item> {
     let root = selected_library_folder_root(state, Some(library_index), folder);
     let requested = web_path(state, &root, relative).await.ok()?;
-    let requested = std::fs::canonicalize(&requested).unwrap_or(requested);
     crate::audiobookshelf::catalog::Catalog::load_async(state)
         .await
-        .libraries
-        .iter()
-        .find(|library| library.source_index == library_index)?
-        .items
-        .iter()
-        .find(|item| {
-            std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone()) == requested
-        })
+        .find_item_path(library_index, relative, &root, &requested)
         .cloned()
 }
 
@@ -4133,10 +4166,18 @@ pub(crate) fn cover_artwork_markup(url: &str, label: &str) -> String {
     )
 }
 
+fn library_page_bounds(total: usize, offset: usize) -> (std::ops::Range<usize>, bool) {
+    let start = offset.min(total);
+    let end = (start + WEB_LIBRARY_PAGE_SIZE).min(total);
+    (start..end, end < total)
+}
+
 pub(crate) async fn web_client(
     State(s): State<AppState>,
     Query(mut query): Query<WebPath>,
 ) -> Response {
+    let library_offset = query.offset.unwrap_or(0);
+    let mut library_has_more = false;
     let (_, audio_language_primary, audio_language_secondary, _, _) =
         effective_plex_language_settings(&s);
     let (bilingual_enabled, language_primary, language_secondary) =
@@ -4210,18 +4251,13 @@ pub(crate) async fn web_client(
     };
     let audiobook_detail_item = if audiobook_request {
         let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-        let requested_canonical =
-            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
         catalog
-            .libraries
-            .iter()
-            .find(|entry| Some(entry.source_index) == query.library)
-            .and_then(|library| {
-                library.items.iter().find(|item| {
-                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                        == requested_canonical
-                })
-            })
+            .find_item_path(
+                query.library.unwrap_or_default(),
+                &relative,
+                &library_root,
+                &requested_path,
+            )
             .cloned()
     } else {
         None
@@ -4699,45 +4735,58 @@ pub(crate) async fn web_client(
                 web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
             });
             let mut seen_paths = std::collections::HashSet::new();
-            media.retain(|item| {
-                let path = std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone());
-                seen_paths.insert(path)
-            });
+            media.retain(|item| seen_paths.insert(item.path.clone()));
             if is_audiobook_library(&library.kind) {
-                let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-                if let Some(abs_library) = catalog
-                    .libraries
-                    .iter()
-                    .find(|entry| entry.source_index == library_index)
-                {
-                    for item in &abs_library.items {
-                        let Some((folder_index, source_root, _)) = library
-                            .folders
-                            .iter()
-                            .enumerate()
-                            .find_map(|(index, root)| {
-                                let canonical =
-                                    std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
-                                item.path
-                                    .strip_prefix(&canonical)
-                                    .ok()
-                                    .map(|path| (index, canonical, path.to_path_buf()))
-                            })
-                        else {
-                            continue;
-                        };
-                        let item_relative = item
-                            .path
-                            .strip_prefix(&source_root)
-                            .unwrap_or(std::path::Path::new(&item.rel_path));
-                        folder_cards.push_str(&audiobook_media_card(
-                            &s,
-                            item,
-                            &item_relative,
-                            library_index,
-                            (folder_index > 0).then_some(folder_index),
-                        ));
+                let catalog = match crate::audiobookshelf::catalog::Catalog::cached(&s) {
+                    Some(catalog) => Some(catalog),
+                    None => tokio::time::timeout(
+                        Duration::from_millis(250),
+                        crate::audiobookshelf::catalog::Catalog::load_async(&s),
+                    )
+                    .await
+                    .ok(),
+                };
+                if let Some(catalog) = catalog {
+                    if let Some(abs_library) = catalog
+                        .libraries
+                        .iter()
+                        .find(|entry| entry.source_index == library_index)
+                    {
+                        let (range, more) =
+                            library_page_bounds(abs_library.items.len(), library_offset);
+                        library_has_more = more;
+                        let saved_progress = audiobook_progress_map(&s);
+                        for item in &abs_library.items[range] {
+                            let Some((folder_index, item_relative)) =
+                                abs_library.folders.iter().enumerate().find_map(
+                                    |(index, folder)| {
+                                        item.path
+                                            .strip_prefix(std::path::Path::new(&folder.full_path))
+                                            .ok()
+                                            .map(|path| (index, path.to_path_buf()))
+                                    },
+                                )
+                            else {
+                                continue;
+                            };
+                            let progress = saved_progress
+                                .get(&item.id)
+                                .copied()
+                                .unwrap_or((0, None, false));
+                            folder_cards.push_str(&audiobook_media_card(
+                                item,
+                                &item_relative,
+                                library_index,
+                                (folder_index > 0).then_some(folder_index),
+                                progress,
+                            ));
+                        }
                     }
+                } else {
+                    crate::audiobookshelf::catalog::refresh_catalog_in_background(s.clone());
+                    folder_cards.push_str(
+                        "<p class=\"note\">Preparing the audiobook catalog. This page will refresh automatically.</p>",
+                    );
                 }
             } else if library.kind == "tv" {
                 let mut shows =
@@ -4745,7 +4794,9 @@ pub(crate) async fn web_client(
                 shows.sort_by(|left, right| {
                     web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
                 });
-                for show in shows {
+                let (range, more) = library_page_bounds(shows.len(), library_offset);
+                library_has_more = more;
+                for show in &shows[range] {
                     let Some(representative) = show.episodes.iter().max_by_key(|episode| {
                         section_metadata
                             .get(&episode.id)
@@ -4825,7 +4876,9 @@ pub(crate) async fn web_client(
                     ));
                 }
             } else {
-                for media_item in media {
+                let (range, more) = library_page_bounds(media.len(), library_offset);
+                library_has_more = more;
+                for media_item in &media[range] {
                     let Some(source_root) = library
                         .folders
                         .iter()
@@ -5068,6 +5121,13 @@ pub(crate) async fn web_client(
         }
     }
     items.push_str(&folder_cards);
+    if library_has_more {
+        items.push_str(&format!(
+            "<div id=\"library-sentinel\" data-next-offset=\"{}\" data-page-size=\"{}\" style=\"grid-column:1/-1;height:1px\"></div>",
+            library_offset + WEB_LIBRARY_PAGE_SIZE,
+            WEB_LIBRARY_PAGE_SIZE
+        ));
+    }
     items.push_str(&season_sections);
     if !has_content {
         items.push_str(r#"<p class="note">No supported media or subfolders here.</p>"#);
@@ -6213,9 +6273,12 @@ pub(crate) async fn web_client(
       video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + offset));
       }});
     }}
+    window.__mplexInfiniteLibrary = Boolean(window.document.querySelector('#library-sentinel'));
     let refreshing = false;
     async function refreshLibrary() {{
       if (refreshing) return;
+      if (window.__mplexInfiniteLibrary) return;
+      if (window.document.visibilityState !== "visible") return;
       refreshing = true;
       try {{
         const response = await fetch(window.location.href, {{ cache: "no-store" }});
@@ -6237,7 +6300,18 @@ pub(crate) async fn web_client(
         const hasAudiobookPlayback = [...window.document.querySelectorAll(".audiobook-audio")]
           .some(audio => !audio.paused || audio.currentTime > 0);
         if (!hasPlaybackState && !hasPlayer && !hasAudiobookPlayback && current && next && current.innerHTML !== next.innerHTML) {{
-          current.replaceWith(next);
+          const currentCards = [...current.children];
+          const nextCards = [...next.children];
+          if (currentCards.length !== nextCards.length) {{
+            current.replaceWith(next);
+          }} else {{
+            nextCards.forEach((nextCard, index) => {{
+              const currentCard = currentCards[index];
+              if (currentCard && currentCard.outerHTML !== nextCard.outerHTML) {{
+                currentCard.replaceWith(nextCard);
+              }}
+            }});
+          }}
           window.__mplexSelectedVideo = null;
         }}
       }} catch (_) {{
@@ -6248,6 +6322,47 @@ pub(crate) async fn web_client(
     }}
     if (window.__mplexLibraryRefreshTimer) clearInterval(window.__mplexLibraryRefreshTimer);
     window.__mplexLibraryRefreshTimer = setInterval(refreshLibrary, 5000);
+    const infiniteSentinel = window.document.querySelector('#library-sentinel');
+    if (infiniteSentinel) {{
+      let infiniteLoading = false;
+      const loadMoreLibrary = async () => {{
+        if (infiniteLoading) return;
+        const nextOffset = infiniteSentinel.dataset.nextOffset;
+        if (!nextOffset) return;
+        infiniteLoading = true;
+        try {{
+          const url = new URL(window.location.href);
+          url.searchParams.set("offset", nextOffset);
+          const response = await fetch(url, {{ cache: "no-store" }});
+          if (!response.ok) {{
+            window.__mplexShowConnectionLost?.("Could not load more items.");
+            return;
+          }}
+          const document = new DOMParser().parseFromString(await response.text(), "text/html");
+          const nextLibrary = document.querySelector(".library");
+          const nextSentinel = document.querySelector('#library-sentinel');
+          const currentLibrary = window.document.querySelector(".library");
+          if (!nextLibrary || !currentLibrary) return;
+          const cards = [...nextLibrary.children].filter(element =>
+            element.id !== "library-sentinel" && !element.matches("nav.breadcrumb"));
+          cards.forEach(card => currentLibrary.insertBefore(card, infiniteSentinel));
+          if (nextSentinel && nextSentinel.dataset.nextOffset) {{
+            infiniteSentinel.dataset.nextOffset = nextSentinel.dataset.nextOffset;
+          }} else {{
+            infiniteSentinel.remove();
+            observer.disconnect();
+          }}
+        }} catch (_) {{
+          window.__mplexShowConnectionLost?.("Could not load more items.");
+        }} finally {{
+          infiniteLoading = false;
+        }}
+      }};
+      const observer = new IntersectionObserver(entries => {{
+        if (entries.some(entry => entry.isIntersecting)) loadMoreLibrary();
+      }}, {{ rootMargin: "800px 0px" }});
+      observer.observe(infiniteSentinel);
+    }}
   </script>
   {}{}
 </body>
@@ -6774,30 +6889,30 @@ pub(crate) async fn web_artwork(
     };
     if is_audiobook_library(&library.kind) && kind == "cover" {
         let catalog = crate::audiobookshelf::catalog::Catalog::load_async(&s).await;
-        let requested_canonical =
-            std::fs::canonicalize(&requested_path).unwrap_or_else(|_| requested_path.clone());
-        let item = catalog
-            .libraries
-            .iter()
-            .find(|entry| entry.source_index == library_index)
-            .and_then(|library| {
-                library.items.iter().find(|item| {
-                    std::fs::canonicalize(&item.path).unwrap_or_else(|_| item.path.clone())
-                        == requested_canonical
-                })
-            });
-        let cover = item.and_then(|item| {
-            item.cover_path
-                .clone()
-                .filter(|path| path.is_file())
-                .or_else(|| {
-                    crate::audiobookshelf::catalog::ensure_embedded_cover(&s, library_index, item)
-                })
-        });
+        let item = catalog.find_item_path(library_index, &relative, &root, &requested_path);
+        let Some(item) = item else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let cover = match item.cover_path.clone().filter(|path| path.is_file()) {
+            Some(cover) => Some(cover),
+            None => {
+                crate::audiobookshelf::catalog::spawn_embedded_cover_extraction(
+                    s.clone(),
+                    library_index,
+                    item.clone(),
+                );
+                None
+            }
+        };
         if let Some(cover) = cover {
             if let Ok(bytes) = tokio::fs::read(&cover).await {
                 let content_type = crate::audiobookshelf::catalog::image_content_type(&cover);
-                return ([(header::CONTENT_TYPE, content_type)], bytes).into_response();
+                let cache_seconds = if query.version.is_some() {
+                    31_536_000
+                } else {
+                    300
+                };
+                return image_response(content_type, bytes, cache_seconds);
             }
         }
         return StatusCode::NOT_FOUND.into_response();
@@ -6886,7 +7001,7 @@ pub(crate) async fn web_episode_artwork(
         .is_ok_and(|config| config.metadata_storage == "media");
     if let Some(path) = tv_episode_artwork_path(&state, library_key, root, &media, sidecar_mode) {
         if let Ok(bytes) = tokio::fs::read(path).await {
-            return ([(header::CONTENT_TYPE, "image/jpeg")], bytes).into_response();
+            return image_response("image/jpeg", bytes, 300);
         }
     }
     plex_artwork(&state, &id, "cover.jpg").await
@@ -6926,6 +7041,20 @@ pub(crate) fn artwork_url(
     kind: &str,
 ) -> String {
     artwork_url_with_folder(relative, library, None, kind)
+}
+
+fn artwork_url_with_version(
+    relative: &std::path::Path,
+    library: Option<usize>,
+    folder: Option<usize>,
+    kind: &str,
+    version: Option<i64>,
+) -> String {
+    let mut url = artwork_url_with_folder(relative, library, folder, kind);
+    if let Some(version) = version {
+        url.push_str(&format!("&v={version}"));
+    }
+    url
 }
 
 fn artwork_url_with_folder(
@@ -7497,6 +7626,32 @@ pub(crate) fn media_cover_url(media_id: &str) -> String {
     format!("/web/artwork/media/{}/cover", url_encode(media_id))
 }
 
+/// Serve image bytes with a short private cache. Versioned cover URLs may be
+/// cached much longer because replacing the file changes the URL.
+pub(crate) fn image_response(
+    content_type: &'static str,
+    bytes: Vec<u8>,
+    cache_seconds: u32,
+) -> Response {
+    let value = if cache_seconds >= 86_400 {
+        // Versioned URLs never need revalidation: a changed cover gets a new
+        // URL, so the browser can keep this image until its cache evicts it.
+        format!("private, max-age={cache_seconds}, immutable")
+    } else {
+        format!("private, max-age={cache_seconds}")
+    };
+    let cache = HeaderValue::from_str(&value)
+        .unwrap_or_else(|_| HeaderValue::from_static("private, max-age=60"));
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+            (header::CACHE_CONTROL, cache),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 pub(crate) fn media_card(
     media: &Media,
     library_config: &ConfigLibrary,
@@ -7701,8 +7856,7 @@ const bindCardAction = (element, type, handler, options) => {
   element.addEventListener(type, handler, options);
   cardActionListeners.push(() => element.removeEventListener(type, handler, options));
 };
-bindCardAction(document, "error", event => {
-  const image = event.target;
+const replaceBrokenCoverImage = image => {
   if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-cover img")) return;
   const placeholder = document.createElement("div");
   const title = image.alt.replace(/^Cover for /, "");
@@ -7711,7 +7865,11 @@ bindCardAction(document, "error", event => {
   placeholder.setAttribute("aria-label", `Cover unavailable for ${title}`);
   placeholder.textContent = "No cover available";
   image.replaceWith(placeholder);
-}, true);
+};
+bindCardAction(document, "error", event => replaceBrokenCoverImage(event.target), true);
+document.querySelectorAll(".media-card-cover img").forEach(image => {
+  if (image.complete && image.naturalWidth === 0) replaceBrokenCoverImage(image);
+});
 const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
 const fixMatchProvider = document.querySelector("#tv-fix-match-provider");
 const fixMatchQuery = document.querySelector("#tv-fix-match-query");
@@ -8205,7 +8363,7 @@ window.__mplexConnectionCheckTimer = window.setInterval(async () => {
   if (checkingConnection) return;
   checkingConnection = true;
   try {
-    const response = await fetch("/", { cache: "no-store" });
+    const response = await fetch("/web/ping", { cache: "no-store" });
     if (response.status === 404) {
       clearInterval(window.__mplexConnectionCheckTimer);
       window.__mplexConnectionCheckTimer = null;
@@ -8417,6 +8575,38 @@ fn audiobook_saved_progress(state: &AppState, item_id: &str) -> (i64, Option<i64
         .unwrap_or((0, None, false))
 }
 
+/// Load all saved progress for a library page in one query. Rendering a
+/// 700-book grid must not issue 700 individual database queries.
+fn audiobook_progress_map(state: &AppState) -> HashMap<String, (i64, Option<i64>, bool)> {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|db| {
+            let mut statement = db
+                .prepare(
+                    "SELECT media_key, position_ms, duration_ms, watched
+                       FROM watch_progress
+                      WHERE user_id = ?1",
+                )
+                .ok()?;
+            let rows = statement
+                .query_map([USER_ID], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        (
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<i64>>(2)?,
+                            row.get::<_, bool>(3)?,
+                        ),
+                    ))
+                })
+                .ok()?;
+            Some(rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default()
+}
+
 fn series_display_label(value: &str) -> String {
     let (name, sequence) = crate::audiobookshelf::scanner::split_series_label(value);
     match sequence {
@@ -8426,11 +8616,11 @@ fn series_display_label(value: &str) -> String {
 }
 
 fn audiobook_media_card(
-    state: &AppState,
     item: &crate::audiobookshelf::catalog::Item,
     relative: &std::path::Path,
     library: usize,
     folder: Option<usize>,
+    saved_progress: (i64, Option<i64>, bool),
 ) -> String {
     let folder_query = folder
         .map(|index| format!("folder={index}&"))
@@ -8457,13 +8647,14 @@ fn audiobook_media_card(
         ));
     }
     let details = details_parts.join(" · ");
-    let cover_url = Some(artwork_url_with_folder(
+    let cover_url = Some(artwork_url_with_version(
         relative,
         Some(library),
         folder,
         "cover",
+        item.cover_version,
     ));
-    let (position, duration, watched) = audiobook_saved_progress(state, &item.id);
+    let (position, duration, watched) = saved_progress;
     let progress = if watched {
         1.0
     } else {
@@ -8540,11 +8731,12 @@ fn audiobook_detail(
 ) -> String {
     let book = &item.metadata;
     let folder_index = folder.unwrap_or_default();
-    let cover_url = Some(artwork_url_with_folder(
+    let cover_url = Some(artwork_url_with_version(
         relative,
         Some(library),
         folder,
         "cover",
+        item.cover_version,
     ));
     let cover = match cover_url.as_deref() {
         Some(url) => format!(
@@ -8988,6 +9180,10 @@ pub(crate) fn contains_hidden_component(path: &std::path::Path) -> bool {
     })
 }
 
+pub(crate) async fn web_ping() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
 pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
     let snapshot = state.metrics.snapshot();
     let current = snapshot.latest.clone().unwrap_or_default();
@@ -9032,12 +9228,15 @@ pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
             }
         }
     }
-    let audiobooks = crate::audiobookshelf::catalog::Catalog::load_async(&state)
-        .await
-        .libraries
-        .iter()
-        .map(|library| library.items.len())
-        .sum::<usize>();
+    let audiobooks = crate::audiobookshelf::catalog::Catalog::cached(&state)
+        .map(|catalog| {
+            catalog
+                .libraries
+                .iter()
+                .map(|library| library.items.len())
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
     let (markers_total, markers_last_24h) = state
         .db
         .lock()

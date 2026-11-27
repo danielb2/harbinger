@@ -1104,6 +1104,11 @@ async fn settings_logs_tab_displays_recent_events() {
     assert!(body.contains("id=\"settings-logs-reverse\" type=\"checkbox\""));
     assert!(body.contains("id=\"settings-logs-copy\" type=\"button\""));
     assert!(body.contains("id=\"settings-logs-copy-status\""));
+    assert!(body.contains("id=\"settings-logs-download\""));
+    assert!(body.contains("href=\"/settings/logs/download\""));
+    assert!(body.contains("Download the recent log history as a text file"));
+    assert!(body.contains("action=\"/settings/logs/level\""));
+    assert!(body.contains("id=\"settings-logs-download\""));
     assert!(body.contains("id=\"settings-logs-clear\""));
     assert!(body.contains("action=\"/settings/logs/clear\""));
     assert!(body.contains("visibleLogLines.slice()"));
@@ -1170,6 +1175,122 @@ async fn settings_logs_can_clear_the_in_memory_buffer() {
     }
     assert!(cleared);
     assert!(!super::recent_log_snapshot().1.contains(&token));
+}
+
+#[tokio::test]
+async fn library_refresh_updates_only_changed_cards() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("window.document.visibilityState !== \"visible\""));
+    assert!(body.contains("currentCard.outerHTML !== nextCard.outerHTML"));
+    assert!(body.contains("currentCard.replaceWith(nextCard)"));
+    assert!(body.contains("const currentCards = [...current.children]"));
+}
+
+#[tokio::test]
+async fn settings_log_download_keeps_history_beyond_the_live_buffer() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    super::clear_log_lines();
+    let token = "event=history_marker";
+    super::push_log_line(token.to_owned());
+    for index in 0..super::MAX_LOG_LINES {
+        super::push_log_line(format!("event=history_filler_{index}"));
+    }
+    let (_, live) = super::recent_log_snapshot();
+    assert!(!live.contains(&token.to_owned()));
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings/logs/download",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(token));
+}
+
+#[tokio::test]
+async fn settings_logs_can_toggle_debug_level() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let _ = super::set_log_level("info");
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/logs/level",
+        "level=debug",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers()[header::LOCATION].to_str().unwrap(),
+        "/settings?tab=logs"
+    );
+    assert!(super::debug_logging_enabled());
+    let page = send(
+        &fixture.app,
+        Method::GET,
+        "/settings?tab=logs",
+        Body::empty(),
+    )
+    .await;
+    let body = to_bytes(page.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("Disable debug"));
+
+    let response = send_form(
+        &fixture.app,
+        Method::POST,
+        "/settings/logs/level",
+        "level=info",
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(!super::debug_logging_enabled());
+}
+
+#[tokio::test]
+async fn settings_logs_can_be_downloaded_as_a_text_file() {
+    let _log_guard = LOG_TEST_LOCK.lock().await;
+    let fixture = fixture();
+    let token = format!(
+        "event=download_log_test_{}",
+        NEXT_FIXTURE.load(Ordering::Relaxed)
+    );
+    super::push_log_line(token.clone());
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/settings/logs/download",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE].to_str().unwrap(),
+        "text/plain; charset=utf-8"
+    );
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL].to_str().unwrap(),
+        "no-store"
+    );
+    let disposition = response.headers()[header::CONTENT_DISPOSITION]
+        .to_str()
+        .unwrap();
+    assert!(disposition.starts_with("attachment; filename=\"harbinger-logs-"));
+    assert!(disposition.ends_with(".log\""));
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains(&token));
+    assert!(body.ends_with('\n'));
 }
 
 #[tokio::test]
@@ -2492,6 +2613,7 @@ fn audiobook_web_fixture(name: &str) -> Fixture {
         config.libraries[0].folders = vec![root];
     }
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
     fixture
 }
 
@@ -2519,6 +2641,7 @@ fn audiobook_web_fixture_with_metadata(name: &str, description: &str) -> Fixture
     )
     .unwrap();
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
     fixture
 }
 
@@ -2540,9 +2663,9 @@ async fn web_library_root_shows_audiobook_cards() {
         "path={}",
         super::url_encode("Author One/Book One")
     )));
-    assert!(
-        body.contains("/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover")
-    );
+    assert!(body.contains(
+        "/web/artwork?library=0&amp;path=Author%20One%2FBook%20One&amp;kind=cover&amp;v="
+    ));
     assert!(body.contains("<div class=\"media-card media-card-book\""));
     assert!(body.contains("</details></div><a class=\"media-card-info\""));
     assert_eq!(
@@ -2566,6 +2689,189 @@ async fn web_library_root_shows_audiobook_cards() {
     assert!(body.contains(".media-card-book .media-card-cover,.media-card-book .media-card-cover img{aspect-ratio:1/1}"));
     assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
+    assert!(body.contains("image.complete && image.naturalWidth === 0"));
+    assert!(body.contains("replaceBrokenCoverImage"));
+}
+
+#[tokio::test]
+async fn audiobook_without_cover_fails_fast_for_the_placeholder() {
+    let fixture = audiobook_web_fixture("audiobooks-no-cover");
+    let root = fixture.root.join("audiobooks-no-cover");
+    std::fs::remove_file(root.join("Author One/Book One/cover.png")).unwrap();
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let page = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let page = body_string(page).await;
+    assert!(page.contains("image.complete && image.naturalWidth === 0"));
+}
+
+#[tokio::test]
+async fn audiobook_library_paginates_with_a_scroll_sentinel() {
+    let fixture = audiobook_web_fixture("audiobooks-pagination");
+    let root = fixture.root.join("audiobooks-pagination");
+    for index in 0..60 {
+        let book_dir = root
+            .join(format!("Author {index:02}"))
+            .join(format!("Book {index:02}"));
+        std::fs::create_dir_all(&book_dir).unwrap();
+        std::fs::write(book_dir.join("Chapter.m4b"), b"0123456789abcdef").unwrap();
+    }
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first
+            .matches("<div class=\"media-card media-card-book\"")
+            .count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+    assert!(first.contains("IntersectionObserver"));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second
+            .matches("<div class=\"media-card media-card-book\"")
+            .count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
+}
+
+#[tokio::test]
+async fn web_connection_check_uses_a_lightweight_ping() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/web/ping", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let page = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let page = body_string(page).await;
+    assert!(page.contains("fetch(\"/web/ping\", { cache: \"no-store\" })"));
+    assert!(!page.contains("fetch(\"/\", { cache: \"no-store\" })"));
+}
+
+#[tokio::test]
+async fn movie_library_paginates_with_a_scroll_sentinel() {
+    let fixture = fixture();
+    let media_dir = fixture.root.join("media");
+    let items = (0..61)
+        .map(|index| {
+            let path = media_dir.join(format!("Movie {index:02}.mkv"));
+            std::fs::write(&path, b"0123456789abcdef").unwrap();
+            Media {
+                id: format!("1-{}", index + 1),
+                title: format!("Movie {index:02}"),
+                path,
+                size: 16,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    *fixture.state.media.write().unwrap() = Arc::new(items);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first.matches("<div class=\"media-card\" style=").count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second.matches("<div class=\"media-card\" style=").count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
+}
+
+#[tokio::test]
+async fn tv_library_paginates_with_a_scroll_sentinel() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "tv".to_owned();
+    let media_dir = fixture.root.join("media");
+    let items = (0..61)
+        .map(|index| {
+            let path = media_dir.join(format!(
+                "Show {index:02}/season.01/Show {index:02} s01e01.mkv"
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789abcdef").unwrap();
+            Media {
+                id: format!("1-{}", index + 1),
+                title: format!("Show {index:02} s01e01"),
+                path,
+                size: 16,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    *fixture.state.media.write().unwrap() = Arc::new(items);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first
+            .matches("<div class=\"media-card media-card-tv\" style=")
+            .count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second
+            .matches("<div class=\"media-card media-card-tv\" style=")
+            .count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
 }
 
 #[tokio::test]
@@ -2680,6 +2986,7 @@ async fn web_single_file_audiobook_renders_player() {
     let root = fixture.root.join("audiobooks-web-single-file");
     std::fs::write(root.join("Ender's Game.m4b"), b"0123456789abcdef").unwrap();
     crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
 
     let home = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
     assert_eq!(home.status(), StatusCode::OK);
@@ -2994,8 +3301,25 @@ async fn web_artwork_serves_local_audiobook_cover() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+    assert_eq!(
+        response.headers()[header::CACHE_CONTROL],
+        "private, max-age=300"
+    );
     let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(&bytes[..], b"cover-bytes");
+
+    let versioned = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover&v=123",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(versioned.status(), StatusCode::OK);
+    assert_eq!(
+        versioned.headers()[header::CACHE_CONTROL],
+        "private, max-age=31536000, immutable"
+    );
 }
 
 #[tokio::test]

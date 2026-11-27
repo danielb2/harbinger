@@ -131,27 +131,39 @@ async fn cors(request: Request<Body>, next: Next) -> Response {
 }
 
 async fn log_requests(request: Request<Body>, next: Next) -> Response {
+    let request_id = crate::harbinger::next_http_request_id();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let query = crate::harbinger::sanitized_query(request.uri());
     let started = Instant::now();
-    tracing::info!(
+    tracing::debug!(
         tag = "abs",
         event = "http_request",
+        id = request_id,
         method = %method,
         path = %path,
         query = ?query
     );
     let response = next.run(request).await;
-    tracing::info!(
-        tag = "abs",
-        event = "http_response",
-        method = %method,
-        path = %path,
-        query = ?query,
-        status = %response.status(),
-        latency_ms = started.elapsed().as_millis()
-    );
+    let status = response.status();
+    let latency_ms = started.elapsed().as_millis();
+    if status.is_client_error() || status.is_server_error() {
+        tracing::warn!(
+            tag = "abs",
+            event = "http_response",
+            id = request_id,
+            status = status.as_u16(),
+            latency_ms
+        );
+    } else {
+        tracing::debug!(
+            tag = "abs",
+            event = "http_response",
+            id = request_id,
+            status = status.as_u16(),
+            latency_ms
+        );
+    }
     response
 }
 
@@ -505,25 +517,25 @@ async fn cover(
         .item_library(item)
         .map(|library| library.source_index)
         .unwrap_or_default();
-    let path = item
-        .cover_path
-        .clone()
-        .filter(|path| path.is_file())
-        .or_else(|| {
-            crate::audiobookshelf::catalog::ensure_embedded_cover(&state, source_index, item)
-        });
+    let path = match item.cover_path.clone().filter(|path| path.is_file()) {
+        Some(path) => Some(path),
+        None => {
+            crate::audiobookshelf::catalog::ensure_embedded_cover_async(
+                state.clone(),
+                source_index,
+                item.clone(),
+            )
+            .await
+        }
+    };
     let Some(path) = path else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    let Ok(bytes) = tokio::fs::read(&path).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let content_type = image_content_type(path.as_path());
-    (
-        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
-        Body::from(bytes),
-    )
-        .into_response()
+    crate::harbinger::image_response(content_type, bytes, 300)
 }
 
 async fn play(
