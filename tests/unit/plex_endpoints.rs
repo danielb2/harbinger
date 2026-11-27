@@ -2689,6 +2689,189 @@ async fn web_library_root_shows_audiobook_cards() {
     assert!(body.contains(".media-card-book .media-card-cover,.media-card-book .media-card-cover img{aspect-ratio:1/1}"));
     assert!(!body.contains("class=\"folder-card\""));
     assert!(!body.contains("No supported media or subfolders here."));
+    assert!(body.contains("image.complete && image.naturalWidth === 0"));
+    assert!(body.contains("replaceBrokenCoverImage"));
+}
+
+#[tokio::test]
+async fn audiobook_without_cover_fails_fast_for_the_placeholder() {
+    let fixture = audiobook_web_fixture("audiobooks-no-cover");
+    let root = fixture.root.join("audiobooks-no-cover");
+    std::fs::remove_file(root.join("Author One/Book One/cover.png")).unwrap();
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/web/artwork?library=0&path=Author%20One%2FBook%20One&kind=cover",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let page = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let page = body_string(page).await;
+    assert!(page.contains("image.complete && image.naturalWidth === 0"));
+}
+
+#[tokio::test]
+async fn audiobook_library_paginates_with_a_scroll_sentinel() {
+    let fixture = audiobook_web_fixture("audiobooks-pagination");
+    let root = fixture.root.join("audiobooks-pagination");
+    for index in 0..60 {
+        let book_dir = root
+            .join(format!("Author {index:02}"))
+            .join(format!("Book {index:02}"));
+        std::fs::create_dir_all(&book_dir).unwrap();
+        std::fs::write(book_dir.join("Chapter.m4b"), b"0123456789abcdef").unwrap();
+    }
+    crate::audiobookshelf::catalog::Catalog::clear_cache();
+    let _ = crate::audiobookshelf::catalog::Catalog::load(&fixture.state);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first
+            .matches("<div class=\"media-card media-card-book\"")
+            .count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+    assert!(first.contains("IntersectionObserver"));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second
+            .matches("<div class=\"media-card media-card-book\"")
+            .count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
+}
+
+#[tokio::test]
+async fn web_connection_check_uses_a_lightweight_ping() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/web/ping", Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let page = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let page = body_string(page).await;
+    assert!(page.contains("fetch(\"/web/ping\", { cache: \"no-store\" })"));
+    assert!(!page.contains("fetch(\"/\", { cache: \"no-store\" })"));
+}
+
+#[tokio::test]
+async fn movie_library_paginates_with_a_scroll_sentinel() {
+    let fixture = fixture();
+    let media_dir = fixture.root.join("media");
+    let items = (0..61)
+        .map(|index| {
+            let path = media_dir.join(format!("Movie {index:02}.mkv"));
+            std::fs::write(&path, b"0123456789abcdef").unwrap();
+            Media {
+                id: format!("1-{}", index + 1),
+                title: format!("Movie {index:02}"),
+                path,
+                size: 16,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    *fixture.state.media.write().unwrap() = Arc::new(items);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first.matches("<div class=\"media-card\" style=").count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second.matches("<div class=\"media-card\" style=").count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
+}
+
+#[tokio::test]
+async fn tv_library_paginates_with_a_scroll_sentinel() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "tv".to_owned();
+    let media_dir = fixture.root.join("media");
+    let items = (0..61)
+        .map(|index| {
+            let path = media_dir.join(format!(
+                "Show {index:02}/season.01/Show {index:02} s01e01.mkv"
+            ));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"0123456789abcdef").unwrap();
+            Media {
+                id: format!("1-{}", index + 1),
+                title: format!("Show {index:02} s01e01"),
+                path,
+                size: 16,
+                container: "mkv".to_owned(),
+                mime: "video/x-matroska".to_owned(),
+                metadata_revision: 0,
+            }
+        })
+        .collect::<Vec<_>>();
+    *fixture.state.media.write().unwrap() = Arc::new(items);
+
+    let first = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = body_string(first).await;
+    assert_eq!(
+        first
+            .matches("<div class=\"media-card media-card-tv\" style=")
+            .count(),
+        60
+    );
+    assert!(first.contains("id=\"library-sentinel\""));
+    assert!(first.contains("data-next-offset=\"60\""));
+
+    let second = send(
+        &fixture.app,
+        Method::GET,
+        "/?library=0&offset=60",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = body_string(second).await;
+    assert_eq!(
+        second
+            .matches("<div class=\"media-card media-card-tv\" style=")
+            .count(),
+        1
+    );
+    assert!(!second.contains("id=\"library-sentinel\""));
 }
 
 #[tokio::test]

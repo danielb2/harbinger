@@ -139,7 +139,7 @@ async fn log_requests(request: Request<Body>, next: Next) -> Response {
     tracing::debug!(
         tag = "abs",
         event = "http_request",
-        request_id,
+        id = request_id,
         method = %method,
         path = %path,
         query = ?query
@@ -151,10 +151,7 @@ async fn log_requests(request: Request<Body>, next: Next) -> Response {
         tracing::warn!(
             tag = "abs",
             event = "http_response",
-            request_id,
-            method = %method,
-            path = %path,
-            query = ?query,
+            id = request_id,
             status = status.as_u16(),
             latency_ms
         );
@@ -162,10 +159,7 @@ async fn log_requests(request: Request<Body>, next: Next) -> Response {
         tracing::debug!(
             tag = "abs",
             event = "http_response",
-            request_id,
-            method = %method,
-            path = %path,
-            query = ?query,
+            id = request_id,
             status = status.as_u16(),
             latency_ms
         );

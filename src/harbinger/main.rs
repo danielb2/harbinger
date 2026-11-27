@@ -115,6 +115,7 @@ use tracing_subscriber::{
 };
 
 const POSTER_CARD_MIN_WIDTH: usize = 140;
+pub(crate) const WEB_LIBRARY_PAGE_SIZE: usize = 60;
 const WEB_UI_PORT: u16 = 4826;
 const ABS_PORT: u16 = 13378;
 pub(crate) const USER_ID: &str = "admin";
@@ -1356,7 +1357,7 @@ async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next
         debug!(
             tag,
             event = "http_request",
-            request_id,
+            id = request_id,
             remote_ip = %remote_ip,
             method = %method,
             path = %path,
@@ -1371,7 +1372,7 @@ async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next
         info!(
             tag,
             event = "http_request",
-            request_id,
+            id = request_id,
             remote_ip = %remote_ip,
             method = %method,
             path = %path,
@@ -1394,10 +1395,7 @@ async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next
             debug!(
                 tag,
                 event = "http_response",
-                request_id,
-                method = %method,
-                path = %path,
-                query = ?query,
+                id = request_id,
                 status = response.status().as_u16(),
                 latency_ms = started.elapsed().as_millis()
             );
@@ -1405,10 +1403,7 @@ async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next
             info!(
                 tag,
                 event = "http_response",
-                request_id,
-                method = %method,
-                path = %path,
-                query = ?query,
+                id = request_id,
                 status = response.status().as_u16(),
                 latency_ms = started.elapsed().as_millis()
             );
@@ -7114,6 +7109,7 @@ pub(crate) struct WebPath {
     pub(crate) kind: Option<String>,
     #[serde(alias = "v")]
     pub(crate) version: Option<i64>,
+    pub(crate) offset: Option<usize>,
     pub(crate) stream: Option<usize>,
     pub(crate) play: Option<String>,
     pub(crate) episode: Option<String>,

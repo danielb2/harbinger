@@ -67,6 +67,7 @@ pub(crate) fn web_routes() -> Router<AppState> {
         .route("/auth/login", post(auth_login))
         .route("/auth/logout", post(auth_logout))
         .route("/web/dashboard/stats", get(dashboard_stats))
+        .route("/web/ping", get(web_ping))
         .route("/web/search", get(web_search))
         .route("/web/stream", any(web_stream))
         .route("/web/index.html", get(web_index_redirect))
@@ -4165,10 +4166,18 @@ pub(crate) fn cover_artwork_markup(url: &str, label: &str) -> String {
     )
 }
 
+fn library_page_bounds(total: usize, offset: usize) -> (std::ops::Range<usize>, bool) {
+    let start = offset.min(total);
+    let end = (start + WEB_LIBRARY_PAGE_SIZE).min(total);
+    (start..end, end < total)
+}
+
 pub(crate) async fn web_client(
     State(s): State<AppState>,
     Query(mut query): Query<WebPath>,
 ) -> Response {
+    let library_offset = query.offset.unwrap_or(0);
+    let mut library_has_more = false;
     let (_, audio_language_primary, audio_language_secondary, _, _) =
         effective_plex_language_settings(&s);
     let (bilingual_enabled, language_primary, language_secondary) =
@@ -4728,14 +4737,26 @@ pub(crate) async fn web_client(
             let mut seen_paths = std::collections::HashSet::new();
             media.retain(|item| seen_paths.insert(item.path.clone()));
             if is_audiobook_library(&library.kind) {
-                if let Some(catalog) = crate::audiobookshelf::catalog::Catalog::cached(&s) {
+                let catalog = match crate::audiobookshelf::catalog::Catalog::cached(&s) {
+                    Some(catalog) => Some(catalog),
+                    None => tokio::time::timeout(
+                        Duration::from_millis(250),
+                        crate::audiobookshelf::catalog::Catalog::load_async(&s),
+                    )
+                    .await
+                    .ok(),
+                };
+                if let Some(catalog) = catalog {
                     if let Some(abs_library) = catalog
                         .libraries
                         .iter()
                         .find(|entry| entry.source_index == library_index)
                     {
+                        let (range, more) =
+                            library_page_bounds(abs_library.items.len(), library_offset);
+                        library_has_more = more;
                         let saved_progress = audiobook_progress_map(&s);
-                        for item in &abs_library.items {
+                        for item in &abs_library.items[range] {
                             let Some((folder_index, item_relative)) =
                                 abs_library.folders.iter().enumerate().find_map(
                                     |(index, folder)| {
@@ -4773,7 +4794,9 @@ pub(crate) async fn web_client(
                 shows.sort_by(|left, right| {
                     web_title_sort_key(&left.title).cmp(&web_title_sort_key(&right.title))
                 });
-                for show in shows {
+                let (range, more) = library_page_bounds(shows.len(), library_offset);
+                library_has_more = more;
+                for show in &shows[range] {
                     let Some(representative) = show.episodes.iter().max_by_key(|episode| {
                         section_metadata
                             .get(&episode.id)
@@ -4853,7 +4876,9 @@ pub(crate) async fn web_client(
                     ));
                 }
             } else {
-                for media_item in media {
+                let (range, more) = library_page_bounds(media.len(), library_offset);
+                library_has_more = more;
+                for media_item in &media[range] {
                     let Some(source_root) = library
                         .folders
                         .iter()
@@ -5096,6 +5121,13 @@ pub(crate) async fn web_client(
         }
     }
     items.push_str(&folder_cards);
+    if library_has_more {
+        items.push_str(&format!(
+            "<div id=\"library-sentinel\" data-next-offset=\"{}\" data-page-size=\"{}\" style=\"grid-column:1/-1;height:1px\"></div>",
+            library_offset + WEB_LIBRARY_PAGE_SIZE,
+            WEB_LIBRARY_PAGE_SIZE
+        ));
+    }
     items.push_str(&season_sections);
     if !has_content {
         items.push_str(r#"<p class="note">No supported media or subfolders here.</p>"#);
@@ -6241,9 +6273,11 @@ pub(crate) async fn web_client(
       video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + offset));
       }});
     }}
+    window.__mplexInfiniteLibrary = Boolean(window.document.querySelector('#library-sentinel'));
     let refreshing = false;
     async function refreshLibrary() {{
       if (refreshing) return;
+      if (window.__mplexInfiniteLibrary) return;
       if (window.document.visibilityState !== "visible") return;
       refreshing = true;
       try {{
@@ -6288,6 +6322,47 @@ pub(crate) async fn web_client(
     }}
     if (window.__mplexLibraryRefreshTimer) clearInterval(window.__mplexLibraryRefreshTimer);
     window.__mplexLibraryRefreshTimer = setInterval(refreshLibrary, 5000);
+    const infiniteSentinel = window.document.querySelector('#library-sentinel');
+    if (infiniteSentinel) {{
+      let infiniteLoading = false;
+      const loadMoreLibrary = async () => {{
+        if (infiniteLoading) return;
+        const nextOffset = infiniteSentinel.dataset.nextOffset;
+        if (!nextOffset) return;
+        infiniteLoading = true;
+        try {{
+          const url = new URL(window.location.href);
+          url.searchParams.set("offset", nextOffset);
+          const response = await fetch(url, {{ cache: "no-store" }});
+          if (!response.ok) {{
+            window.__mplexShowConnectionLost?.("Could not load more items.");
+            return;
+          }}
+          const document = new DOMParser().parseFromString(await response.text(), "text/html");
+          const nextLibrary = document.querySelector(".library");
+          const nextSentinel = document.querySelector('#library-sentinel');
+          const currentLibrary = window.document.querySelector(".library");
+          if (!nextLibrary || !currentLibrary) return;
+          const cards = [...nextLibrary.children].filter(element =>
+            element.id !== "library-sentinel" && !element.matches("nav.breadcrumb"));
+          cards.forEach(card => currentLibrary.insertBefore(card, infiniteSentinel));
+          if (nextSentinel && nextSentinel.dataset.nextOffset) {{
+            infiniteSentinel.dataset.nextOffset = nextSentinel.dataset.nextOffset;
+          }} else {{
+            infiniteSentinel.remove();
+            observer.disconnect();
+          }}
+        }} catch (_) {{
+          window.__mplexShowConnectionLost?.("Could not load more items.");
+        }} finally {{
+          infiniteLoading = false;
+        }}
+      }};
+      const observer = new IntersectionObserver(entries => {{
+        if (entries.some(entry => entry.isIntersecting)) loadMoreLibrary();
+      }}, {{ rootMargin: "800px 0px" }});
+      observer.observe(infiniteSentinel);
+    }}
   </script>
   {}{}
 </body>
@@ -7781,8 +7856,7 @@ const bindCardAction = (element, type, handler, options) => {
   element.addEventListener(type, handler, options);
   cardActionListeners.push(() => element.removeEventListener(type, handler, options));
 };
-bindCardAction(document, "error", event => {
-  const image = event.target;
+const replaceBrokenCoverImage = image => {
   if (!(image instanceof HTMLImageElement) || !image.matches(".media-card-cover img")) return;
   const placeholder = document.createElement("div");
   const title = image.alt.replace(/^Cover for /, "");
@@ -7791,7 +7865,11 @@ bindCardAction(document, "error", event => {
   placeholder.setAttribute("aria-label", `Cover unavailable for ${title}`);
   placeholder.textContent = "No cover available";
   image.replaceWith(placeholder);
-}, true);
+};
+bindCardAction(document, "error", event => replaceBrokenCoverImage(event.target), true);
+document.querySelectorAll(".media-card-cover img").forEach(image => {
+  if (image.complete && image.naturalWidth === 0) replaceBrokenCoverImage(image);
+});
 const fixMatchDialog = document.querySelector("#tv-fix-match-dialog");
 const fixMatchProvider = document.querySelector("#tv-fix-match-provider");
 const fixMatchQuery = document.querySelector("#tv-fix-match-query");
@@ -8285,7 +8363,7 @@ window.__mplexConnectionCheckTimer = window.setInterval(async () => {
   if (checkingConnection) return;
   checkingConnection = true;
   try {
-    const response = await fetch("/", { cache: "no-store" });
+    const response = await fetch("/web/ping", { cache: "no-store" });
     if (response.status === 404) {
       clearInterval(window.__mplexConnectionCheckTimer);
       window.__mplexConnectionCheckTimer = null;
@@ -9100,6 +9178,10 @@ pub(crate) fn contains_hidden_component(path: &std::path::Path) -> bool {
     path.components().any(|component| {
         matches!(component, Component::Normal(name) if name.to_str().is_some_and(|name| name.starts_with('.')))
     })
+}
+
+pub(crate) async fn web_ping() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
 pub(crate) async fn dashboard_stats(State(state): State<AppState>) -> Response {
