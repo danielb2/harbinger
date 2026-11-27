@@ -1257,6 +1257,7 @@ fn build_tagged_app(state: AppState, tag: &'static str) -> Router {
                         remote_ip = %remote_ip,
                         method = %request.method(),
                         path = %request.uri().path(),
+                        query = ?sanitized_query(request.uri()),
                         accept = ?request.headers().get(header::ACCEPT),
                         plex_product = ?plex_product,
                         client_profile = ?client_profile,
@@ -1295,6 +1296,31 @@ fn build_web_listener_app(state: AppState) -> Router {
             next.run(request).await
         },
     ))
+}
+
+pub(crate) fn sanitized_query(uri: &Uri) -> Option<String> {
+    let query = uri.query()?;
+    let mut parts = Vec::new();
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        let key = key.into_owned();
+        let sensitive = matches!(
+            key.to_ascii_lowercase().as_str(),
+            "token"
+                | "x-plex-token"
+                | "password"
+                | "auth"
+                | "access_token"
+                | "refresh_token"
+                | "pin"
+                | "code"
+        );
+        parts.push(if sensitive {
+            format!("{key}=[redacted]")
+        } else {
+            format!("{key}={value}")
+        });
+    }
+    Some(parts.join("&"))
 }
 
 fn build_plex_listener_app(state: AppState) -> Router {
@@ -1643,7 +1669,15 @@ pub(crate) async fn scan_library_inventory(
         "Scanning configured folders",
     );
     if is_audiobook_library(&library.kind) {
-        let count = crate::audiobookshelf::catalog::count_audio_files(&library);
+        let count_library = library.clone();
+        let count = tokio::task::spawn_blocking(move || {
+            crate::audiobookshelf::catalog::count_audio_files(&count_library)
+        })
+        .await
+        .unwrap_or_else(|error| {
+            warn!(library = %library.name, %error, "audiobook file count failed");
+            0
+        });
         crate::audiobookshelf::catalog::invalidate_cache();
         let matched = if match_unmatched {
             crate::audiobookshelf::matching::match_library(state, library_id, &library, manual)

@@ -23,7 +23,7 @@ pub(crate) async fn match_library(
         return 0;
     }
     super::catalog::invalidate_cache();
-    let catalog = Catalog::load(state);
+    let catalog = Catalog::load_async(state).await;
     let Some(catalog_library) = catalog
         .libraries
         .iter()

@@ -6,7 +6,10 @@ use std::{
     collections::{BTreeSet, HashMap},
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -138,29 +141,79 @@ static CATALOG_CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
 static CATALOG_BUILD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 type AudioDurationCache = Mutex<HashMap<PathBuf, (u64, i64, Option<f64>)>>;
 static AUDIO_DURATION_CACHE: OnceLock<AudioDurationCache> = OnceLock::new();
+static CATALOG_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+fn refresh_catalog_in_background(state: AppState) {
+    if CATALOG_REFRESH_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        let _ = Catalog::load(&state);
+        CATALOG_REFRESH_RUNNING.store(false, Ordering::Release);
+    });
+}
+
+fn catalog_cache_key(config: &crate::harbinger::Config) -> String {
+    config
+        .libraries
+        .iter()
+        .filter(|library| is_audiobook_library(&library.kind))
+        .map(|library| {
+            let folders = library
+                .folders
+                .iter()
+                .map(|folder| canonical_or_absolute(folder).to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{}|{}|{}", library.name, library.kind, folders)
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
 
 impl Catalog {
+    /// Load the catalog without blocking the async runtime. Catalog construction
+    /// walks media folders and probes files; doing that on a Tokio worker can
+    /// starve the entire server for a large library.
+    pub(crate) async fn load_async(state: &AppState) -> Catalog {
+        let config = state
+            .config
+            .lock()
+            .map(|config| (*config).clone())
+            .unwrap_or_else(|poison| (*poison.into_inner()).clone());
+        let key = catalog_cache_key(&config);
+        let cache = CATALOG_CACHE.get_or_init(Default::default);
+        let cached = cache.lock().ok().and_then(|guard| {
+            guard.as_ref().and_then(|entry| {
+                (entry.key == key)
+                    .then(|| (entry.catalog.clone(), entry.created.elapsed() < CATALOG_TTL))
+            })
+        });
+        if let Some((catalog, fresh)) = cached {
+            if !fresh {
+                refresh_catalog_in_background(state.clone());
+            }
+            return catalog;
+        }
+        let state = state.clone();
+        match tokio::task::spawn_blocking(move || Catalog::load(&state)).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                tracing::error!(error = %error, "audiobook catalog build task failed");
+                Catalog {
+                    libraries: Vec::new(),
+                }
+            }
+        }
+    }
+
     pub(crate) fn load(state: &AppState) -> Catalog {
         let config = state
             .config
             .lock()
             .map(|config| (*config).clone())
             .unwrap_or_else(|poison| (*poison.into_inner()).clone());
-        let key = config
-            .libraries
-            .iter()
-            .filter(|library| is_audiobook_library(&library.kind))
-            .map(|library| {
-                let folders = library
-                    .folders
-                    .iter()
-                    .map(|folder| canonical_or_absolute(folder).to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-                    .join(",");
-                format!("{}|{}|{}", library.name, library.kind, folders)
-            })
-            .collect::<Vec<_>>()
-            .join(";");
+        let key = catalog_cache_key(&config);
         let cache = CATALOG_CACHE.get_or_init(Default::default);
         if let Ok(guard) = cache.lock() {
             if let Some(entry) = guard.as_ref() {
@@ -262,7 +315,16 @@ fn build_catalog(
     config_libraries: &[crate::harbinger::ConfigLibrary],
     cover_settings: &CoverSettings,
 ) -> Catalog {
-    let libraries = config_libraries
+    let started = Instant::now();
+    let audiobook_libraries = config_libraries
+        .iter()
+        .filter(|library| is_audiobook_library(&library.kind))
+        .count();
+    tracing::info!(
+        libraries = audiobook_libraries,
+        "audiobook catalog build started"
+    );
+    let libraries: Vec<Library> = config_libraries
         .iter()
         .enumerate()
         .filter(|(_, configured)| is_audiobook_library(&configured.kind))
@@ -318,6 +380,15 @@ fn build_catalog(
             }
         })
         .collect();
+    let items = libraries
+        .iter()
+        .map(|library| library.items.len())
+        .sum::<usize>();
+    tracing::info!(
+        items,
+        elapsed_ms = started.elapsed().as_millis(),
+        "audiobook catalog build finished"
+    );
     Catalog { libraries }
 }
 

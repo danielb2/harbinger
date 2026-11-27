@@ -133,14 +133,22 @@ async fn cors(request: Request<Body>, next: Next) -> Response {
 async fn log_requests(request: Request<Body>, next: Next) -> Response {
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
+    let query = crate::harbinger::sanitized_query(request.uri());
     let started = Instant::now();
-    tracing::info!(tag = "abs", event = "http_request", method = %method, path = %path);
+    tracing::info!(
+        tag = "abs",
+        event = "http_request",
+        method = %method,
+        path = %path,
+        query = ?query
+    );
     let response = next.run(request).await;
     tracing::info!(
         tag = "abs",
         event = "http_response",
         method = %method,
         path = %path,
+        query = ?query,
         status = %response.status(),
         latency_ms = started.elapsed().as_millis()
     );
@@ -216,7 +224,7 @@ async fn login(
         Ok(tokens) => tokens,
         Err(status) => return status.into_response(),
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let default_library_id = catalog.default_library_id();
     let user = user_json(
         &identity,
@@ -271,7 +279,7 @@ async fn refresh(
         Ok(tokens) => tokens,
         Err(status) => return status.into_response(),
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let default_library_id = catalog.default_library_id();
     let user = user_json(
         &identity,
@@ -330,7 +338,7 @@ async fn authorize(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let Some((user, default_library_id)) = current_user_json(&state, &token) else {
+    let Some((user, default_library_id)) = current_user_json(&state, &token).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     Json(login_envelope(user, &default_library_id)).into_response()
@@ -344,7 +352,7 @@ async fn libraries(
     if let Err(response) = require_auth(&state, &headers, &uri) {
         return response;
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     Json(json!({
         "libraries": catalog.libraries.iter().map(library_json).collect::<Vec<_>>()
     }))
@@ -360,7 +368,7 @@ async fn library(
     if let Err(response) = require_auth(&state, &headers, &uri) {
         return response;
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     match catalog.find_library(&id) {
         Some(library) => Json(library_detail_json(library)).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
@@ -376,7 +384,7 @@ async fn library_items(
     if let Err(response) = require_auth(&state, &headers, &uri) {
         return response;
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(library) = catalog.find_library(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -447,7 +455,7 @@ async fn item(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -489,7 +497,7 @@ async fn cover(
     State(state): State<crate::harbinger::AppState>,
     Path(id): Path<String>,
 ) -> Response {
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -528,7 +536,7 @@ async fn play(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -567,7 +575,7 @@ async fn me(
         Ok(token) => token,
         Err(response) => return response,
     };
-    let Some((user, _)) = current_user_json(&state, &token) else {
+    let Some((user, _)) = current_user_json(&state, &token).await else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
     Json(user).into_response()
@@ -582,7 +590,7 @@ async fn all_progress(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     Json(progress_values(&state, &catalog, &identity.id)).into_response()
 }
 
@@ -598,7 +606,7 @@ async fn items_in_progress(
     let limit = query_value(&uri, "limit")
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(25);
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let mut results = progress_values(&state, &catalog, &identity.id)
         .into_iter()
         .filter(|progress| {
@@ -645,7 +653,7 @@ async fn progress_response(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    let catalog = Catalog::load(state);
+    let catalog = Catalog::load_async(state).await;
     let Some(item) = catalog.find_item(id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -712,7 +720,7 @@ async fn update_progress_impl(
         Err(response) => return response,
     };
     let payload = parse_json_or_default::<ProgressRequest>(&body);
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -740,7 +748,7 @@ async fn batch_progress(
     if payloads.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let mut results = Vec::new();
     for payload in payloads {
         let Some(item) = catalog.find_item(&payload.library_item_id) else {
@@ -770,7 +778,7 @@ async fn session(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&session.library_item_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -793,7 +801,7 @@ async fn sync_session(
         Err(response) => return response,
     };
     let payload = parse_json_or_default::<SessionSyncRequest>(&body);
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(session) = sessions()
         .lock()
         .ok()
@@ -852,7 +860,7 @@ async fn close_session(
         Err(response) => return response,
     };
     let payload = parse_json_or_default::<SessionSyncRequest>(&body);
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(session) = sessions()
         .lock()
         .ok()
@@ -898,7 +906,7 @@ async fn stream_file_by_ino(
     if let Err(response) = require_auth(&state, &headers, &uri) {
         return response;
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -925,7 +933,7 @@ async fn public_session_track(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&session.library_item_id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -945,7 +953,7 @@ async fn stream_track(
     if let Err(response) = require_auth(&state, &headers, &uri) {
         return response;
     }
-    let catalog = Catalog::load(&state);
+    let catalog = Catalog::load_async(&state).await;
     let Some(item) = catalog.find_item(&id) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -1100,9 +1108,12 @@ pub(crate) fn session_user(
     })
 }
 
-fn current_user_json(state: &crate::harbinger::AppState, token: &str) -> Option<(Value, String)> {
+async fn current_user_json(
+    state: &crate::harbinger::AppState,
+    token: &str,
+) -> Option<(Value, String)> {
     let identity = session_user(state, token)?;
-    let catalog = Catalog::load(state);
+    let catalog = Catalog::load_async(state).await;
     let default_library_id = catalog.default_library_id();
     let user = user_json(
         &identity,
