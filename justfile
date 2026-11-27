@@ -15,6 +15,11 @@ dev bind="0.0.0.0:32400":
 test:
     cargo test
 
+release TYPE="minor":
+    opencode run  -m 'opencode/beam-free#low' "do a {{ TYPE }} version bump in cargo.toml. tag the repo with vX.X.X format"
+    # git push --tags
+    # just publish
+
 # build docker image
 image:
     #!/usr/bin/env bash
