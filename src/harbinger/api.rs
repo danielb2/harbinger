@@ -2375,10 +2375,18 @@ document.addEventListener('click', event => {
   if (event.target.closest?.('#folder-picker-close')) folderPicker?.close();
 });
 window.addEventListener('message', event => {
-  if (event.origin !== location.origin || event.data?.type !== 'mplex-folder-selected') return;
+  if (event.origin !== location.origin) return;
+  if (event.data?.type === 'mplex-folder-picker-close') {
+    folderPicker?.close();
+    return;
+  }
+  if (event.data?.type !== 'mplex-folder-selected') return;
   const input = document.getElementById(folderPicker?.dataset.target || '');
   if (input) input.value = event.data.path;
   folderPicker?.close();
+});
+document.addEventListener('keydown', event => {
+  if (event.key === 'Escape' && folderPicker?.open) folderPicker.close();
 });
 </script>"#;
 
@@ -3467,7 +3475,7 @@ pub(crate) async fn settings_browse(Query(query): Query<BrowseQuery>) -> Respons
     );
     let page = page.replace(
         "</body>",
-        "<script>document.addEventListener('click',event=>{const link=event.target.closest?.('a.choose, .toolbar a.action[href*=\\\"/settings?folder=\\\"]');if(!link||window.parent===window)return;event.preventDefault();const path=new URL(link.href,location.origin).searchParams.get('folder');window.parent.postMessage({type:'mplex-folder-selected',path},location.origin);});</script></body>",
+        "<script>document.addEventListener('click',event=>{const link=event.target.closest?.('a.choose, .toolbar a.action[href*=\\\"/settings?folder=\\\"]');if(!link||window.parent===window)return;event.preventDefault();const path=new URL(link.href,location.origin).searchParams.get('folder');window.parent.postMessage({type:'mplex-folder-selected',path},location.origin);});document.addEventListener('keydown',event=>{if(event.key!=='Escape'||window.parent===window)return;event.preventDefault();window.parent.postMessage({type:'mplex-folder-picker-close'},location.origin);});</script></body>",
     );
     Html(add_build_info_footer(page)).into_response()
 }
@@ -4889,7 +4897,7 @@ pub(crate) async fn web_client(
                 false,
                 "item",
                 false,
-                false,
+                true,
             ));
         }
         has_content = !folder_cards.is_empty();
@@ -4929,7 +4937,7 @@ pub(crate) async fn web_client(
                 true,
                 "item",
                 false,
-                false,
+                true,
             ));
         }
         has_content = virtual_seasons.contains_key(&query.season.unwrap_or_default());
@@ -5098,7 +5106,7 @@ pub(crate) async fn web_client(
                         true,
                         "show",
                         false,
-                        false,
+                        true,
                     ));
                 }
             } else {
@@ -5184,7 +5192,7 @@ pub(crate) async fn web_client(
                             false,
                             "item",
                             false,
-                            false,
+                            true,
                         )
                     })
                     .unwrap_or_default();
@@ -5258,7 +5266,7 @@ pub(crate) async fn web_client(
                     true,
                     "item",
                     false,
-                    false,
+                    true,
                 ));
                 continue;
             }
@@ -7998,7 +8006,7 @@ pub(crate) fn media_card(
         is_metadata_library(&library_config.kind),
         "item",
         show_remove_from_continue,
-        library_config.kind == "other",
+        !is_audiobook_library(&library_config.kind),
     )
 }
 

@@ -2852,6 +2852,22 @@ async fn web_library_root_shows_audiobook_cards() {
 }
 
 #[tokio::test]
+async fn video_media_cards_offer_set_cover_image() {
+    let fixture = fixture();
+    let response = send(&fixture.app, Method::GET, "/?library=0", Body::empty()).await;
+    let body = body_string(response).await;
+    assert!(body.contains("data-media-id=\"1-1\""));
+    assert!(body.contains("data-set-cover"));
+    assert!(body.contains("Set cover image"));
+
+    let tv = tv_fixture();
+    let response = send(&tv.app, Method::GET, "/?library=0", Body::empty()).await;
+    let body = body_string(response).await;
+    assert!(body.contains("data-set-cover"));
+    assert!(body.contains("Set cover image"));
+}
+
+#[tokio::test]
 async fn audiobook_without_cover_fails_fast_for_the_placeholder() {
     let fixture = audiobook_web_fixture("audiobooks-no-cover");
     let root = fixture.root.join("audiobooks-no-cover");
@@ -8323,12 +8339,16 @@ async fn library_creation_keeps_settings_open_and_publishes_stable_scan_metadata
     assert!(settings_body.contains("id=\"folder-picker\""));
     assert!(settings_body.contains("params.get('add_library')==='true'"));
     assert!(settings_body.contains("mplex-folder-selected"));
+    assert!(settings_body.contains("mplex-folder-picker-close"));
+    assert!(settings_body.contains("event.key === 'Escape'"));
     assert!(!settings_body.contains("<strong>Scan all libraries</strong>"));
     let browser = send(&fixture.app, Method::GET, "/settings/browse", Body::empty()).await;
     let browser_body = to_bytes(browser.into_body(), usize::MAX).await.unwrap();
     let browser_body = String::from_utf8(browser_body.to_vec()).unwrap();
     assert!(browser_body.contains("window.parent.postMessage"));
     assert!(browser_body.contains("mplex-folder-selected"));
+    assert!(browser_body.contains("mplex-folder-picker-close"));
+    assert!(browser_body.contains("event.key!=='Escape'"));
 
     let providers = send(&fixture.app, Method::GET, "/media/providers", Body::empty()).await;
     let providers: serde_json::Value =

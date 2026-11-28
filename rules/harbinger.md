@@ -16,6 +16,8 @@
   - Verify: an episode represented by multiple files or metadata records appears only once in cards and episode lists.
 - spa: the webpage must be a single-page app driven by JavaScript to prevent load time. In-page actions must not trigger full-page reloads or full document navigation.
   - Verify: exercising library navigation, playback actions, cover upload, watch-state changes, and dialogs does not call `window.location.reload()` or navigate the full document; history/back-forward behavior still works.
+- modal_escape: every popup modal must close when the Escape key is pressed, including while focus is inside embedded content such as an iframe. Keep the visible close control, but a user must never have to find it to dismiss a modal.
+  - Verify: open the folder picker, metadata storage confirmation, technical information, Fix Match, and cover picker dialogs and press Escape; click into the folder picker's iframe and press Escape; every modal closes.
 - unwatched_badge: tv-series covers show the number of unwatched episodes in the top-right corner in white font on an 80% opaque background, layered on the cover; when there are no unwatched episodes show a checkmark instead of a 0.
   - Verify: a series with unwatched episodes renders the count badge, and a fully watched series renders `✓`; both are positioned over the cover with the specified background.
 
