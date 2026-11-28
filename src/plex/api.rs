@@ -4482,7 +4482,7 @@ pub(crate) async fn plex_detect_markers(
             activity_title,
             activity_detail,
         );
-        if let Err(error) = detect_markers_for_episode(state, media, kind, force, threshold).await {
+        if let Err(error) = detect_markers_for_media(state, media, kind, force, threshold).await {
             warn!(%error, marker_type = kind.as_str(), "marker detection failed");
         }
     });

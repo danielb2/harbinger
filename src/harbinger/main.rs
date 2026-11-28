@@ -1,6 +1,7 @@
 use crate::plex::plex_tls;
 #[path = "api.rs"]
 mod api;
+pub(crate) mod introdb;
 pub(crate) mod markers;
 pub(crate) mod metrics;
 mod subtitles;
@@ -143,6 +144,29 @@ fn begin_marker_detection_group(
         format!("markers:{key}"),
         format!("{} detection", kind.as_str()),
         format!("{show} · Season {season}"),
+        format!("Library: {library_name}"),
+    ))
+}
+
+fn begin_movie_marker_detection(
+    state: &AppState,
+    key: String,
+    library_name: String,
+    title: &str,
+) -> Option<metrics::ActivityGuard> {
+    let inserted = MARKER_DETECTION_GROUPS
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut groups| groups.insert(key.clone()))
+        .unwrap_or(false);
+    if !inserted {
+        return None;
+    }
+    Some(metrics::ActivityGuard::begin(
+        &state.metrics,
+        format!("markers:{key}"),
+        "markers detection",
+        title.to_owned(),
         format!("Library: {library_name}"),
     ))
 }
@@ -2086,7 +2110,7 @@ pub(crate) async fn scan_library_inventory(
             info!(library = %library.name, status = response.status().as_u16(), "automatic metadata detection finished");
         }
     }
-    if library.kind == "tv" {
+    if matches!(library.kind.as_str(), "tv" | "movie") {
         let detection_state = state.clone();
         tokio::spawn(async move {
             let mode = if manual { "manual" } else { "automatic" };
@@ -9881,6 +9905,427 @@ fn season_episode_candidates_by_number(
     episodes
 }
 
+fn media_tmdb_id(state: &AppState, media: &Media) -> Option<i64> {
+    let (section, library) = media_library(state, media)?;
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))?;
+    let media_key = database_media_key(section, &media.id);
+    let group_path = metadata_group_path(root, &media.path, &library.kind);
+    read_metadata_sidecar(state, &media_key, &group_path)?
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .filter(|id| *id > 0)
+}
+
+fn markers_present(state: &AppState, media: &Media, kind: markers::MarkerKind) -> bool {
+    if let Ok(db) = state.db.lock() {
+        if markers::markers_for_media(&db, &media.id)
+            .is_ok_and(|markers| markers.iter().any(|marker| marker.kind == kind))
+        {
+            return true;
+        }
+    }
+    let Some((_, library)) = media_library(state, media) else {
+        return false;
+    };
+    let Some(root) = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))
+    else {
+        return false;
+    };
+    marker_sidecar_target(&library, root, media).is_some_and(|(path, key)| {
+        markers::read_marker_sidecar(&path).is_some_and(|sidecar| {
+            sidecar
+                .items
+                .get(&key)
+                .is_some_and(|entry| entry.markers.iter().any(|marker| marker.kind == kind))
+        })
+    })
+}
+
+fn lookup_state_current(
+    state: &AppState,
+    media: &Media,
+    kind: markers::MarkerKind,
+    media_fingerprint: &str,
+    group_fingerprint: &str,
+) -> bool {
+    let Ok(db) = state.db.lock() else {
+        return false;
+    };
+    markers::marker_lookup_is_current(&db, &media.id, kind, media_fingerprint, group_fingerprint)
+        .unwrap_or(false)
+}
+
+fn introdb_lookup_needed(
+    state: &AppState,
+    files: &[Media],
+    fingerprints: &[String],
+    group_fingerprint: &str,
+    kind: markers::MarkerKind,
+    force: bool,
+) -> bool {
+    if force {
+        return true;
+    }
+    !files.iter().zip(fingerprints).all(|(file, fingerprint)| {
+        // Existing markers, whatever their source, are authoritative for the
+        // fallback: if the episode or movie already has this marker type there
+        // is nothing to fetch. The local lookup state additionally remembers
+        // negative results so a scan does not repeat a request that had no
+        // data. Requiring only the lookup state would also repeat requests
+        // solely because a fresh host has an empty SQLite database.
+        markers_present(state, file, kind)
+            || lookup_state_current(state, file, kind, fingerprint, group_fingerprint)
+    })
+}
+
+fn movie_introdb_lookup_needed(
+    state: &AppState,
+    media: &Media,
+    root: &std::path::Path,
+    force: bool,
+) -> bool {
+    let fingerprint = media_fingerprint(root, media);
+    let fingerprints = std::slice::from_ref(&fingerprint);
+    let group = group_fingerprint(root, std::slice::from_ref(media));
+    let stale = [markers::MarkerKind::Intro, markers::MarkerKind::Credits]
+        .into_iter()
+        .any(|kind| {
+            introdb_lookup_needed(
+                state,
+                std::slice::from_ref(media),
+                fingerprints,
+                &group,
+                kind,
+                force,
+            )
+        });
+    // Unmatched media has no TMDB identity to query. Skipping it here keeps it
+    // from consuming the per-pass lookup budget.
+    stale && media_tmdb_id(state, media).is_some()
+}
+
+fn episode_introdb_lookup_needed(
+    state: &AppState,
+    root: &std::path::Path,
+    files: &[Media],
+    force: bool,
+) -> bool {
+    let Some(representative) = files.first() else {
+        return false;
+    };
+    let fingerprints = files
+        .iter()
+        .map(|file| media_fingerprint(root, file))
+        .collect::<Vec<_>>();
+    let group = group_fingerprint(root, std::slice::from_ref(representative));
+    let stale = [markers::MarkerKind::Intro, markers::MarkerKind::Credits]
+        .into_iter()
+        .any(|kind| introdb_lookup_needed(state, files, &fingerprints, &group, kind, force));
+    stale && media_tmdb_id(state, representative).is_some()
+}
+
+async fn store_introdb_segments(
+    state: &AppState,
+    files: &[Media],
+    fingerprints: &[String],
+    group_fingerprint: &str,
+    segments: introdb::Segments,
+    kinds: &[markers::MarkerKind],
+    duration_ms: i64,
+) -> Result<usize, String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| "marker database is unavailable".to_owned())?;
+    let mut updated = 0usize;
+    for &kind in kinds {
+        let range = match kind {
+            markers::MarkerKind::Intro => segments.intro,
+            markers::MarkerKind::Credits => segments.credits,
+        };
+        for (file, fingerprint) in files.iter().zip(fingerprints) {
+            if let Some(range) = range {
+                let detected = markers::DetectedRange {
+                    start_ms: range.start_ms,
+                    end_ms: range.end_ms,
+                };
+                markers::replace_detected_markers(
+                    &db,
+                    &file.id,
+                    kind,
+                    Some(&detected),
+                    fingerprint,
+                    group_fingerprint,
+                    duration_ms,
+                )
+                .map_err(|error| format!("could not persist detected marker: {error}"))?;
+                updated += 1;
+                export_marker_sidecar(
+                    state,
+                    file,
+                    &db,
+                    Some((kind, fingerprint, group_fingerprint)),
+                )?;
+            }
+            // Record the lookup even when TheIntroDB had nothing, so the next
+            // scan does not repeat the request for the same file and group.
+            markers::record_marker_lookup(
+                &db,
+                &file.id,
+                kind,
+                fingerprint,
+                group_fingerprint,
+                range.is_some(),
+            )
+            .map_err(|error| format!("could not record marker lookup: {error}"))?;
+        }
+    }
+    Ok(updated)
+}
+
+fn store_missing_introdb_lookup(
+    state: &AppState,
+    files: &[Media],
+    fingerprints: &[String],
+    group_fingerprint: &str,
+    kinds: &[markers::MarkerKind],
+) -> Result<(), String> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| "marker database is unavailable".to_owned())?;
+    for &kind in kinds {
+        for (file, fingerprint) in files.iter().zip(fingerprints) {
+            markers::record_marker_lookup(
+                &db,
+                &file.id,
+                kind,
+                fingerprint,
+                group_fingerprint,
+                false,
+            )
+            .map_err(|error| format!("could not record marker lookup: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+async fn media_duration_from_cache(state: &AppState, media: &Media) -> Option<i64> {
+    ensure_media_info(state, media)
+        .await
+        .as_ref()
+        .and_then(technical_duration_ms)
+}
+
+/// Single-episode seasons cannot be correlated with another episode, so use
+/// the public TheIntroDB timestamps instead. Both intro and credits come from
+/// one request.
+async fn detect_introdb_markers_for_episode(
+    state: &AppState,
+    root: &std::path::Path,
+    files: &[Media],
+    season: u32,
+    episode: u32,
+    kinds: &[markers::MarkerKind],
+    force: bool,
+) -> Result<usize, String> {
+    let Some(representative) = files.first() else {
+        return Ok(0);
+    };
+    let fingerprints = files
+        .iter()
+        .map(|file| media_fingerprint(root, file))
+        .collect::<Vec<_>>();
+    let group_fingerprint = group_fingerprint(root, std::slice::from_ref(representative));
+    let needed = kinds
+        .iter()
+        .copied()
+        .filter(|kind| {
+            introdb_lookup_needed(
+                state,
+                files,
+                &fingerprints,
+                &group_fingerprint,
+                *kind,
+                force,
+            )
+        })
+        .collect::<Vec<_>>();
+    if needed.is_empty() {
+        return Ok(0);
+    }
+    let Some(tmdb_id) = media_tmdb_id(state, representative) else {
+        debug!(
+            path = %representative.path.display(),
+            "TheIntroDB fallback skipped because the episode has no TMDB show match"
+        );
+        return Ok(0);
+    };
+    let duration = media_duration_from_cache(state, representative).await;
+    let started = Instant::now();
+    match introdb::lookup(tmdb_id, Some((season, episode)), duration).await {
+        Ok(segments) => {
+            let updated = store_introdb_segments(
+                state,
+                files,
+                &fingerprints,
+                &group_fingerprint,
+                segments,
+                &needed,
+                duration.unwrap_or(i64::MAX),
+            )
+            .await?;
+            info!(
+                show_episode = ?(season, episode),
+                tmdb_id,
+                force,
+                rows_updated = updated,
+                intro = segments.intro.is_some(),
+                credits = segments.credits.is_some(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "TheIntroDB single-episode marker lookup finished"
+            );
+            Ok(updated)
+        }
+        Err(introdb::LookupError::Missing) => {
+            store_missing_introdb_lookup(state, files, &fingerprints, &group_fingerprint, &needed)?;
+            debug!(
+                show_episode = ?(season, episode),
+                tmdb_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "TheIntroDB has no timestamps for this episode"
+            );
+            Ok(0)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) async fn detect_markers_for_movie(
+    state: AppState,
+    media: Media,
+    kind: markers::MarkerKind,
+    force: bool,
+) -> Result<usize, String> {
+    detect_markers_for_movie_kinds(state, media, &[kind], force).await
+}
+
+async fn detect_markers_for_movie_kinds(
+    state: AppState,
+    media: Media,
+    kinds: &[markers::MarkerKind],
+    force: bool,
+) -> Result<usize, String> {
+    let kind = kinds.first().copied().unwrap_or(markers::MarkerKind::Intro);
+    let (_, library) = media_library(&state, &media)
+        .ok_or_else(|| "media item is not in a configured library".to_owned())?;
+    if library.kind != "movie" {
+        return Err("movie marker detection requires a movie library".to_owned());
+    }
+    let root = library
+        .folders
+        .iter()
+        .find(|folder| media.path.starts_with(folder))
+        .cloned()
+        .ok_or_else(|| "movie library folder was not found".to_owned())?;
+    let Some(tmdb_id) = media_tmdb_id(&state, &media) else {
+        debug!(
+            path = %media.path.display(),
+            "TheIntroDB fallback skipped because the movie has no TMDB match"
+        );
+        return Ok(0);
+    };
+    let fingerprint = media_fingerprint(&root, &media);
+    let group_fingerprint = group_fingerprint(&root, std::slice::from_ref(&media));
+    let files = std::slice::from_ref(&media);
+    let fingerprints = [fingerprint];
+    let needed = kinds
+        .iter()
+        .copied()
+        .filter(|kind| {
+            introdb_lookup_needed(
+                &state,
+                files,
+                &fingerprints,
+                &group_fingerprint,
+                *kind,
+                force,
+            )
+        })
+        .collect::<Vec<_>>();
+    if needed.is_empty() {
+        return Ok(0);
+    }
+    let duration = media_duration_from_cache(&state, &media).await;
+    let started = Instant::now();
+    match introdb::lookup(tmdb_id, None, duration).await {
+        Ok(segments) => {
+            let updated = store_introdb_segments(
+                &state,
+                files,
+                &fingerprints,
+                &group_fingerprint,
+                segments,
+                &needed,
+                duration.unwrap_or(i64::MAX),
+            )
+            .await?;
+            info!(
+                title = %media.title,
+                marker_type = kind.as_str(),
+                tmdb_id,
+                force,
+                rows_updated = updated,
+                intro = segments.intro.is_some(),
+                credits = segments.credits.is_some(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "TheIntroDB movie marker lookup finished"
+            );
+            Ok(updated)
+        }
+        Err(introdb::LookupError::Missing) => {
+            store_missing_introdb_lookup(
+                &state,
+                files,
+                &fingerprints,
+                &group_fingerprint,
+                &needed,
+            )?;
+            debug!(
+                title = %media.title,
+                tmdb_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                "TheIntroDB has no timestamps for this movie"
+            );
+            Ok(0)
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+pub(crate) async fn detect_markers_for_media(
+    state: AppState,
+    media: Media,
+    kind: markers::MarkerKind,
+    force: bool,
+    threshold: f32,
+) -> Result<usize, String> {
+    let library_kind = media_library(&state, &media)
+        .map(|(_, library)| library.kind)
+        .ok_or_else(|| "media item is not in a configured library".to_owned())?;
+    if library_kind == "movie" {
+        detect_markers_for_movie(state, media, kind, force).await
+    } else {
+        detect_markers_for_episode(state, media, kind, force, threshold).await
+    }
+}
+
 pub(crate) async fn detect_markers_for_episode(
     state: AppState,
     media: Media,
@@ -9888,6 +10333,20 @@ pub(crate) async fn detect_markers_for_episode(
     force: bool,
     threshold: f32,
 ) -> Result<usize, String> {
+    detect_markers_for_episode_kinds(state, media, &[kind], force, threshold).await
+}
+
+/// `kinds` is a single type for the audio path. A single-episode season
+/// resolves every requested type from one TheIntroDB lookup, so the automatic
+/// scan passes both.
+async fn detect_markers_for_episode_kinds(
+    state: AppState,
+    media: Media,
+    kinds: &[markers::MarkerKind],
+    force: bool,
+    threshold: f32,
+) -> Result<usize, String> {
+    let kind = kinds.first().copied().unwrap_or(markers::MarkerKind::Intro);
     let detection_started = Instant::now();
     let (_, library) = media_library(&state, &media)
         .ok_or_else(|| "media item is not in a configured library".to_owned())?;
@@ -9911,7 +10370,19 @@ pub(crate) async fn detect_markers_for_episode(
         episode_info.season,
     );
     if episode_groups.len() < 2 {
-        return Err("at least two episodes are required for audio marker detection".to_owned());
+        let Some(files) = episode_groups.values().next() else {
+            return Ok(0);
+        };
+        return detect_introdb_markers_for_episode(
+            &state,
+            &root,
+            files,
+            episode_info.season,
+            episode_info.episode,
+            kinds,
+            force,
+        )
+        .await;
     }
     let episodes = episode_groups
         .values()
@@ -10103,11 +10574,81 @@ pub(crate) async fn detect_markers_for_library(
         );
         return Ok(0);
     }
+    // A first scan of a large library must not turn into thousands of
+    // TheIntroDB calls. Each pass resolves a bounded batch; recorded lookups
+    // make later passes continue with the remaining items.
+    const INTRODB_LOOKUPS_PER_PASS: usize = 25;
+    let mut introdb_lookups_remaining = INTRODB_LOOKUPS_PER_PASS;
+    if library.kind == "movie" {
+        let mut updated = 0usize;
+        for media in media_snapshot(&state)
+            .iter()
+            .filter(|media| media_in_library(media, &library))
+            .filter(|media| {
+                library
+                    .folders
+                    .iter()
+                    .any(|folder| media.path.starts_with(folder))
+            })
+        {
+            let Some(root) = library
+                .folders
+                .iter()
+                .find(|folder| media.path.starts_with(folder))
+            else {
+                continue;
+            };
+            if !movie_introdb_lookup_needed(&state, media, root, force) {
+                continue;
+            }
+            if introdb_lookups_remaining == 0 {
+                debug!(
+                    library_id,
+                    "TheIntroDB lookup budget for this pass is exhausted; remaining items resume on the next scan"
+                );
+                break;
+            }
+            introdb_lookups_remaining -= 1;
+            let key = format!("{}|movie|{}", library_id, media.id);
+            let Some(_detection_activity) = begin_movie_marker_detection(
+                &state,
+                key.clone(),
+                library.name.clone(),
+                &media.title,
+            ) else {
+                continue;
+            };
+            match detect_markers_for_movie_kinds(
+                state.clone(),
+                (*media).clone(),
+                &[markers::MarkerKind::Intro, markers::MarkerKind::Credits],
+                force,
+            )
+            .await
+            {
+                Ok(count) => updated += count,
+                Err(error) => {
+                    warn!(
+                        library_id,
+                        title = %media.title,
+                        %error,
+                        "automatic TheIntroDB marker lookup failed"
+                    );
+                    end_marker_detection_group(&key);
+                    // A transport or rate-limit failure would repeat for every
+                    // remaining movie, so stop this pass instead of hammering.
+                    break;
+                }
+            }
+            end_marker_detection_group(&key);
+        }
+        return Ok(updated);
+    }
     if library.kind != "tv" {
         return Ok(0);
     }
 
-    let mut groups = BTreeMap::<(String, u32), (Media, HashSet<u32>)>::new();
+    let mut groups = BTreeMap::<(String, u32), (Media, HashSet<u32>, Vec<Media>)>::new();
     for media in media_snapshot(&state).iter() {
         let Some(root) = library
             .folders
@@ -10119,23 +10660,67 @@ pub(crate) async fn detect_markers_for_library(
         let Some(info) = tv_episode_info(root, &media.path) else {
             continue;
         };
-        groups
+        let group = groups
             .entry((tv_show_title(root, &media.path), info.season))
-            .or_insert_with(|| ((*media).clone(), HashSet::new()))
-            .1
-            .insert(info.episode);
+            .or_insert_with(|| ((*media).clone(), HashSet::new(), Vec::new()));
+        group.1.insert(info.episode);
+        group.2.push((*media).clone());
     }
 
     let mut updated = 0usize;
-    for ((show, season), (media, episodes)) in groups {
+    for ((show, season), (media, episodes, files)) in groups {
         if episodes.len() < 2 {
-            debug!(
-                library_id,
-                %show,
+            // A single episode cannot be correlated with another episode, so
+            // use TheIntroDB instead. One lookup resolves both intro and
+            // credits.
+            let Some(root) = library
+                .folders
+                .iter()
+                .find(|folder| media.path.starts_with(folder))
+            else {
+                continue;
+            };
+            if !episode_introdb_lookup_needed(&state, root, &files, force) {
+                continue;
+            }
+            if introdb_lookups_remaining == 0 {
+                debug!(
+                    library_id,
+                    "TheIntroDB lookup budget for this pass is exhausted; remaining items resume on the next scan"
+                );
+                break;
+            }
+            introdb_lookups_remaining -= 1;
+            let key = format!("{}|{}|{}|intro", library_id, show, season);
+            let Some(_detection_activity) = begin_marker_detection_group(
+                &state,
+                key.clone(),
+                library.name.clone(),
+                &show,
                 season,
-                episodes = episodes.len(),
-                "marker detection skipped; at least two episodes are required"
-            );
+                markers::MarkerKind::Intro,
+            ) else {
+                continue;
+            };
+            match detect_markers_for_episode_kinds(
+                state.clone(),
+                media.clone(),
+                &[markers::MarkerKind::Intro, markers::MarkerKind::Credits],
+                force,
+                threshold,
+            )
+            .await
+            {
+                Ok(count) => updated += count,
+                Err(error) => warn!(
+                    library_id,
+                    %show,
+                    season,
+                    %error,
+                    "automatic TheIntroDB marker lookup failed"
+                ),
+            }
+            end_marker_detection_group(&key);
             continue;
         }
         for kind in [markers::MarkerKind::Intro, markers::MarkerKind::Credits] {

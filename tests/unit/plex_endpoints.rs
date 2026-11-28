@@ -1,8 +1,10 @@
 use super::{
-    build_app, build_plex_listener_app, build_web_listener_app, load_cached_media, markers,
-    migrate_library_model, open_database, persist_media_records, plex_external_subtitle_id,
-    plex_part_id, plex_remux_audio_mode, sidebar_nav_with_settings, sync_config_libraries,
-    sync_marker_sidecars, AppState, Config, ConfigLibrary, Media, PlexTls, SkipMode,
+    build_app, build_plex_listener_app, build_web_listener_app, group_fingerprint, introdb,
+    introdb_lookup_needed, load_cached_media, markers, media_fingerprint, migrate_library_model,
+    open_database, persist_media_records, plex_external_subtitle_id, plex_part_id,
+    plex_remux_audio_mode, sidebar_nav_with_settings, store_introdb_segments,
+    store_missing_introdb_lookup, sync_config_libraries, sync_marker_sidecars, AppState, Config,
+    ConfigLibrary, Media, PlexTls, SkipMode,
 };
 use argon2::{password_hash::PasswordHash, Argon2, PasswordVerifier};
 use axum::{
@@ -11372,4 +11374,261 @@ async fn home_continue_watching_reads_admin_progress_rows() {
         .expect("continue watching content");
     assert!(continue_cards.contains("data-media-path=\"Demo.mkv\""));
     assert!(!continue_cards.contains("Nothing to resume yet"));
+}
+
+#[tokio::test]
+async fn introdb_fallback_persists_markers_and_skips_repeated_lookups() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let root = fixture.root.join("media");
+    let fingerprint = media_fingerprint(&root, &media);
+    let group = group_fingerprint(&root, std::slice::from_ref(&media));
+    let kinds = [markers::MarkerKind::Intro, markers::MarkerKind::Credits];
+
+    assert!(introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        markers::MarkerKind::Intro,
+        false,
+    ));
+
+    let updated = store_introdb_segments(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        introdb::Segments {
+            intro: Some(introdb::Segment {
+                start_ms: 5_000,
+                end_ms: 45_000,
+            }),
+            credits: Some(introdb::Segment {
+                start_ms: 3_500_000,
+                end_ms: 3_599_500,
+            }),
+        },
+        &kinds,
+        3_600_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated, 2);
+
+    {
+        let db = fixture.db.lock().unwrap();
+        let stored = markers::markers_for_media(&db, "1-1").unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].kind, markers::MarkerKind::Intro);
+        assert_eq!(stored[0].start_ms, 5_000);
+        assert_eq!(stored[0].end_ms, 45_000);
+        assert_eq!(stored[1].kind, markers::MarkerKind::Credits);
+        assert_eq!(stored[1].start_ms, 3_500_000);
+        assert!(stored[1].final_marker);
+    }
+
+    let sidecar: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fixture.root.join("media/.hbgr/skip_markers.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sidecar["items"]["Demo.mkv"]["markers"][0]["type"], "intro");
+    assert_eq!(
+        sidecar["items"]["Demo.mkv"]["fingerprints"]["intro"]["groupFingerprint"],
+        serde_json::json!(group)
+    );
+
+    // The recorded lookup keeps the next scan from repeating the request.
+    for kind in kinds {
+        assert!(!introdb_lookup_needed(
+            &fixture.state,
+            std::slice::from_ref(&media),
+            std::slice::from_ref(&fingerprint),
+            &group,
+            kind,
+            false,
+        ));
+        assert!(introdb_lookup_needed(
+            &fixture.state,
+            std::slice::from_ref(&media),
+            std::slice::from_ref(&fingerprint),
+            &group,
+            kind,
+            true,
+        ));
+    }
+
+    // Existing markers suppress the fallback even when the group changes (for
+    // example, when sibling episodes are deleted). Once a second episode is
+    // present the library scan selects the audio path by episode count, not by
+    // asking TheIntroDB again.
+    let changed_group = group_fingerprint(&root, &[media.clone(), media.clone()]);
+    assert!(!introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &changed_group,
+        markers::MarkerKind::Intro,
+        false,
+    ));
+    // A forced refresh still reaches TheIntroDB.
+    assert!(introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &changed_group,
+        markers::MarkerKind::Intro,
+        true,
+    ));
+}
+
+#[tokio::test]
+async fn introdb_missing_lookup_keeps_existing_markers_and_caches_negative_result() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let root = fixture.root.join("media");
+    let fingerprint = media_fingerprint(&root, &media);
+    let group = group_fingerprint(&root, std::slice::from_ref(&media));
+
+    {
+        let db = fixture.db.lock().unwrap();
+        markers::create_user_marker(
+            &db,
+            "1-1",
+            markers::MarkerKind::Intro,
+            5_000,
+            45_000,
+            3_600_000,
+        )
+        .unwrap();
+        markers::record_marker_lookup(
+            &db,
+            "1-1",
+            markers::MarkerKind::Credits,
+            &fingerprint,
+            &group,
+            true,
+        )
+        .unwrap();
+    }
+
+    store_missing_introdb_lookup(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        &[markers::MarkerKind::Credits],
+    )
+    .unwrap();
+
+    {
+        let db = fixture.db.lock().unwrap();
+        let stored = markers::markers_for_media(&db, "1-1").unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].kind, markers::MarkerKind::Intro);
+    }
+    assert!(!introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        markers::MarkerKind::Credits,
+        false,
+    ));
+    // The user marker already covers intro, so the fallback must not replace
+    // it; credits has no marker and a cached negative result.
+    assert!(!introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        markers::MarkerKind::Intro,
+        false,
+    ));
+
+    markers::delete_section_markers(&fixture.db.lock().unwrap(), 1).unwrap();
+    assert!(
+        markers::markers_for_media(&fixture.db.lock().unwrap(), "1-1")
+            .unwrap()
+            .is_empty()
+    );
+    assert!(introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        markers::MarkerKind::Credits,
+        false,
+    ));
+}
+
+#[tokio::test]
+async fn introdb_fallback_does_not_refetch_after_fresh_host_sidecar_import() {
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let root = fixture.root.join("media");
+    let fingerprint = media_fingerprint(&root, &media);
+    let group = group_fingerprint(&root, std::slice::from_ref(&media));
+    let kinds = [markers::MarkerKind::Intro, markers::MarkerKind::Credits];
+
+    store_introdb_segments(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        introdb::Segments {
+            intro: Some(introdb::Segment {
+                start_ms: 5_000,
+                end_ms: 45_000,
+            }),
+            credits: Some(introdb::Segment {
+                start_ms: 3_500_000,
+                end_ms: 3_599_500,
+            }),
+        },
+        &kinds,
+        3_600_000,
+    )
+    .await
+    .unwrap();
+
+    // Simulate a fresh host: the local database has no marker rows and no
+    // lookup state, but the media sidecar still carries the markers and their
+    // fingerprints.
+    {
+        let db = fixture.db.lock().unwrap();
+        db.execute("DELETE FROM media_markers", []).unwrap();
+        db.execute("DELETE FROM marker_lookup_state", []).unwrap();
+    }
+    for kind in kinds {
+        assert!(!introdb_lookup_needed(
+            &fixture.state,
+            std::slice::from_ref(&media),
+            std::slice::from_ref(&fingerprint),
+            &group,
+            kind,
+            false,
+        ));
+    }
+
+    let media_snapshot = fixture.state.media.read().unwrap().clone();
+    sync_marker_sidecars(&fixture.state, &media_snapshot);
+    {
+        let db = fixture.db.lock().unwrap();
+        assert_eq!(markers::markers_for_media(&db, "1-1").unwrap().len(), 2);
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM marker_lookup_state", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+    assert!(!introdb_lookup_needed(
+        &fixture.state,
+        std::slice::from_ref(&media),
+        std::slice::from_ref(&fingerprint),
+        &group,
+        markers::MarkerKind::Intro,
+        false,
+    ));
 }

@@ -108,7 +108,16 @@ pub(crate) fn ensure_marker_schema(connection: &Connection) -> Result<(), rusqli
              created_at INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS media_markers_lookup
-             ON media_markers(media_key, marker_type, start_ms);",
+             ON media_markers(media_key, marker_type, start_ms);
+         CREATE TABLE IF NOT EXISTS marker_lookup_state (
+             media_key TEXT NOT NULL,
+             marker_type TEXT NOT NULL CHECK(marker_type IN ('intro', 'credits')),
+             media_fingerprint TEXT NOT NULL,
+             group_fingerprint TEXT NOT NULL,
+             found INTEGER NOT NULL,
+             checked_at INTEGER NOT NULL,
+             PRIMARY KEY (media_key, marker_type)
+         );",
     )
 }
 
@@ -266,10 +275,74 @@ pub(crate) fn delete_section_markers(
     connection: &Connection,
     section_id: u64,
 ) -> Result<usize, rusqlite::Error> {
-    Ok(connection.execute(
+    let marker_rows = connection.execute(
         "DELETE FROM media_markers WHERE media_key LIKE ?1",
         [format!("{section_id}-%")],
-    )?)
+    )?;
+    connection.execute(
+        "DELETE FROM marker_lookup_state WHERE media_key LIKE ?1",
+        [format!("{section_id}-%")],
+    )?;
+    Ok(marker_rows)
+}
+
+/// Whether a remote lookup (TheIntroDB) was already recorded for this media,
+/// marker type, and fingerprint pair. Recording negative results too keeps a
+/// scan pass from re-querying every movie or single episode that has no data.
+pub(crate) fn marker_lookup_is_current(
+    connection: &Connection,
+    media_key: &str,
+    kind: MarkerKind,
+    media_fingerprint: &str,
+    group_fingerprint: &str,
+) -> Result<bool, rusqlite::Error> {
+    Ok(connection
+        .query_row(
+            "SELECT 1 FROM marker_lookup_state
+              WHERE media_key = ?1 AND marker_type = ?2
+                AND media_fingerprint = ?3 AND group_fingerprint = ?4",
+            params![
+                media_key,
+                kind.as_str(),
+                media_fingerprint,
+                group_fingerprint
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+pub(crate) fn record_marker_lookup(
+    connection: &Connection,
+    media_key: &str,
+    kind: MarkerKind,
+    media_fingerprint: &str,
+    group_fingerprint: &str,
+    found: bool,
+) -> Result<(), rusqlite::Error> {
+    connection.execute(
+        "INSERT INTO marker_lookup_state
+             (media_key, marker_type, media_fingerprint, group_fingerprint, found, checked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(media_key, marker_type) DO UPDATE SET
+             media_fingerprint = excluded.media_fingerprint,
+             group_fingerprint = excluded.group_fingerprint,
+             found = excluded.found,
+             checked_at = excluded.checked_at",
+        params![
+            media_key,
+            kind.as_str(),
+            media_fingerprint,
+            group_fingerprint,
+            i64::from(found),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64
+        ],
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
