@@ -1358,6 +1358,7 @@ async fn log_http_exchange(tag: &'static str, request: Request<Body>, next: Next
     // Artwork and favicon requests are high-volume and rarely useful at the
     // default level; keep them available when debug logging is enabled.
     let noisy = path == "/favicon.ico"
+        || path == "/web/ping"
         || path == "/web/artwork"
         || path.starts_with("/web/artwork/")
         || path.starts_with("/web/episode-artwork/");
@@ -5991,11 +5992,13 @@ pub(crate) async fn inspect_media(path: &std::path::Path) -> Option<serde_json::
     let started = Instant::now();
     let inspect_path = path.to_owned();
     let result = tokio::task::spawn_blocking(move || {
-        vuio_media_info::inspect(inspect_path)
+        let json = vuio_media_info::inspect(&inspect_path)
             .ok()?
             .to_json()
-            .ok()
-            .and_then(|json| serde_json::from_str(&json).ok())
+            .ok()?;
+        let mut value: serde_json::Value = serde_json::from_str(&json).ok()?;
+        fill_missing_matroska_languages(&inspect_path, &mut value);
+        Some(value)
     })
     .await
     .ok()
@@ -6010,6 +6013,81 @@ pub(crate) async fn inspect_media(path: &std::path::Path) -> Option<serde_json::
         );
     }
     result
+}
+
+/// vuio sometimes reports Matroska text tracks without their language tag even
+/// though the track has one. Fill only missing/unknown languages from the
+/// container header so the subtitle picker and translation source agree with
+/// ffprobe without running an external process.
+fn fill_missing_matroska_languages(path: &std::path::Path, info: &mut serde_json::Value) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return;
+    };
+    let Ok(container) = MatroskaFile::open(file) else {
+        return;
+    };
+    let languages = container
+        .tracks()
+        .iter()
+        .filter_map(|track| {
+            let language = track.language_bcp47().or_else(|| track.language())?;
+            let (code, _) = plex_language(language);
+            (code != "und").then(|| (track.track_number().get(), code.to_owned()))
+        })
+        .collect::<HashMap<_, _>>();
+    if languages.is_empty() {
+        return;
+    }
+    fill_missing_track_languages(info, &languages);
+}
+
+fn fill_missing_track_languages(info: &mut serde_json::Value, languages: &HashMap<u64, String>) {
+    let Some(tracks) = info
+        .get_mut("media")
+        .and_then(|media| media.get_mut("track"))
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for track in tracks {
+        if track
+            .get("Language")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|language| plex_language(language).0 != "und")
+        {
+            continue;
+        }
+        let id = track
+            .get("ID")
+            .or_else(|| track.get("StreamOrder"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| id.parse::<u64>().ok());
+        if let Some(language) = id.and_then(|id| languages.get(&id)) {
+            track["Language"] = serde_json::json!(language);
+        }
+    }
+}
+
+#[cfg(test)]
+mod subtitle_language_tests {
+    use super::fill_missing_track_languages;
+    use std::collections::HashMap;
+
+    #[test]
+    fn fills_missing_matroska_languages_without_overwriting_known_ones() {
+        let mut info = serde_json::json!({
+            "media": {
+                "track": [
+                    {"ID": "3", "@type": "Text", "Format": "UTF-8"},
+                    {"ID": "4", "@type": "Text", "Language": "chi"}
+                ]
+            }
+        });
+        let languages = HashMap::from([(3, "en".to_owned()), (4, "zh".to_owned())]);
+        fill_missing_track_languages(&mut info, &languages);
+        assert_eq!(info["media"]["track"][0]["Language"], "en");
+        assert_eq!(info["media"]["track"][1]["Language"], "chi");
+    }
 }
 
 pub(crate) fn technical_tracks(info: &serde_json::Value) -> &[serde_json::Value] {
@@ -7345,10 +7423,15 @@ pub(crate) async fn cached_media_info(
     }
     let read_state = state.clone();
     let read_media = media.clone();
-    let info = tokio::task::spawn_blocking(move || sidecar_media_info(&read_state, &read_media))
-        .await
-        .ok()
-        .flatten()?;
+    let info = tokio::task::spawn_blocking(move || {
+        sidecar_media_info(&read_state, &read_media).map(|mut info| {
+            fill_missing_matroska_languages(&read_media.path, &mut info);
+            info
+        })
+    })
+    .await
+    .ok()
+    .flatten()?;
     store_media_info(state, media, info.clone());
     Some(info)
 }
