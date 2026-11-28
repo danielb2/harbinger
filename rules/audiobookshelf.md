@@ -1,6 +1,7 @@
 # audiobookshelf rules
 
 - abs_check_references: consult the official Audiobookshelf implementation to match API behavior (https://github.com/advplyr/audiobookshelf).
+    - https://github.com/likhithpraveenk/storii
   - Verify: cite the ABS source or documented behavior in the change notes for every ABS endpoint, scanner, or metadata behavior change.
 - abs_api: the ABS-compatible API in `src/audiobookshelf/` serves audiobook libraries and items as books, including library browsing, item detail, covers, and playback/progress. Use `abs_check_references` when adding or changing ABS endpoints.
   - Verify: the affected routes and prefix aliases are exercised by `tests/unit/abs_endpoints.rs`.

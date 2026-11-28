@@ -4032,7 +4032,7 @@ async fn my_listening_stats(
             let day = date.format("%Y-%m-%d").to_string();
             *days.entry(day).or_insert(0.0) += session.time_listened;
             *day_of_week
-                .entry(date.weekday().num_days_from_sunday().to_string())
+                .entry(date.format("%A").to_string())
                 .or_insert(0.0) += session.time_listened;
         }
         let Some(item) = catalog.find_item(&session.item_id) else {

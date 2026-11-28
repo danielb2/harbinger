@@ -1465,6 +1465,20 @@ async fn year_stats_report_sessions_and_finished_books() {
     assert_eq!(listening["recentSessions"].as_array().unwrap().len(), 1);
     assert!(listening["days"].is_object());
     assert!(listening["dayOfWeek"].is_object());
+    assert!(listening["dayOfWeek"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .all(|key| [
+            "Sunday",
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday"
+        ]
+        .contains(&key.as_str())));
     assert!(listening["items"].is_object());
 
     let library_id = catalog_library_id(&fixture, &token).await;
