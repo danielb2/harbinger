@@ -1094,6 +1094,17 @@ pub(crate) async fn set_audiobook_cover(
     if body.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    let Some(kind) = state.config.lock().ok().and_then(|config| {
+        config
+            .libraries
+            .get(library_index)
+            .map(|library| library.kind.clone())
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !crate::harbinger::is_audiobook_library(&kind) {
+        return save_video_cover(&state, library_index, query.folder, &relative, &body).await;
+    }
     let Some(extension) = crate::audiobookshelf::scanner::image_extension(&body) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     };
@@ -1165,6 +1176,28 @@ pub(crate) async fn audiobook_cover_options(
     let Some(relative) = query.path.as_deref().and_then(clean_relative_path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let Some(kind) = state.config.lock().ok().and_then(|config| {
+        config
+            .libraries
+            .get(library_index)
+            .map(|library| library.kind.clone())
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if !crate::harbinger::is_audiobook_library(&kind) {
+        if video_cover_library_and_media(&state, library_index, query.folder, &relative)
+            .await
+            .is_none()
+        {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        return Json(serde_json::json!({
+            "stored": [],
+            "embedded": false,
+            "folder": []
+        }))
+        .into_response();
+    }
     let Some(item) = audiobook_item_for_match(&state, library_index, query.folder, &relative).await
     else {
         return StatusCode::NOT_FOUND.into_response();
@@ -1382,42 +1415,29 @@ pub(crate) async fn set_audiobook_cover_url(
     let Some(relative) = clean_relative_path(&request.path) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let parsed = match reqwest::Url::parse(request.url.trim()) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
-        _ => return StatusCode::BAD_REQUEST.into_response(),
+    let Some(kind) = state.config.lock().ok().and_then(|config| {
+        config
+            .libraries
+            .get(library_index)
+            .map(|library| library.kind.clone())
+    }) else {
+        return StatusCode::BAD_REQUEST.into_response();
     };
+    if !crate::harbinger::is_audiobook_library(&kind) {
+        let bytes = match download_cover_image(&request.url).await {
+            Ok(bytes) => bytes,
+            Err(response) => return response,
+        };
+        return save_video_cover(&state, library_index, request.folder, &relative, &bytes).await;
+    }
     let Some(item) =
         audiobook_item_for_match(&state, library_index, request.folder, &relative).await
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(20))
-        .user_agent(format!("harbinger/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
-        Ok(client) => client,
-        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
-    };
-    let response = match client.get(parsed).send().await {
-        Ok(response) if response.status().is_success() => response,
-        _ => {
-            return (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({ "error": "Could not download that cover image." })),
-            )
-                .into_response()
-        }
-    };
-    let bytes = match response.bytes().await {
-        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024 => bytes.to_vec(),
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "The cover image is empty or too large." })),
-            )
-                .into_response()
-        }
+    let bytes = match download_cover_image(&request.url).await {
+        Ok(bytes) => bytes,
+        Err(response) => return response,
     };
     let Some(extension) = crate::audiobookshelf::scanner::image_extension(&bytes) else {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
@@ -1435,6 +1455,184 @@ pub(crate) async fn set_audiobook_cover_url(
 fn safe_cover_file(name: &str) -> Option<&str> {
     let path = std::path::Path::new(name);
     (path.components().count() == 1 && !name.starts_with('.')).then_some(name)
+}
+
+async fn download_cover_image(url: &str) -> Result<Vec<u8>, Response> {
+    let parsed = match reqwest::Url::parse(url.trim()) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        _ => return Err(StatusCode::BAD_REQUEST.into_response()),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .user_agent(format!("harbinger/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    };
+    let response = match client.get(parsed).send().await {
+        Ok(response) if response.status().is_success() => response,
+        _ => {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({ "error": "Could not download that cover image." })),
+            )
+                .into_response())
+        }
+    };
+    match response.bytes().await {
+        Ok(bytes) if !bytes.is_empty() && bytes.len() <= 10 * 1024 * 1024 => Ok(bytes.to_vec()),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "The cover image is empty or too large." })),
+        )
+            .into_response()),
+    }
+}
+
+async fn video_cover_library_and_media(
+    state: &AppState,
+    library_index: usize,
+    folder: Option<usize>,
+    relative: &std::path::Path,
+) -> Option<(ConfigLibrary, Media)> {
+    let library = state
+        .config
+        .lock()
+        .ok()?
+        .libraries
+        .get(library_index)?
+        .clone();
+    let root = selected_library_folder_root(state, Some(library_index), folder);
+    let media = web_media_for_relative(state, &root, relative).await?;
+    Some((library, media))
+}
+
+fn video_cover_directory(
+    state: &AppState,
+    library_index: usize,
+    library: &ConfigLibrary,
+    media: &Media,
+) -> Option<PathBuf> {
+    let root = library
+        .folders
+        .iter()
+        .find(|root| media.path.starts_with(root))?;
+    let group_path = metadata_group_path(root, &media.path, &library.kind);
+    let config_mode = state
+        .config
+        .lock()
+        .ok()
+        .is_some_and(|config| config.metadata_storage == "config");
+    if config_mode {
+        let media_index = media_snapshot(state);
+        let representative = media_index
+            .iter()
+            .find(|candidate| {
+                media_in_library(candidate, library)
+                    && metadata_group_path(root, &candidate.path, &library.kind) == group_path
+            })
+            .unwrap_or(media);
+        let key = database_media_key(library_index + 1, &representative.id);
+        return config_metadata_sidecar_path(state, &key)
+            .parent()
+            .map(|path| path.to_path_buf());
+    }
+    let group_directory = if group_path.is_file() {
+        group_path.parent()?.to_path_buf()
+    } else {
+        group_path
+    };
+    if library.kind == "other" {
+        return Some(group_directory.join(".hbgr").join(&media.id));
+    }
+    Some(group_directory.join(".hbgr"))
+}
+
+async fn normalize_video_cover_jpeg(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some(bytes.to_vec());
+    }
+    let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+    let mut child = tokio::process::Command::new(ffmpeg)
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-threads")
+        .arg("1")
+        .arg("-i")
+        .arg("pipe:0")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-f")
+        .arg("image2")
+        .arg("-c:v")
+        .arg("mjpeg")
+        .arg("-q:v")
+        .arg("2")
+        .arg("pipe:1")
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take()?;
+        if stdin.write_all(bytes).await.is_err() {
+            return None;
+        }
+    }
+    let output = child.wait_with_output().await.ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+    Some(output.stdout)
+}
+
+async fn save_video_cover(
+    state: &AppState,
+    library_index: usize,
+    folder: Option<usize>,
+    relative: &std::path::Path,
+    bytes: &[u8],
+) -> Response {
+    if crate::audiobookshelf::scanner::image_extension(bytes).is_none() {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
+    let Some((library, media)) =
+        video_cover_library_and_media(state, library_index, folder, relative).await
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if crate::harbinger::is_audiobook_library(&library.kind) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(jpeg) = normalize_video_cover_jpeg(bytes).await else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let Some(directory) = video_cover_directory(state, library_index, &library, &media) else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    if tokio::fs::create_dir_all(&directory).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    let target = directory.join("cover.jpg");
+    let temporary = directory.join(format!("cover.{}.tmp", std::process::id()));
+    if tokio::fs::write(&temporary, &jpeg).await.is_err() {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    if tokio::fs::rename(&temporary, &target).await.is_err() {
+        let _ = tokio::fs::remove_file(&temporary).await;
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    info!(
+        path = %relative.display(),
+        library = library_index,
+        "Video cover image saved"
+    );
+    StatusCode::NO_CONTENT.into_response()
 }
 
 pub(crate) async fn web_subtitle_selection(
@@ -4134,13 +4332,21 @@ pub(crate) async fn library_artwork(
     library: &ConfigLibrary,
     index: usize,
 ) -> Option<(String, String)> {
+    let media_index = media_snapshot(state);
+    if library.kind == "other" {
+        let media = media_index
+            .iter()
+            .find(|media| media_in_library(media, library))?;
+        let cover = media_cover_url(&media.id);
+        return Some((cover.clone(), cover));
+    }
     let root = library.folders.first()?;
     let config_mode = state
         .config
         .lock()
         .ok()
         .is_some_and(|config| config.metadata_storage == "config");
-    for media in media_snapshot(state)
+    for media in media_index
         .iter()
         .filter(|media| media_in_library(media, library))
     {
@@ -4683,6 +4889,7 @@ pub(crate) async fn web_client(
                 false,
                 "item",
                 false,
+                false,
             ));
         }
         has_content = !folder_cards.is_empty();
@@ -4721,6 +4928,7 @@ pub(crate) async fn web_client(
                 true,
                 true,
                 "item",
+                false,
                 false,
             ));
         }
@@ -4890,6 +5098,7 @@ pub(crate) async fn web_client(
                         true,
                         "show",
                         false,
+                        false,
                     ));
                 }
             } else {
@@ -4975,6 +5184,7 @@ pub(crate) async fn web_client(
                             false,
                             "item",
                             false,
+                            false,
                         )
                     })
                     .unwrap_or_default();
@@ -5047,6 +5257,7 @@ pub(crate) async fn web_client(
                     true,
                     true,
                     "item",
+                    false,
                     false,
                 ));
                 continue;
@@ -7787,6 +7998,7 @@ pub(crate) fn media_card(
         is_metadata_library(&library_config.kind),
         "item",
         show_remove_from_continue,
+        library_config.kind == "other",
     )
 }
 
@@ -7943,6 +8155,39 @@ const bookCoverUrl = document.querySelector("#book-cover-url");
 const bookCoverUrlUse = document.querySelector("#book-cover-url-use");
 const bookCoverUpload = document.querySelector("#book-cover-upload");
 const bookCoverUploadInput = document.querySelector("#book-cover-upload-input");
+const coverSectionGrids = [bookCoverStored, bookCoverEmbedded, bookCoverFolder];
+const setCoverSectionsVisible = visible => {
+  coverSectionGrids.forEach(grid => {
+    if (grid) grid.hidden = !visible;
+    const heading = grid?.previousElementSibling;
+    if (heading?.tagName === "H3") heading.hidden = !visible;
+  });
+};
+const finishCoverSave = () => {
+  const scope = bookCoverDialog?.__coverScope;
+  const isBook = bookCoverDialog?.dataset.mode === "book";
+  bookCoverDialog?.close();
+  if (isBook) {
+    refreshPage();
+    return;
+  }
+  const cover = scope?.querySelector(".media-card-cover");
+  if (!cover) return;
+  const image = cover.querySelector("img");
+  if (image) {
+    image.src = `${image.src.split("?")[0]}?v=${Date.now()}`;
+    return;
+  }
+  const mediaId = scope.dataset.mediaId;
+  if (!mediaId) return;
+  const replacement = document.createElement("img");
+  replacement.alt = `Cover for ${scope.querySelector(".media-card-title")?.textContent || "media"}`;
+  replacement.loading = "lazy";
+  replacement.src = `/web/artwork/media/${encodeURIComponent(mediaId)}/cover?v=${Date.now()}`;
+  const placeholder = cover.querySelector(".media-cover-placeholder");
+  if (placeholder) placeholder.replaceWith(replacement);
+  else cover.append(replacement);
+};
 const fixMatchSearchButton = document.querySelector("#tv-fix-match-search");
 const fixMatchStatus = document.querySelector("#tv-fix-match-status");
 const fixMatchResults = document.querySelector("#tv-fix-match-results");
@@ -8165,6 +8410,14 @@ const openBookCoverDialog = async trigger => {
   bookCoverDialog.dataset.library = library;
   bookCoverDialog.dataset.folder = scope?.dataset.folder || "0";
   bookCoverDialog.dataset.path = path;
+  const isBook = Boolean(
+    trigger.closest(".media-card-book")
+    || trigger.closest(".audiobook-detail")
+    || scope?.dataset.watchScope === "audiobook"
+  );
+  bookCoverDialog.dataset.mode = isBook ? "book" : "video";
+  bookCoverDialog.__coverScope = scope;
+  setCoverSectionsVisible(isBook);
   bookCoverStored.replaceChildren();
   bookCoverEmbedded.replaceChildren();
   bookCoverFolder.replaceChildren();
@@ -8211,8 +8464,7 @@ const saveBookCoverUrl = async () => {
       })
     });
     if (!response.ok) throw new Error("Could not download that cover.");
-    bookCoverDialog.close();
-    refreshPage();
+    finishCoverSave();
   } catch (error) {
     bookCoverStatus.textContent = error.message || "Could not download that cover.";
   } finally {
@@ -8228,8 +8480,7 @@ const uploadBookCover = async file => {
       { method: "POST", headers: { "content-type": file.type || "application/octet-stream" }, body: await file.arrayBuffer() }
     );
     if (!response.ok) throw new Error("Could not save that cover.");
-    bookCoverDialog.close();
-    refreshPage();
+    finishCoverSave();
   } catch (error) {
     bookCoverStatus.textContent = error.message || "Could not save that cover.";
   }
@@ -8748,6 +8999,7 @@ fn audiobook_media_card(
         false,
         cover_url.as_deref(),
         Some(&item.id),
+        false,
     )
 }
 

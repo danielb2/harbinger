@@ -23,22 +23,22 @@ pub(crate) use crate::plex::api::{
     plex_auth_client_identifier, plex_auth_product, plex_auth_status, plex_auth_url, plex_codec,
     plex_connection_urls, plex_connectivity_check, plex_cors, plex_device_announce_query,
     plex_device_announce_url, plex_device_jwk, plex_device_key, plex_external_subtitle_id,
-    plex_frame_cover, plex_json, plex_language, plex_language_code_3, plex_machine_identifier,
-    plex_media_id, plex_notification_response, plex_part_id, plex_photo_source,
-    plex_playback_decision, plex_playback_media_from_query, plex_prefs, plex_presence_url,
-    plex_profile_requests_hls_mkv, plex_protocol_response, plex_query_value, plex_rating_key,
-    plex_remux_resource, plex_remux_start, plex_request_token, plex_resource_connection_summary,
-    plex_resources_contain, plex_resources_contain_local_connection,
-    plex_resources_contain_local_https, plex_root, plex_scrobble, plex_section_metadata,
-    plex_server_registration_url, plex_server_registration_xml, plex_startup_registration,
-    plex_timeline, plex_track_label, plex_track_label_with_fallback, plex_track_language,
-    plex_translated_subtitle_id, plex_tv_season_groups, plex_tv_season_key, plex_tv_show_groups,
-    plex_user_avatar, plex_user_avatar_source, plex_video_level, plex_video_profile,
-    plex_video_resolution, plex_webhook_access_tokens, plex_webhook_account,
-    plex_webhook_account_from_access_tokens, plex_webhook_destinations,
-    plex_webhook_destinations_for_account, plex_webhook_metadata, plex_webhook_player,
-    plex_webhook_server_token, PlexClaimTokenResponse, PlexPinResponse, PlexRemuxSession,
-    PlexScrobbleQuery, PlexStreamSelection, PlexTimelineQuery, PlexTvShowGroup,
+    plex_frame_cover, plex_frame_cover_cache_path, plex_frame_cover_with_ffmpeg, plex_json,
+    plex_language, plex_language_code_3, plex_machine_identifier, plex_media_id,
+    plex_notification_response, plex_part_id, plex_photo_source, plex_playback_decision,
+    plex_playback_media_from_query, plex_prefs, plex_presence_url, plex_profile_requests_hls_mkv,
+    plex_protocol_response, plex_query_value, plex_rating_key, plex_remux_resource,
+    plex_remux_start, plex_request_token, plex_resource_connection_summary, plex_resources_contain,
+    plex_resources_contain_local_connection, plex_resources_contain_local_https, plex_root,
+    plex_scrobble, plex_section_metadata, plex_server_registration_url,
+    plex_server_registration_xml, plex_startup_registration, plex_timeline, plex_track_label,
+    plex_track_label_with_fallback, plex_track_language, plex_translated_subtitle_id,
+    plex_tv_season_groups, plex_tv_season_key, plex_tv_show_groups, plex_user_avatar,
+    plex_user_avatar_source, plex_video_level, plex_video_profile, plex_video_resolution,
+    plex_webhook_access_tokens, plex_webhook_account, plex_webhook_account_from_access_tokens,
+    plex_webhook_destinations, plex_webhook_destinations_for_account, plex_webhook_metadata,
+    plex_webhook_player, plex_webhook_server_token, PlexClaimTokenResponse, PlexPinResponse,
+    PlexRemuxSession, PlexScrobbleQuery, PlexStreamSelection, PlexTimelineQuery, PlexTvShowGroup,
     PLEX_DEFAULT_AUDIO_LANGUAGE,
 };
 #[cfg(test)]
@@ -8612,6 +8612,7 @@ fn media_cover_card(
     allow_metadata_actions: bool,
     watch_scope: &str,
     show_remove_from_continue: bool,
+    allow_cover_upload: bool,
 ) -> String {
     media_card_with_options(
         media_id,
@@ -8629,6 +8630,7 @@ fn media_cover_card(
         show_remove_from_continue,
         None,
         None,
+        allow_cover_upload,
     )
 }
 
@@ -8648,6 +8650,7 @@ pub(crate) fn media_card_with_options(
     show_remove_from_continue: bool,
     cover_url: Option<&str>,
     watch_key: Option<&str>,
+    allow_cover_upload: bool,
 ) -> String {
     let subtitle = subtitle
         .map(|value| format!("<span class=\"media-card-subtitle\">{}</span>", html(value)))
@@ -8772,6 +8775,8 @@ pub(crate) fn media_card_with_options(
     };
     let set_cover_action = if book_card {
         r#"<button type="button" data-set-cover>Set cover image</button><button type="button" data-book-match>Match audiobook</button>"#
+    } else if allow_cover_upload {
+        r#"<button type="button" data-set-cover>Set cover image</button>"#
     } else {
         ""
     };
@@ -8779,9 +8784,10 @@ pub(crate) fn media_card_with_options(
         r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{watched_label}</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{unwatched_label}</button>{set_cover_action}{remove_action}{fix_match_action}</div></details>"#
     );
     let card = format!(
-        r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a>{}</div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
+        r#"<div class="{}" style="{}" data-media-id="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a>{}</div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
         card_class,
         card_style,
+        html(media_id.unwrap_or_default()),
         path,
         library,
         folder_index,

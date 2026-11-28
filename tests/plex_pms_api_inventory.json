@@ -856,7 +856,7 @@
       "path": "/library/sections/{sectionId}/composite/{updatedAt}",
       "operation_id": "librarySectionGetComposite",
       "summary": "Get a section composite image",
-      "expected_status": 404
+      "expected_status": 200
     },
     {
       "method": "GET",

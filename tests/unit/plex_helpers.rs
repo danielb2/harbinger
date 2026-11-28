@@ -639,6 +639,7 @@ fn missing_cover_markup_uses_a_readable_fallback() {
         true,
         "show",
         false,
+        false,
     );
     assert!(card.contains("No cover available"));
     assert!(card.contains("Cover unavailable for Missing Artwork"));
@@ -1675,6 +1676,7 @@ fn tv_show_cover_badge_shows_unwatched_count_or_checkmark() {
             true,
             true,
             "show",
+            false,
             false,
         )
     };

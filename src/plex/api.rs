@@ -173,6 +173,14 @@ pub(crate) fn plex_routes() -> Router<AppState> {
         )
         .route("/library/metadata/:id/thumb", get(plex_thumb))
         .route("/library/metadata/:id/art", get(plex_art))
+        .route(
+            "/library/sections/:section/composite",
+            get(plex_section_composite),
+        )
+        .route(
+            "/library/sections/:section/composite/:updated_at",
+            get(plex_section_composite_versioned),
+        )
         .route("/media/:id", any(stream_media))
 }
 
@@ -2923,6 +2931,8 @@ pub(crate) fn plex_create_section_xml(directory: &serde_json::Value) -> String {
         "directory",
         "contentChangedAt",
         "hidden",
+        "composite",
+        "thumb",
     ]
     .iter()
     .filter_map(|name| {
@@ -8868,12 +8878,24 @@ pub(crate) async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> 
     };
     let season_directory = media.path.parent().unwrap_or(root);
     let media_artwork = if library.kind == "tv" && filename == "cover.jpg" {
-        [
+        vec![
             season_directory.join(".hbgr").join(filename),
             group_directory.join(".hbgr").join(filename),
         ]
+    } else if library.kind == "other" {
+        vec![
+            media
+                .path
+                .parent()
+                .unwrap_or(root)
+                .join(".hbgr")
+                .join(&media.id)
+                .join(filename),
+            group_directory.join(".hbgr").join(filename),
+            season_directory.join(".hbgr").join(filename),
+        ]
     } else {
-        [
+        vec![
             group_directory.join(".hbgr").join(filename),
             season_directory.join(".hbgr").join(filename),
         ]
@@ -8930,7 +8952,40 @@ pub(crate) async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> 
     StatusCode::NOT_FOUND.into_response()
 }
 
-pub(crate) async fn plex_frame_cover(state: &AppState, media: &Media) -> Option<Vec<u8>> {
+pub(crate) async fn plex_section_composite(
+    State(state): State<AppState>,
+    Path(section): Path<usize>,
+) -> Response {
+    let libraries = state
+        .config
+        .lock()
+        .map(|config| config.libraries.clone())
+        .unwrap_or_default();
+    let Some(library) = section
+        .checked_sub(1)
+        .and_then(|index| libraries.get(index))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let media_index = media_snapshot(&state);
+    let Some(media) = media_index
+        .iter()
+        .find(|media| media_in_library(media, library))
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    plex_artwork(&state, &media.id, "cover.jpg").await
+}
+
+pub(crate) async fn plex_section_composite_versioned(
+    State(state): State<AppState>,
+    Path((section, _updated_at)): Path<(usize, String)>,
+) -> Response {
+    plex_section_composite(State(state), Path(section)).await
+}
+
+/// Cache path for a generated video-frame thumbnail.
+pub(crate) fn plex_frame_cover_cache_path(state: &AppState, media: &Media) -> PathBuf {
     let cache_dir = state
         .config_path
         .parent()
@@ -8939,19 +8994,131 @@ pub(crate) async fn plex_frame_cover(state: &AppState, media: &Media) -> Option<
     let cache_key = format!(
         "{:x}",
         Sha256::digest(format!(
-            "{}:{}:{}",
+            "frame:v1:{}:{}:{}",
             media.id,
             media.size,
             media_modified_at(media)
         ))
     );
-    let cache_path = cache_dir.join(format!("{cache_key}.jpg"));
+    cache_dir.join(format!("{cache_key}.jpg"))
+}
+
+static FRAME_COVER_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+static FRAME_COVER_LOCKS: OnceLock<
+    std::sync::Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+> = OnceLock::new();
+
+pub(crate) async fn plex_frame_cover(state: &AppState, media: &Media) -> Option<Vec<u8>> {
+    let ffmpeg = std::env::var("HARBINGER_FFMPEG").unwrap_or_else(|_| "ffmpeg".to_owned());
+    plex_frame_cover_with_ffmpeg(state, media, &ffmpeg).await
+}
+
+/// Generate or read a cached video-frame thumbnail using the given FFmpeg
+/// binary. The supplied binary makes the extraction path testable without
+/// requiring FFmpeg to be installed in the test environment.
+pub(crate) async fn plex_frame_cover_with_ffmpeg(
+    state: &AppState,
+    media: &Media,
+    ffmpeg: &str,
+) -> Option<Vec<u8>> {
+    let cache_path = plex_frame_cover_cache_path(state, media);
     if let Ok(bytes) = tokio::fs::read(&cache_path).await {
         return Some(bytes);
     }
 
-    warn!(media_id = %media.id, "no cached cover; frame extraction requires an in-process decoder");
-    None
+    let lock = {
+        let locks = FRAME_COVER_LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+        let mut locks = locks.lock().ok()?;
+        locks
+            .entry(cache_path.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    let guard = lock.lock().await;
+    if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+        drop(guard);
+        release_frame_cover_lock(&cache_path, &lock);
+        return Some(bytes);
+    }
+
+    let result = async {
+        let _permit = FRAME_COVER_LIMIT.acquire().await.ok()?;
+        let bytes = extract_video_frame_jpeg(ffmpeg, &media.path).await?;
+        let parent = cache_path.parent()?;
+        tokio::fs::create_dir_all(parent).await.ok()?;
+        let temporary = cache_path.with_extension(format!("{}.tmp", std::process::id()));
+        if tokio::fs::write(&temporary, &bytes).await.is_ok() {
+            if tokio::fs::rename(&temporary, &cache_path).await.is_err() {
+                let _ = tokio::fs::remove_file(&temporary).await;
+            }
+        }
+        Some(bytes)
+    }
+    .await;
+
+    drop(guard);
+    release_frame_cover_lock(&cache_path, &lock);
+    result
+}
+
+fn release_frame_cover_lock(cache_path: &std::path::Path, lock: &Arc<tokio::sync::Mutex<()>>) {
+    if Arc::strong_count(lock) != 2 {
+        return;
+    }
+    if let Ok(mut locks) = FRAME_COVER_LOCKS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+    {
+        locks.remove(cache_path);
+    }
+}
+
+async fn extract_video_frame_jpeg(ffmpeg: &str, path: &std::path::Path) -> Option<Vec<u8>> {
+    let mut command = tokio::process::Command::new(ffmpeg);
+    command
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-threads")
+        .arg("1")
+        .arg("-i")
+        .arg(path)
+        .arg("-vf")
+        .arg("thumbnail=100,scale=640:-2")
+        .arg("-frames:v")
+        .arg("1")
+        .arg("-f")
+        .arg("image2")
+        .arg("-c:v")
+        .arg("mjpeg")
+        .arg("-q:v")
+        .arg("4")
+        .arg("pipe:1")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.as_std_mut().pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+                Ok(())
+            });
+        }
+    }
+    let output = command.output().await.ok()?;
+    if !output.status.success() || output.stdout.is_empty() {
+        tracing::debug!(
+            ffmpeg = %ffmpeg,
+            path = %path.display(),
+            error = %String::from_utf8_lossy(&output.stderr).trim(),
+            "video frame thumbnail extraction failed"
+        );
+        return None;
+    }
+    Some(output.stdout)
 }
 
 pub(crate) fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_json::Value>) {
@@ -8981,6 +9148,8 @@ pub(crate) fn plex_section_directories(state: &AppState) -> (usize, Vec<serde_js
                 "language": library.plex_language.as_deref().unwrap_or("en-US"),
                 "metadataAgentProviderGroupId": library.metadata_agent_provider_group_id.unwrap_or(if library.kind == "tv" { 2 } else { 1 }),
                 "uuid": plex_library_uuid(state, &library.name, section),
+                "composite": format!("/library/sections/{section}/composite/{content_changed_at}"),
+                "thumb": format!("/library/sections/{section}/composite/{content_changed_at}"),
                 "updatedAt": updated_at,
                 "createdAt": created_at,
                 "scannedAt": scanned_at,

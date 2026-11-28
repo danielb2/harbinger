@@ -1410,6 +1410,162 @@ async fn plex_artwork_serves_config_sidecar_cover() {
     assert_eq!(body.as_ref(), b"cover bytes");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn generated_video_frame_cover_is_cached_and_reused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = fixture();
+    let media = fixture.state.media.read().unwrap()[0].clone();
+    let bytes = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x01, 0x02, 0x03];
+    let frame = fixture.root.join("frame.jpg");
+    std::fs::write(&frame, bytes).unwrap();
+    let script = fixture.root.join("fake-ffmpeg");
+    std::fs::write(&script, format!("#!/bin/sh\ncat '{}'\n", frame.display())).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let generated =
+        super::plex_frame_cover_with_ffmpeg(&fixture.state, &media, script.to_str().unwrap()).await;
+    assert_eq!(generated.as_deref(), Some(bytes.as_slice()));
+    let cache = super::plex_frame_cover_cache_path(&fixture.state, &media);
+    assert_eq!(std::fs::read(cache).unwrap(), bytes);
+
+    let cached =
+        super::plex_frame_cover_with_ffmpeg(&fixture.state, &media, "/definitely/missing/ffmpeg")
+            .await;
+    assert_eq!(cached.as_deref(), Some(bytes.as_slice()));
+}
+
+#[tokio::test]
+async fn other_video_cover_upload_overrides_artwork() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "other".to_owned();
+    std::fs::remove_file(fixture.root.join("media/.hbgr/cover.jpg")).unwrap();
+    let cover = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x10, 0x20, 0x30];
+    let response = send(
+        &fixture.app,
+        Method::POST,
+        "/web/audiobook-cover?library=0&path=Demo.mkv",
+        Body::from(cover.to_vec()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        std::fs::read(fixture.root.join("media/.hbgr/1-1/cover.jpg")).unwrap(),
+        cover
+    );
+    assert!(!fixture.root.join("media/.hbgr/cover.jpg").exists());
+
+    let artwork = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1/thumb",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(artwork.status(), StatusCode::OK);
+    let body = to_bytes(artwork.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), cover.as_slice());
+}
+
+#[tokio::test]
+async fn other_video_cover_upload_respects_config_storage_mode() {
+    let fixture = fixture();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.metadata_storage = "config".to_owned();
+        config.libraries[0].kind = "other".to_owned();
+    }
+    let media_cover = fixture.root.join("media/.hbgr/cover.jpg");
+    std::fs::remove_file(&media_cover).unwrap();
+    let cover = [0xFFu8, 0xD8, 0xFF, 0xE0, 0x40, 0x50, 0x60];
+    let response = send(
+        &fixture.app,
+        Method::POST,
+        "/web/audiobook-cover?library=0&path=Demo.mkv",
+        Body::from(cover.to_vec()),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!media_cover.exists());
+    let config_cover = fixture
+        .state
+        .config_path
+        .parent()
+        .unwrap()
+        .join(".hbgr/1-1/cover.jpg");
+    assert_eq!(std::fs::read(config_cover).unwrap(), cover);
+
+    let artwork = send(
+        &fixture.app,
+        Method::GET,
+        "/library/metadata/1-1/thumb",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(artwork.status(), StatusCode::OK);
+    let body = to_bytes(artwork.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), cover.as_slice());
+}
+
+#[tokio::test]
+async fn other_library_tile_falls_back_to_first_item_cover() {
+    let fixture = fixture();
+    fixture.config.lock().unwrap().libraries[0].kind = "other".to_owned();
+    std::fs::remove_file(fixture.root.join("media/.hbgr/cover.jpg")).unwrap();
+
+    let home = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    assert_eq!(home.status(), StatusCode::OK);
+    let body = String::from_utf8(
+        to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let card = body
+        .split("class=\"library-card\"")
+        .nth(1)
+        .unwrap()
+        .split("</a>")
+        .next()
+        .unwrap();
+    assert!(card.contains("/web/artwork/media/1-1/cover"));
+}
+
+#[tokio::test]
+async fn plex_section_composite_serves_library_artwork() {
+    let fixture = fixture();
+    let response = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections/1/composite/123",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body.as_ref(), b"cover");
+
+    let sections = send(
+        &fixture.app,
+        Method::GET,
+        "/library/sections",
+        Body::empty(),
+    )
+    .await;
+    let sections: serde_json::Value =
+        serde_json::from_slice(&to_bytes(sections.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert!(sections["MediaContainer"]["Directory"][0]["composite"]
+        .as_str()
+        .unwrap()
+        .starts_with("/library/sections/1/composite/"));
+    assert_eq!(
+        sections["MediaContainer"]["Directory"][0]["thumb"],
+        sections["MediaContainer"]["Directory"][0]["composite"]
+    );
+}
+
 #[tokio::test]
 async fn hbweb_serves_config_sidecar_banner() {
     let fixture = fixture();
@@ -4079,7 +4235,8 @@ async fn library_home_visibility_flags_hide_plex_continue_watching_and_recently_
     let home_hubs = send(&fixture.app, Method::GET, "/hubs", Body::empty()).await;
     assert_eq!(home_hubs.status(), StatusCode::OK);
     let home_hubs: serde_json::Value =
-        serde_json::from_slice(&to_bytes(home_hubs.into_body(), usize::MAX).await.unwrap()).unwrap();
+        serde_json::from_slice(&to_bytes(home_hubs.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
     let hubs = home_hubs["MediaContainer"]["Hub"].as_array().unwrap();
     assert!(!hubs
         .iter()
@@ -4131,7 +4288,8 @@ async fn library_home_visibility_flags_hide_plex_continue_watching_and_recently_
     .await;
     assert_eq!(hub_items.status(), StatusCode::OK);
     let hub_items: serde_json::Value =
-        serde_json::from_slice(&to_bytes(hub_items.into_body(), usize::MAX).await.unwrap()).unwrap();
+        serde_json::from_slice(&to_bytes(hub_items.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
     assert_eq!(hub_items["MediaContainer"]["size"], 0);
     assert_eq!(
         hub_items["MediaContainer"]["Metadata"],
@@ -9286,6 +9444,7 @@ async fn every_registered_plex_route_has_success_and_failure_cases() {
         (Method::GET, "/system/scanners/1?action=update"),
         (Method::GET, "/library/sections/1"),
         (Method::GET, "/library/sections/1/refresh"),
+        (Method::GET, "/library/sections/1/composite"),
         (Method::GET, "/library/sections/1/collections"),
         (Method::GET, "/library/sections/1/prefs"),
         (Method::PUT, "/library/sections/1/prefs?hidden=1"),
