@@ -962,7 +962,7 @@ pub(crate) async fn update_web_progress(
         .unwrap_or_default();
     if connection
         .execute(
-            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = excluded.position_ms, duration_ms = excluded.duration_ms, watched = excluded.watched, hidden_from_continue = 0, updated_at = excluded.updated_at",
+            "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at, finished_at) VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6, CASE WHEN ?5 THEN ?6 ELSE NULL END) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = excluded.position_ms, duration_ms = excluded.duration_ms, watched = excluded.watched, hidden_from_continue = 0, updated_at = excluded.updated_at, finished_at = CASE WHEN excluded.watched = 1 THEN COALESCE(watch_progress.finished_at, excluded.updated_at) ELSE NULL END",
             (USER_ID, media_key.as_str(), update.position_ms.max(0), update.duration_ms, update.watched, updated_at),
         )
         .is_err()
@@ -1039,8 +1039,8 @@ pub(crate) async fn web_watch_action(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
     let sql = match update.action.as_str() {
-        "watched" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 1, 0, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 1, hidden_from_continue = 0, updated_at = excluded.updated_at",
-        "unwatched" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 0, 0, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 0, hidden_from_continue = 0, updated_at = excluded.updated_at",
+        "watched" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at, finished_at) VALUES (?1, ?2, 0, NULL, 1, 0, ?3, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 1, hidden_from_continue = 0, updated_at = excluded.updated_at, finished_at = COALESCE(watch_progress.finished_at, excluded.updated_at)",
+        "unwatched" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at, finished_at) VALUES (?1, ?2, 0, NULL, 0, 0, ?3, NULL) ON CONFLICT(user_id, media_key) DO UPDATE SET position_ms = 0, watched = 0, hidden_from_continue = 0, updated_at = excluded.updated_at, finished_at = NULL",
         "remove_from_continue" => "INSERT INTO watch_progress (user_id, media_key, position_ms, duration_ms, watched, hidden_from_continue, updated_at) VALUES (?1, ?2, 0, NULL, 0, 1, ?3) ON CONFLICT(user_id, media_key) DO UPDATE SET hidden_from_continue = 1, updated_at = excluded.updated_at",
         _ => return StatusCode::BAD_REQUEST.into_response(),
     };
@@ -2854,7 +2854,7 @@ pub(crate) async fn tv_match_search(
     };
     let status = response.status();
     if !status.is_success() {
-        warn!(library = %library.name, show = %title, %status, "TV fix-match search returned an error status");
+        warn!(library = %library.name, show = %title, status = status.as_u16(), "TV fix-match search returned an error status");
         return (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"error": format!("TMDB returned {status}")})),
@@ -2954,7 +2954,7 @@ pub(crate) async fn tv_match_select(
     };
     let status = response.status();
     if !status.is_success() {
-        warn!(library = %library.name, show = %title, %status, "TV fix-match details returned an error status");
+        warn!(library = %library.name, show = %title, status = status.as_u16(), "TV fix-match details returned an error status");
         return (
             StatusCode::BAD_GATEWAY,
             Json(serde_json::json!({"error": format!("TMDB returned {status}")})),
@@ -8331,12 +8331,21 @@ bindCardAction(document, "click", async event => {
         if (fill) fill.style.width = `${percentValue}%`;
         if (percent) percent.textContent = `${percentValue}%`;
         const badge = item.querySelector(".media-card-unwatched");
-        if (item.classList.contains("media-card-book") && badge) {
+        if (item.classList.contains("media-card-book")) {
           if (action === "watched") {
-            badge.textContent = "✓";
-            badge.setAttribute("aria-label", "Read");
+            if (badge) {
+              badge.textContent = "✓";
+              badge.setAttribute("aria-label", "Read");
+            } else {
+              const created = document.createElement("span");
+              created.className = "media-card-unwatched";
+              created.setAttribute("aria-label", "Read");
+              created.style.cssText = "position:absolute;right:0;top:0;z-index:2;min-width:1.5rem;padding:.2rem .4rem;border-radius:0 0 0 .35rem;color:#fff;background:rgba(17,24,39,.8);font-size:.85rem;font-weight:700;line-height:1;text-align:center";
+              created.textContent = "✓";
+              item.querySelector(".media-card-artwork")?.append(created);
+            }
           } else {
-            badge.remove();
+            badge?.remove();
           }
         }
         if (action === "watched" && item.closest(".continue-grid")) item.remove();

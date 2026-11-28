@@ -1292,21 +1292,23 @@ fn restart_process() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 fn build_app(state: AppState) -> Router {
-    build_tagged_app(state, "plex")
+    build_base_app(state).layer(middleware::from_fn(
+        |request: Request<Body>, next: Next| async move {
+            log_http_exchange("plex", request, next).await
+        },
+    ))
 }
 
-fn build_tagged_app(state: AppState, tag: &'static str) -> Router {
+/// Build the shared Plex/web router without the request-log layer so listener
+/// variants can put their own surface gate *inside* request logging. That way
+/// a request sent to the wrong port is still logged before it is rejected.
+fn build_base_app(state: AppState) -> Router {
     Router::new()
         .merge(api::web_routes())
         .merge(crate::plex::api::plex_routes())
         .fallback(log_not_found)
         .layer(middleware::from_fn(plex_cors))
         .layer(middleware::from_fn_with_state(state.clone(), web_auth_gate))
-        .layer(middleware::from_fn(
-            move |request: Request<Body>, next: Next| async move {
-                log_http_exchange(tag, request, next).await
-            },
-        ))
         .with_state(state)
 }
 
@@ -1419,15 +1421,21 @@ pub(crate) enum ListenerSurface {
 }
 
 fn build_web_listener_app(state: AppState) -> Router {
-    build_tagged_app(state, "hb").layer(middleware::from_fn(
-        |mut request: Request<Body>, next: Next| async move {
-            if !is_web_surface_path(request.uri().path()) {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            request.extensions_mut().insert(ListenerSurface::Web);
-            next.run(request).await
-        },
-    ))
+    build_base_app(state)
+        .layer(middleware::from_fn(
+            |mut request: Request<Body>, next: Next| async move {
+                if !is_web_surface_path(request.uri().path()) {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                request.extensions_mut().insert(ListenerSurface::Web);
+                next.run(request).await
+            },
+        ))
+        .layer(middleware::from_fn(
+            |request: Request<Body>, next: Next| async move {
+                log_http_exchange("hb", request, next).await
+            },
+        ))
 }
 
 pub(crate) fn sanitized_query(uri: &Uri) -> Option<String> {
@@ -1456,19 +1464,25 @@ pub(crate) fn sanitized_query(uri: &Uri) -> Option<String> {
 }
 
 fn build_plex_listener_app(state: AppState) -> Router {
-    build_tagged_app(state, "plex").layer(middleware::from_fn(
-        |mut request: Request<Body>, next: Next| async move {
-            if is_web_surface_path(request.uri().path())
-                && request.uri().path() != "/"
-                && request.uri().path() != "/web/index.html"
-                && request.uri().path() != "/web/"
-            {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            request.extensions_mut().insert(ListenerSurface::Plex);
-            next.run(request).await
-        },
-    ))
+    build_base_app(state)
+        .layer(middleware::from_fn(
+            |mut request: Request<Body>, next: Next| async move {
+                if is_web_surface_path(request.uri().path())
+                    && request.uri().path() != "/"
+                    && request.uri().path() != "/web/index.html"
+                    && request.uri().path() != "/web/"
+                {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                request.extensions_mut().insert(ListenerSurface::Plex);
+                next.run(request).await
+            },
+        ))
+        .layer(middleware::from_fn(
+            |request: Request<Body>, next: Next| async move {
+                log_http_exchange("plex", request, next).await
+            },
+        ))
 }
 
 fn is_web_surface_path(path: &str) -> bool {
@@ -2062,7 +2076,7 @@ pub(crate) async fn scan_library_inventory(
         )
         .await;
         if !assets_only {
-            info!(library = %library.name, status = %response.status(), "automatic metadata detection finished");
+            info!(library = %library.name, status = response.status().as_u16(), "automatic metadata detection finished");
         }
     }
     if library.kind == "tv" {
@@ -2530,7 +2544,60 @@ fn open_database(
              added_at INTEGER NOT NULL
          );
          CREATE UNIQUE INDEX IF NOT EXISTS collection_items_collection_media
-             ON collection_items(collection_id, media_key);",
+             ON collection_items(collection_id, media_key);
+         CREATE TABLE IF NOT EXISTS abs_collections (
+             id TEXT PRIMARY KEY,
+             library_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             description TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS abs_collection_items (
+             collection_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL,
+             PRIMARY KEY (collection_id, item_id)
+         );
+         CREATE TABLE IF NOT EXISTS abs_playlists (
+             id TEXT PRIMARY KEY,
+             library_id TEXT NOT NULL,
+             user_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             description TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS abs_playlist_items (
+             playlist_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL,
+             PRIMARY KEY (playlist_id, item_id)
+         );
+         CREATE TABLE IF NOT EXISTS abs_playback_sessions (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             library_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             duration REAL NOT NULL DEFAULT 0,
+             current_time REAL NOT NULL DEFAULT 0,
+             time_listened REAL NOT NULL DEFAULT 0,
+             started_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             closed_at INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS abs_bookmarks (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             time REAL NOT NULL,
+             title TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             UNIQUE (user_id, item_id, time)
+         );",
     )?;
     markers::ensure_marker_schema(&connection)?;
 
@@ -2544,6 +2611,10 @@ fn open_database(
     );
     let _ = connection.execute(
         "ALTER TABLE watch_progress ADD COLUMN hidden_from_continue INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE watch_progress ADD COLUMN finished_at INTEGER",
         [],
     );
     let _ = connection.execute(
@@ -4096,7 +4167,7 @@ async fn publish_plex_connections(
         ));
     }
     info!(
-        status = %registration_response.status(),
+        status = registration_response.status().as_u16(),
         server_name = %configured_server_name,
         "Plex server registration response"
     );
@@ -4230,7 +4301,10 @@ pub(crate) async fn run_plex_presence(
                 }
             }
             Ok(response) => {
-                warn!(status = %response.status(), "Plex presence stream rejected; reconnecting in 15 seconds");
+                warn!(
+                    status = response.status().as_u16(),
+                    "Plex presence stream rejected; reconnecting in 15 seconds"
+                );
             }
             Err(error) => {
                 warn!(error = %error, "Plex presence stream could not connect; reconnecting in 15 seconds");
@@ -4731,7 +4805,7 @@ pub(crate) async fn scan_library_metadata(
             };
             let status = response.status();
             if !status.is_success() {
-                warn!(library = %library.name, title = %group_title, status = %status, "TMDB metadata search returned an error status");
+                warn!(library = %library.name, title = %group_title, status = status.as_u16(), "TMDB metadata search returned an error status");
                 continue;
             }
             let payload = match response.json::<serde_json::Value>().await {
@@ -6498,7 +6572,11 @@ async fn download_tmdb_artwork(
         };
         let status = response.status();
         if !status.is_success() {
-            warn!(artwork = kind, %status, "TMDB artwork request returned an error status");
+            warn!(
+                artwork = kind,
+                status = status.as_u16(),
+                "TMDB artwork request returned an error status"
+            );
             continue;
         }
         let bytes = response.bytes().await?;
@@ -6865,7 +6943,13 @@ async fn download_tmdb_episode_metadata(
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
                 let status = response.status();
-                warn!(show_id, season = episode.season, episode = episode.episode, status = %status, "TMDB episode details request returned an error status");
+                warn!(
+                    show_id,
+                    season = episode.season,
+                    episode = episode.episode,
+                    status = status.as_u16(),
+                    "TMDB episode details request returned an error status"
+                );
                 if status == reqwest::StatusCode::NOT_FOUND {
                     let cached = if sidecar_mode {
                         write_tv_episode_sidecar_metadata(
@@ -6969,7 +7053,13 @@ async fn download_tmdb_episode_metadata(
         {
             Ok(response) if response.status().is_success() => response,
             Ok(response) => {
-                warn!(show_id, season = episode.season, episode = episode.episode, status = %response.status(), "TMDB episode still request returned an error status");
+                warn!(
+                    show_id,
+                    season = episode.season,
+                    episode = episode.episode,
+                    status = response.status().as_u16(),
+                    "TMDB episode still request returned an error status"
+                );
                 continue;
             }
             Err(error) => {
@@ -8538,7 +8628,7 @@ pub(crate) fn media_card_with_options(
         ""
     };
     let menu = format!(
-        r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched">{watched_label}</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{unwatched_label}</button>{set_cover_action}{remove_action}{fix_match_action}</div></details>"#
+        r#"<details class="media-card-menu"><summary aria-label="More options" title="More options">⋮</summary><div class="media-card-menu-items"><button type="button" data-watch-action="watched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{watched_label}</button><button type="button" data-watch-action="unwatched" data-path="{path}" data-library="{library}" data-watch-scope="{watch_scope}" data-watch-key="{watch_key}">{unwatched_label}</button>{set_cover_action}{remove_action}{fix_match_action}</div></details>"#
     );
     let card = format!(
         r#"<div class="{}" style="{}" data-media-path="{}" data-library="{}" data-folder="{}" data-watch-scope="{}" data-watch-key="{}"><div class="media-card-artwork"><a class="media-card-cover" data-spa-link href="{}">{}{}</a>{}</div><a class="media-card-info" data-spa-link href="{}"{}><span class="media-card-title" title="{}"{}>{}</span>{}{}{}</a></div>"#,
@@ -8685,7 +8775,10 @@ async fn log_not_found(State(state): State<AppState>, req: Request<Body>) -> Res
                 .ok()
                 .map(|uri| uri.path().to_owned())
                 .unwrap_or_else(|| "<invalid-uri>".to_owned());
-            warn!(status = %StatusCode::NOT_FOUND, source_path, "unsupported Plex photo source");
+            warn!(
+                status = StatusCode::NOT_FOUND.as_u16(),
+                source_path, "unsupported Plex photo source"
+            );
             let mut response = StatusCode::NOT_FOUND.into_response();
             response.extensions_mut().insert(SuppressHttpResponseLog);
             return response;
@@ -8903,7 +8996,12 @@ async fn deliver_plex_webhook(
                 info!(event, destination_index = index, "Plex webhook delivered");
             }
             Ok(response) => {
-                warn!(event, destination_index = index, status = %response.status(), "Plex webhook destination rejected event");
+                warn!(
+                    event,
+                    destination_index = index,
+                    status = response.status().as_u16(),
+                    "Plex webhook destination rejected event"
+                );
             }
             Err(error) => {
                 warn!(

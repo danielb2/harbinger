@@ -1,4 +1,4 @@
-use super::{api, catalog::Catalog};
+use super::catalog::Catalog;
 use crate::harbinger::{metrics, AppState, Config, ConfigLibrary, SkipMode};
 use crate::plex::plex_tls::PlexTls;
 use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
@@ -7,6 +7,8 @@ use axum::{
     http::{header, Method, Request, StatusCode},
     Router,
 };
+use base64::Engine as _;
+use chrono::Datelike as _;
 use rand_core::OsRng;
 use serde_json::{json, Value};
 use std::{
@@ -22,6 +24,7 @@ static NEXT_FIXTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 struct Fixture {
     app: Router,
+    state: AppState,
     root: PathBuf,
     item_id: String,
 }
@@ -33,7 +36,6 @@ impl Drop for Fixture {
 }
 
 fn fixture() -> Fixture {
-    api::clear_sessions();
     Catalog::clear_cache();
     let id = NEXT_FIXTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let root = std::env::temp_dir().join(format!(
@@ -106,7 +108,61 @@ fn fixture() -> Fixture {
              watched INTEGER NOT NULL DEFAULT 0,
              hidden_from_continue INTEGER NOT NULL DEFAULT 0,
              updated_at INTEGER NOT NULL,
+             finished_at INTEGER,
              PRIMARY KEY (user_id, media_key)
+         );
+         CREATE TABLE abs_collections (
+             id TEXT PRIMARY KEY,
+             library_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             description TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE abs_collection_items (
+             collection_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL,
+             PRIMARY KEY (collection_id, item_id)
+         );
+         CREATE TABLE abs_playlists (
+             id TEXT PRIMARY KEY,
+             library_id TEXT NOT NULL,
+             user_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             description TEXT NOT NULL DEFAULT '',
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL
+         );
+         CREATE TABLE abs_playlist_items (
+             playlist_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             position INTEGER NOT NULL,
+             added_at INTEGER NOT NULL,
+             PRIMARY KEY (playlist_id, item_id)
+         );
+         CREATE TABLE abs_playback_sessions (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             library_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             duration REAL NOT NULL DEFAULT 0,
+             current_time REAL NOT NULL DEFAULT 0,
+             time_listened REAL NOT NULL DEFAULT 0,
+             started_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             closed_at INTEGER
+         );
+         CREATE TABLE abs_bookmarks (
+             id TEXT PRIMARY KEY,
+             user_id TEXT NOT NULL,
+             item_id TEXT NOT NULL,
+             time REAL NOT NULL,
+             title TEXT NOT NULL,
+             created_at INTEGER NOT NULL,
+             updated_at INTEGER NOT NULL,
+             UNIQUE (user_id, item_id, time)
          );",
     )
     .unwrap();
@@ -193,7 +249,8 @@ fn fixture() -> Fixture {
     let catalog = Catalog::load(&state);
     let item_id = catalog.libraries[0].items[0].id.clone();
     Fixture {
-        app: super::router(state),
+        app: super::router(state.clone()),
+        state,
         root,
         item_id,
     }
@@ -1027,6 +1084,720 @@ async fn protected_routes_reject_missing_auth_and_unknown_ids() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn series_endpoints_group_by_name_and_report_real_counts() {
+    let fixture = fixture();
+    let library = fixture.root.join("library");
+    add_test_book(
+        &library,
+        "Author One/Sword of Truth/Book One",
+        json!({
+            "title": "Book One",
+            "authors": ["Nora Vale"],
+            "series": ["Sword of Truth #1"],
+            "narrators": ["Iris Quinn"],
+            "genres": ["Mystery"]
+        }),
+    );
+    add_test_book(
+        &library,
+        "Author One/Sword of Truth/Book Two",
+        json!({
+            "title": "Book Two",
+            "authors": ["Nora Vale"],
+            "series": ["Sword of Truth #2"],
+            "narrators": ["Iris Quinn"],
+            "genres": ["Mystery"]
+        }),
+    );
+    Catalog::clear_cache();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}?include=filterdata"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["filterdata"]["bookCount"], 3);
+    assert_eq!(detail["filterdata"]["seriesCount"], 2);
+    let sword_filter = detail["filterdata"]["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|series| series["name"] == "Sword of Truth")
+        .unwrap();
+    assert_eq!(sword_filter["numBooks"], 2);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/series"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let series: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(series["total"], 2);
+    let sword = series["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|series| series["name"] == "Sword of Truth")
+        .unwrap();
+    assert_eq!(sword["numBooks"], 2);
+    assert_eq!(sword["books"].as_array().unwrap().len(), 2);
+    let series_id = sword["id"].as_str().unwrap();
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/series/{series_id}?include=progress"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["numBooks"], 2);
+    assert_eq!(
+        detail["progress"]["libraryItemIds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(detail["progress"]["isFinished"], false);
+
+    let filter = format!(
+        "series.{}",
+        base64::engine::general_purpose::STANDARD.encode(series_id)
+    );
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/items?limit=100&filter={filter}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let filtered: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(filtered["total"], 2);
+    assert!(filtered["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| { item["media"]["metadata"]["series"][0]["name"] == "Sword of Truth" }));
+}
+
+#[tokio::test]
+async fn collections_accept_books_and_report_them_back() {
+    let fixture = fixture();
+    let library = fixture.root.join("library");
+    add_test_book(
+        &library,
+        "Author Two/Second Book",
+        json!({"title": "Second Book", "authors": ["Another Author"]}),
+    );
+    Catalog::clear_cache();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let second_id = {
+        let catalog = Catalog::load(&fixture.state);
+        catalog.libraries[0]
+            .items
+            .iter()
+            .find(|item| item.title == "Second Book")
+            .unwrap()
+            .id
+            .clone()
+    };
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        "/api/collections",
+        Some(&token),
+        Some(json!({
+            "libraryId": library_id,
+            "name": "Favorites",
+            "books": [fixture.item_id]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let collection: Value = serde_json::from_slice(&body).unwrap();
+    let collection_id = collection["id"].as_str().unwrap().to_owned();
+    assert_eq!(collection["name"], "Favorites");
+    assert_eq!(collection["books"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/collections"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let collections: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(collections["total"], 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/collections/{collection_id}/book"),
+        Some(&token),
+        Some(json!({"id": second_id})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let collection: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(collection["books"].as_array().unwrap().len(), 2);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/api/collections/{collection_id}/book/{}", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let collection: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(collection["books"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn playlists_accept_books_and_report_them_back() {
+    let fixture = fixture();
+    let library = fixture.root.join("library");
+    add_test_book(
+        &library,
+        "Author Two/Second Book",
+        json!({"title": "Second Book", "authors": ["Another Author"]}),
+    );
+    Catalog::clear_cache();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let second_id = {
+        let catalog = Catalog::load(&fixture.state);
+        catalog.libraries[0]
+            .items
+            .iter()
+            .find(|item| item.title == "Second Book")
+            .unwrap()
+            .id
+            .clone()
+    };
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        "/api/playlists",
+        Some(&token),
+        Some(json!({
+            "libraryId": library_id,
+            "name": "Road Trip",
+            "items": [{"libraryItemId": fixture.item_id}]
+        })),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let playlist: Value = serde_json::from_slice(&body).unwrap();
+    let playlist_id = playlist["id"].as_str().unwrap().to_owned();
+    assert_eq!(playlist["items"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/playlists"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let playlists: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(playlists["total"], 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/playlists/{playlist_id}/batch/add"),
+        Some(&token),
+        Some(json!({"items": [{"libraryItemId": second_id}]})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let playlist: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(playlist["items"].as_array().unwrap().len(), 2);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/api/playlists/{playlist_id}/item/{}", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let playlist: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(playlist["items"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn year_stats_report_sessions_and_finished_books() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/items/{}/play", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let session: Value = serde_json::from_slice(&body).unwrap();
+    let session_id = session["id"].as_str().unwrap();
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/session/{session_id}/sync"),
+        Some(&token),
+        Some(json!({"currentTime": 30.0, "duration": 120.0, "timeListened": 25.0})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/session/{session_id}/close"),
+        Some(&token),
+        Some(json!({"currentTime": 30.0, "duration": 120.0, "isFinished": true})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::PATCH,
+        &format!("/api/me/progress/{}", fixture.item_id),
+        Some(&token),
+        Some(json!({"currentTime": 120.0, "duration": 120.0, "isFinished": true})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let year = chrono::Utc::now().year();
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/me/stats/year/{year}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stats["totalListeningSessions"], 1);
+    assert_eq!(stats["totalListeningTime"], 25);
+    assert_eq!(stats["numBooksListened"], 1);
+    assert_eq!(stats["numBooksFinished"], 1);
+    assert_eq!(
+        stats["finishedBooksWithCovers"].as_array().unwrap().len(),
+        1
+    );
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/stats/year/{year}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stats["numBooks"], 1);
+    assert_eq!(stats["totalListeningTime"], 25);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me/listening-stats",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listening: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listening["totalTime"], 25);
+    assert_eq!(listening["recentSessions"].as_array().unwrap().len(), 1);
+    assert!(listening["days"].is_object());
+    assert!(listening["dayOfWeek"].is_object());
+    assert!(listening["items"].is_object());
+
+    let library_id = catalog_library_id(&fixture, &token).await;
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/stats"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let library_stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(library_stats["totalItems"], 1);
+    assert_eq!(library_stats["totalAuthors"], 1);
+    assert_eq!(library_stats["authorsWithCount"][0]["name"], "Nora Vale");
+    assert_eq!(library_stats["authorsWithCount"][0]["count"], 1);
+    assert_eq!(library_stats["genresWithCount"][0]["genre"], "Mystery");
+    assert_eq!(library_stats["longestItems"].as_array().unwrap().len(), 1);
+    assert_eq!(library_stats["largestItems"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn authors_home_shelves_and_search_are_abs_compatible() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+    let library_id = catalog_library_id(&fixture, &token).await;
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let detail: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(detail["name"], "Audiobooks");
+    assert!(detail["library"].is_null());
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/authors?limit=20&page=0&sort=name"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let authors: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(authors["total"], 1);
+    assert_eq!(authors["results"][0]["name"], "Nora Vale");
+    assert_eq!(authors["results"][0]["numBooks"], 1);
+    let author_id = authors["results"][0]["id"].as_str().unwrap();
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/authors"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let authors: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(authors["authors"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/authors/{author_id}?include=items,series"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let author: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(author["name"], "Nora Vale");
+    assert_eq!(author["libraryItems"].as_array().unwrap().len(), 1);
+    assert_eq!(author["series"][0]["name"], "Stormbound");
+    assert_eq!(author["series"][0]["items"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        author["series"][0]["items"][0]["media"]["metadata"]["series"]["name"],
+        "Stormbound"
+    );
+    assert_eq!(
+        author["series"][0]["items"][0]["media"]["metadata"]["series"]["sequence"],
+        "2"
+    );
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/personalized"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let shelves: Value = serde_json::from_slice(&body).unwrap();
+    let shelves = shelves.as_array().unwrap();
+    assert_eq!(shelves.len(), 6);
+    assert_eq!(shelves[2]["id"], "newest");
+    assert_eq!(shelves[2]["total"], 1);
+    assert_eq!(shelves[2]["entities"][0]["id"], fixture.item_id);
+    assert_eq!(shelves[3]["id"], "recent-series");
+    assert_eq!(shelves[3]["total"], 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/search?q=harbor"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let search: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(search["book"].as_array().unwrap().len(), 1);
+    assert_eq!(search["authors"].as_array().unwrap().len(), 0);
+    assert_eq!(search["series"].as_array().unwrap().len(), 0);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/search?q=nora"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let search: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(search["authors"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/libraries/{library_id}/search?q=storm"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let search: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(search["series"].as_array().unwrap().len(), 1);
+
+    let series_id = author["series"][0]["id"].as_str().unwrap();
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/series/{series_id}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let series: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(series["name"], "Stormbound");
+    assert_eq!(series["numBooks"], 1);
+}
+
+#[tokio::test]
+async fn bookmarks_round_trip_through_the_user_and_item_endpoints() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/me/item/{}/bookmark", fixture.item_id),
+        Some(&token),
+        Some(json!({"time": 12.5, "title": "Chapter one"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bookmark: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bookmark["libraryItemId"], fixture.item_id);
+    assert_eq!(bookmark["time"], 12.5);
+    assert_eq!(bookmark["title"], "Chapter one");
+    assert!(bookmark["id"].as_str().is_some());
+    assert!(bookmark["createdAt"].as_i64().unwrap() > 0);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me/bookmarks",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let all: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(all["bookmarks"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/me/bookmarks/{}", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let item: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(item["bookmarks"].as_array().unwrap().len(), 1);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::PATCH,
+        &format!("/api/me/item/{}/bookmark", fixture.item_id),
+        Some(&token),
+        Some(json!({"time": 12.5, "title": "Renamed chapter"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let bookmark: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(bookmark["title"], "Renamed chapter");
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["bookmarks"].as_array().unwrap().len(), 1);
+    assert_eq!(me["bookmarks"][0]["title"], "Renamed chapter");
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::DELETE,
+        &format!("/api/me/item/{}/bookmark/12.5", fixture.item_id),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me/bookmarks",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let all: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(all["bookmarks"].as_array().unwrap().len(), 0);
+
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::POST,
+        &format!("/api/me/item/{}/bookmark", fixture.item_id),
+        Some(&token),
+        Some(json!({"title": "Missing time"})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn stats_fall_back_to_saved_progress_when_no_sessions_exist() {
+    let fixture = fixture();
+    let token = login(&fixture).await;
+    let (status, _, _) = send(
+        &fixture.app,
+        Method::PATCH,
+        &format!("/api/me/progress/{}", fixture.item_id),
+        Some(&token),
+        Some(json!({"currentTime": 60.0, "duration": 120.0})),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        "/api/me/listening-stats",
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let listening: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listening["totalTime"], 60);
+    assert_eq!(listening["recentSessions"].as_array().unwrap().len(), 1);
+
+    let year = chrono::Utc::now().year();
+    let (status, body, _) = send(
+        &fixture.app,
+        Method::GET,
+        &format!("/api/me/stats/year/{year}"),
+        Some(&token),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let stats: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(stats["totalListeningTime"], 60);
+    assert_eq!(stats["numBooksListened"], 1);
+}
+
+fn add_test_book(library: &std::path::Path, relative: &str, metadata: Value) {
+    let directory = library.join(relative);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("Track 01.mp3"), b"fake-audio").unwrap();
+    std::fs::write(directory.join("metadata.json"), metadata.to_string()).unwrap();
 }
 
 async fn catalog_library_id(fixture: &Fixture, token: &str) -> String {

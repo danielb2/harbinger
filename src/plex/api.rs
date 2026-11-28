@@ -722,7 +722,10 @@ pub(crate) async fn plex_connectivity_check(
         .map_err(|error| format!("could not request Plex connectivity check: {error}"))?
         .error_for_status()
         .map_err(|error| format!("Plex rejected the connectivity check: {error}"))?;
-    info!(status = %response.status(), "Plex connectivity check response");
+    info!(
+        status = response.status().as_u16(),
+        "Plex connectivity check response"
+    );
     Ok(())
 }
 
@@ -1294,7 +1297,11 @@ pub(crate) async fn plex_section_refresh(
     )
     .await;
     if !metadata_response.status().is_success() && !metadata_response.status().is_redirection() {
-        warn!(section, status = %metadata_response.status(), "Plex metadata refresh failed");
+        warn!(
+            section,
+            status = metadata_response.status().as_u16(),
+            "Plex metadata refresh failed"
+        );
         return metadata_response;
     }
     StatusCode::OK.into_response()
@@ -2336,7 +2343,10 @@ pub(crate) async fn plex_user_avatar(state: &AppState, user_id: &str) -> Respons
         }
     };
     if !response.status().is_success() {
-        warn!(status = %response.status(), user_id, "Plex account avatar request failed");
+        warn!(
+            status = response.status().as_u16(),
+            user_id, "Plex account avatar request failed"
+        );
         return StatusCode::BAD_GATEWAY.into_response();
     }
     let content_type = response
@@ -8889,7 +8899,7 @@ pub(crate) async fn plex_artwork(state: &AppState, id: &str, filename: &str) -> 
             )
             .await;
             if !response.status().is_success() && !response.status().is_redirection() {
-                warn!(media_id = %media.id, status = %response.status(), "metadata lookup after missing artwork failed");
+                warn!(media_id = %media.id, status = response.status().as_u16(), "metadata lookup after missing artwork failed");
             }
             for artwork in &artwork_paths {
                 if let Ok(bytes) = tokio::fs::read(artwork).await {

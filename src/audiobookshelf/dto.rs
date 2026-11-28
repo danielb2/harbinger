@@ -68,6 +68,7 @@ pub(crate) fn user_json(
     token: &str,
     default_library_id: &str,
     media_progress: Vec<Value>,
+    bookmarks: Vec<Value>,
     access_token: Option<&str>,
     refresh_token: Option<&str>,
 ) -> Value {
@@ -84,7 +85,7 @@ pub(crate) fn user_json(
         "token": token,
         "mediaProgress": media_progress,
         "seriesHideFromContinueListening": [],
-        "bookmarks": [],
+        "bookmarks": bookmarks,
         "isActive": true,
         "isLocked": false,
         "lastSeen": last_seen,
@@ -149,21 +150,37 @@ pub(crate) fn library_json(library: &Library) -> Value {
 }
 
 pub(crate) fn library_detail_json(library: &Library) -> Value {
+    let mut author_counts = std::collections::BTreeMap::<String, usize>::new();
+    for item in &library.items {
+        if item.metadata.authors.is_empty() {
+            *author_counts.entry(item.author.clone()).or_default() += 1;
+        } else {
+            for author in &item.metadata.authors {
+                *author_counts.entry(author.clone()).or_default() += 1;
+            }
+        }
+    }
+    let mut series_counts = std::collections::BTreeMap::<String, usize>::new();
+    for item in &library.items {
+        let mut seen = std::collections::BTreeSet::new();
+        for label in &item.metadata.series {
+            let (name, _) = super::scanner::split_series_label(label);
+            if seen.insert(name.to_owned()) {
+                *series_counts.entry(name.to_owned()).or_default() += 1;
+            }
+        }
+    }
     json!({
         "library": library_json(library),
         "filterdata": {
-            "authors": unique_strings(
-                library.items.iter().flat_map(|item| item.metadata.authors.iter().cloned())
-            ).into_iter().map(|name| author_json(&name, &library.id)).collect::<Vec<_>>(),
+            "authors": author_counts.iter().map(|(name, count)| author_json(name, &library.id, *count)).collect::<Vec<_>>(),
             "genres": unique_strings(
                 library.items.iter().flat_map(|item| item.metadata.genres.iter().cloned())
             ),
             "tags": unique_strings(
                 library.items.iter().flat_map(|item| item.metadata.tags.iter().cloned())
             ),
-            "series": unique_strings(
-                library.items.iter().flat_map(|item| item.metadata.series.iter().cloned())
-            ).into_iter().map(|name| series_json(&name, &library.id)).collect::<Vec<_>>(),
+            "series": series_counts.iter().map(|(name, count)| series_filter_json(name, &library.id, *count)).collect::<Vec<_>>(),
             "narrators": unique_strings(
                 library.items.iter().flat_map(|item| item.metadata.narrators.iter().cloned())
             ),
@@ -184,7 +201,13 @@ pub(crate) fn library_detail_json(library: &Library) -> Value {
                     &item.metadata.published_year
                 };
                 published_decade(date)
-            }))
+            })),
+            "bookCount": library.items.len(),
+            "authorCount": author_counts.len(),
+            "seriesCount": series_counts.len(),
+            "podcastCount": 0,
+            "numIssues": 0,
+            "loadedAt": now_ms()
         },
         "issues": 0,
         "numUserPlaylists": 0
@@ -225,24 +248,46 @@ fn named_id(prefix: &str, name: &str) -> String {
     )
 }
 
-fn author_json(name: &str, library_id: &str) -> Value {
+pub(crate) fn author_json(name: &str, library_id: &str, num_books: usize) -> Value {
     json!({
-        "id": named_id("author", name),
+        "id": author_id(name),
+        "asin": null,
         "name": name,
+        "description": null,
+        "imagePath": null,
         "libraryId": library_id,
-        "numBooks": 0
+        "addedAt": 0,
+        "updatedAt": 0,
+        "numBooks": num_books
     })
 }
 
-fn series_json(value: &str, library_id: &str) -> Value {
+pub(crate) fn author_id(name: &str) -> String {
+    named_id("author", name)
+}
+
+pub(crate) fn series_id(name: &str) -> String {
+    named_id("series", name)
+}
+
+fn series_json(value: &str, library_id: &str, num_books: usize) -> Value {
     let (name, sequence) = super::scanner::split_series_label(value);
     json!({
         "id": named_id("series", name),
         "name": name,
         "libraryId": library_id,
         "books": [],
-        "numBooks": 0,
+        "numBooks": num_books,
         "sequence": sequence
+    })
+}
+
+fn series_filter_json(name: &str, library_id: &str, num_books: usize) -> Value {
+    json!({
+        "id": series_id(name),
+        "name": name,
+        "libraryId": library_id,
+        "numBooks": num_books
     })
 }
 
@@ -258,11 +303,11 @@ fn chapter_json(chapter: &BookChapter) -> Value {
 pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
     let book = &item.metadata;
     let authors = if book.authors.is_empty() {
-        vec![author_json(&item.author, &item.library_id)]
+        vec![author_json(&item.author, &item.library_id, 0)]
     } else {
         book.authors
             .iter()
-            .map(|name| author_json(name, &item.library_id))
+            .map(|name| author_json(name, &item.library_id, 0))
             .collect::<Vec<_>>()
     };
     let language = if book.language.is_empty() {
@@ -297,7 +342,7 @@ pub(crate) fn item_json(item: &Item, minified: bool) -> Value {
             "subtitle": book.subtitle,
             "authors": authors,
             "narrators": book.narrators,
-            "series": book.series.iter().map(|name| series_json(name, &item.library_id)).collect::<Vec<_>>(),
+            "series": book.series.iter().map(|name| series_json(name, &item.library_id, 0)).collect::<Vec<_>>(),
             "genres": book.genres,
             "description": item.description,
             "publishedYear": book.published_year,

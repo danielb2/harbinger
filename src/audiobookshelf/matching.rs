@@ -152,7 +152,11 @@ fn record_attempt(sidecar: &std::path::Path) {
 async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
     let response = client.get(url).send().await.ok()?;
     if !response.status().is_success() {
-        tracing::debug!(url, status = %response.status(), "Audiobook cover download failed");
+        tracing::debug!(
+            url,
+            status = response.status().as_u16(),
+            "Audiobook cover download failed"
+        );
         return None;
     }
     let bytes = response.bytes().await.ok()?.to_vec();

@@ -170,7 +170,7 @@ async fn search(
             title,
             author,
             region,
-            status = %response.status(),
+            status = response.status().as_u16(),
             "Audible catalog search returned an error status"
         );
         return Vec::new();
@@ -198,7 +198,7 @@ pub(crate) async fn book_by_asin(
         tracing::debug!(
             asin,
             region,
-            status = %response.status(),
+            status = response.status().as_u16(),
             "Audnexus book lookup returned an error status"
         );
         return None;
