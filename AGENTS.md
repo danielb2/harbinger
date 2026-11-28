@@ -6,6 +6,9 @@ Project guidance for `harbinger`: the target is a 100% drop-in replacement for P
 
 - Follow DRY principles across UI components, markup, styles, route behavior, data transformations, validation, media logic, code architecture, and code-reuse. Home and Library presentation should share implementations where sensible. This way we minimize bugs from having a well-tested code path, not multiple.
 
+- progress_checklist: for any multi-step task, give the user a Markdown checklist containing every requested item and its status, update the checklist whenever an item changes state, and explicitly state what is being worked on now. Do not claim completion unless the checklist shows every requested item completed and verified.
+  - Verify: each progress response contains the checklist and a current-item line; the final response contains the completed checklist.
+
 - Never expand scope beyond what the user requested. Make only changes needed to fulfill the request; do not add adjacent features, cleanup, or speculative improvements. If broader work seems necessary, explain why and ask before proceeding.
 
 - Read the named rules for a user-facing feature before changing it. Treat their requirements and `Verify:` checks as contracts; tests and implementation details verify those requirements but do not redefine them. If a proposed implementation conflicts with a rule, preserve the rule and find another implementation. Record regressions as regressions.

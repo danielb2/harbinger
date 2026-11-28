@@ -28,6 +28,7 @@ pub(crate) struct PlaybackSession {
     pub(crate) current_time: f64,
     pub(crate) time_listened: f64,
     pub(crate) duration: f64,
+    pub(crate) start_time: f64,
     pub(crate) started_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -480,7 +481,7 @@ pub(crate) fn playback_session_json(session: &PlaybackSession, item: &Item) -> V
         "date": now.format("%Y-%m-%d").to_string(),
         "dayOfWeek": now.format("%A").to_string(),
         "timeListening": session.time_listened,
-        "startTime": session.current_time,
+        "startTime": session.start_time,
         "currentTime": session.current_time,
         "startedAt": session.started_at,
         "updatedAt": session.updated_at,

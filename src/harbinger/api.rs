@@ -654,27 +654,6 @@ pub(crate) async fn web_translation_progress(
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let total = match request.total_cues {
-        Some(total) if total <= 20_000 => total,
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                "Subtitle track contains too many cues",
-            )
-                .into_response()
-        }
-        None => {
-            let (contents, _, format) =
-                match read_subtitle_source(&state, &media, request.stream_id).await {
-                    Ok(source) => source,
-                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-                };
-            match subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &format)) {
-                Ok(cues) => cues.len(),
-                Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
-            }
-        }
-    };
     let final_path = configured_bilingual_subtitle_path(
         &state,
         &media,
@@ -690,15 +669,44 @@ pub(crate) async fn web_translation_progress(
         "vtt",
     );
     let checkpoint_path = PathBuf::from(format!("{}.part", checkpoint_path.to_string_lossy()));
+    let total = match request.total_cues {
+        Some(total) if total <= 20_000 => total,
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Subtitle track contains too many cues",
+            )
+                .into_response()
+        }
+        None => {
+            if let Some(total) =
+                crate::harbinger::subtitle_marker_total_cues(&checkpoint_path).await
+            {
+                total
+            } else {
+                let (contents, _, format) =
+                    match read_subtitle_source(&state, &media, request.stream_id).await {
+                        Ok(source) => source,
+                        Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                    };
+                match subtitles::parse_subtitles(&subtitle_to_vtt(&contents, &format)) {
+                    Ok(cues) => cues.len(),
+                    Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
+                }
+            }
+        }
+    };
+    let source_key = request.source_key.as_deref();
     let finished =
-        if subtitle_marker_source_matches(&final_path, request.source_key.as_deref()).await {
+        if source_key.is_none() || subtitle_marker_source_matches(&final_path, source_key).await {
             tokio::fs::read_to_string(&final_path).await.ok()
         } else {
             None
         };
     let staged = if let Some(contents) = finished.as_ref() {
         contents.clone()
-    } else if subtitle_marker_source_matches(&checkpoint_path, request.source_key.as_deref()).await
+    } else if source_key.is_none()
+        || subtitle_marker_source_matches(&checkpoint_path, source_key).await
     {
         tokio::fs::read_to_string(&checkpoint_path)
             .await
@@ -775,7 +783,7 @@ pub(crate) async fn web_translated_subtitle(
     let Some(media) = web_media_for_relative(&state, &root, &relative).await else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let (contents, source_language, format) = if request.source_cues.is_empty() {
+    let (contents, inferred_source_language, format) = if request.source_cues.is_empty() {
         match read_subtitle_source(&state, &media, request.stream_id).await {
             Ok(source) => source,
             Err(error) => {
@@ -797,6 +805,15 @@ pub(crate) async fn web_translated_subtitle(
             Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
         }
     };
+    let source_language = request
+        .source_language
+        .as_deref()
+        .map(str::trim)
+        .filter(|code| {
+            code.len() == 2 && isolang::Language::from_639_1(&code.to_ascii_lowercase()).is_some()
+        })
+        .map(str::to_ascii_lowercase)
+        .unwrap_or(inferred_source_language);
     let (contents, format) = if request.prepared {
         (
             vtt_to_srt(&subtitle_to_vtt(&contents, &format)),
@@ -5731,14 +5748,14 @@ pub(crate) async fn web_client(
           const sourceKey = browserTrackIndex !== undefined ? `embedded:${{browserTrackIndex}}` : `stream:${{sourceId}}`;
           const selectedSourceName = selectedOption?.textContent.trim() || "selected subtitle";
           let browserCues = [];
-          let sourceLanguage = "und";
+          let sourceLanguage = selectedOption?.dataset.language || "und";
           if (browserTrackIndex !== undefined) {{
             const embeddedTrack = video.textTracks[Number(browserTrackIndex)];
             if (!embeddedTrack?.cues || embeddedTrack.cues.length === 0) {{
               showTranslationError("This browser has not loaded subtitle cues yet. Start playback or choose a listed server subtitle track, then try again.");
               return;
             }}
-            sourceLanguage = embeddedTrack.language || "und";
+            sourceLanguage = embeddedTrack.language || sourceLanguage;
             browserCues = [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }}));
           }} else if (!sourceId) {{ showTranslationError("Select a text subtitle track first."); return; }}
           if (activeStreamingSourceKey && (prepared || activeStreamingSourceKey !== sourceKey)) {{
@@ -5764,6 +5781,8 @@ pub(crate) async fn web_client(
                 second_language: translationControls.querySelector(".translation-second").value,
                 source_language: sourceLanguage, source_cues: browserCues, source_key: sourceKey, prepared }};
             if (prepared) {{
+              if (generationProgressTimer) clearInterval(generationProgressTimer);
+              generationProgressTimer = null;
               generationProgress.hidden = false;
               generationProgress.value = 0;
               generationProgressLabel.textContent = "Starting bilingual subtitle generation…";
@@ -5889,7 +5908,46 @@ pub(crate) async fn web_client(
           pendingResumeStarted = true;
           await translate(true, sourceOption, true, pendingOption, true);
         }};
+        const showGeneratingProgress = async () => {{
+          if (!subtitleSelect) return;
+          const option = [...subtitleSelect.options].find(candidate => candidate.dataset.generatingBilingual === "true");
+          if (!option) return;
+          const generationProgress = translationControls.querySelector(".translation-progress");
+          const generationProgressLabel = translationControls.querySelector(".translation-progress-label");
+          if (!generationProgress || !generationProgressLabel) return;
+          const streamId = Number(option.dataset.streamId || 0);
+          const firstLanguage = translationControls.querySelector(".translation-first").value;
+          const secondLanguage = translationControls.querySelector(".translation-second").value;
+          if (generationProgressTimer) clearInterval(generationProgressTimer);
+          generationProgress.hidden = false;
+          const refresh = async () => {{
+            if (generationProgressPending) return;
+            generationProgressPending = true;
+            try {{
+              const response = await fetch("/web/translation-progress", {{
+                method: "POST", headers: {{ "content-type": "application/json" }}, cache: "no-store",
+                body: JSON.stringify({{ path, library: library ? Number(library) : null, folder: folder ? Number(folder) : null,
+                  stream_id: streamId, first_language: firstLanguage, second_language: secondLanguage }})
+              }});
+              if (!response.ok) return;
+              const progress = await response.json();
+              generationProgress.value = progress.percent;
+              generationProgressLabel.textContent = `${{progress.completed}} / ${{progress.total}} cues (${{progress.percent}}%)`;
+              if (progress.complete && generationProgressTimer) {{
+                clearInterval(generationProgressTimer);
+                generationProgressTimer = null;
+              }}
+            }} catch (_) {{}} finally {{ generationProgressPending = false; }}
+          }};
+          await refresh();
+          if (!generationProgressTimer) generationProgressTimer = setInterval(refresh, 750);
+        }};
+        video.addEventListener("play", showGeneratingProgress);
         video.addEventListener("play", resumePartialTranslation);
+        subtitleSelect?.addEventListener("change", () => {{
+          if (subtitleSelect.selectedOptions[0]?.dataset.generatingBilingual === "true") showGeneratingProgress();
+        }});
+        showGeneratingProgress();
         startPendingBilingual = (select, pendingOption) => {{
           const status = translationControls.querySelector(".translation-status");
           const sourceOption = (() => {{
@@ -5933,10 +5991,10 @@ pub(crate) async fn web_client(
           const browserTrackIndex = sourceOption.dataset.browserTrack;
           const sourceKey = browserTrackIndex !== undefined ? `embedded:${{browserTrackIndex}}` : `stream:${{sourceId}}`;
           let browserCues = [];
-          let sourceLanguage = "und";
+          let sourceLanguage = sourceOption?.dataset.language || "und";
           if (browserTrackIndex !== undefined) {{
             const embeddedTrack = video.textTracks[Number(browserTrackIndex)];
-            sourceLanguage = embeddedTrack?.language || "und";
+            sourceLanguage = embeddedTrack?.language || sourceLanguage;
             browserCues = embeddedTrack?.cues ? [...embeddedTrack.cues].map(cue => ({{ start_ms: cue.startTime * 1000, end_ms: cue.endTime * 1000, text: cue.text }})) : [];
           }}
           const showTranslationError = message => {{
@@ -7197,8 +7255,10 @@ pub(crate) fn web_client_item(
         .enumerate()
         .map(|(index, track)| {
             format!(
-                r#"<option value="{}" data-stream-id="{}" data-bilingual="{}"{} data-pending-bilingual="{}">{}</option>"#,
+                r#"<option value="{}" data-language="{}" data-generating-bilingual="{}" data-stream-id="{}" data-bilingual="{}"{} data-pending-bilingual="{}">{}</option>"#,
                 index,
+                html(track.language.as_deref().unwrap_or("und")),
+                track.generating,
                 track.stream_id,
                 track.bilingual,
                 if track.stream_id == selected_subtitle_stream_id {

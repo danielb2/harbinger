@@ -622,10 +622,14 @@ async fn library_items(
         "total": total,
         "limit": limit.unwrap_or(0),
         "page": page,
-        "sortBy": sort_by,
-        "sortDesc": sort_desc,
-        "filterBy": filter_by,
-        "mediaType": "book",
+            "sortBy": sort_by,
+            "sortDesc": sort_desc,
+            "filterBy": if filter_by.is_empty() {
+                "all".to_owned()
+            } else {
+                filter_by.clone()
+            },
+            "mediaType": "book",
         "minified": minified,
         "collapseseries": query_value(&uri, "collapseseries").is_some_and(|value| value == "1"),
         "include": "",
@@ -883,6 +887,7 @@ async fn play(
         } else {
             progress.as_ref().map(|row| row.1).unwrap_or(0.0)
         },
+        start_time: progress.as_ref().map(|row| row.0).unwrap_or(0.0),
         started_at: now,
         updated_at: now,
     };
@@ -1884,12 +1889,13 @@ fn persist_playback_session(
     if db
         .execute(
             "INSERT INTO abs_playback_sessions
-                (id, user_id, library_id, item_id, duration, current_time, time_listened, started_at, updated_at, closed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                (id, user_id, library_id, item_id, duration, current_time, time_listened, start_time, started_at, updated_at, closed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 duration = excluded.duration,
                 current_time = excluded.current_time,
                 time_listened = excluded.time_listened,
+                start_time = excluded.start_time,
                 updated_at = excluded.updated_at,
                 closed_at = COALESCE(excluded.closed_at, abs_playback_sessions.closed_at)",
             params![
@@ -1900,6 +1906,7 @@ fn persist_playback_session(
                 session.duration,
                 session.current_time,
                 session.time_listened,
+                session.start_time,
                 started_at,
                 updated_at,
                 closed.then_some(updated_at)
@@ -2272,7 +2279,9 @@ async fn library_authors(
             "page": page,
             "sortBy": sort_by,
             "sortDesc": sort_desc,
-            "filterBy": query_value(&uri, "filter").unwrap_or_default(),
+            "filterBy": query_value(&uri, "filter")
+                .or_else(|| query_value(&uri, "filterBy"))
+                .unwrap_or_else(|| "all".to_owned()),
             "minified": false,
             "include": query_value(&uri, "include").unwrap_or_default()
         }))
@@ -2678,7 +2687,9 @@ async fn library_series(
         "page": page,
         "sortBy": sort_by,
         "sortDesc": sort_desc,
-        "filterBy": query_value(&uri, "filterBy").unwrap_or_default(),
+        "filterBy": query_value(&uri, "filter")
+            .or_else(|| query_value(&uri, "filterBy"))
+            .unwrap_or_else(|| "all".to_owned()),
         "minified": false,
         "include": query_value(&uri, "include").unwrap_or_default()
     }))
@@ -2851,7 +2862,9 @@ async fn library_collections(
         "page": page,
         "sortBy": query_value(&uri, "sortBy").unwrap_or_default(),
         "sortDesc": query_value(&uri, "desc").is_some_and(|value| value == "1"),
-        "filterBy": query_value(&uri, "filterBy").unwrap_or_default(),
+        "filterBy": query_value(&uri, "filter")
+            .or_else(|| query_value(&uri, "filterBy"))
+            .unwrap_or_else(|| "all".to_owned()),
         "minified": false,
         "include": query_value(&uri, "include").unwrap_or_default()
     }))
@@ -3891,6 +3904,7 @@ struct ListeningSessionRow {
     time_listened: f64,
     current_time: f64,
     duration: f64,
+    start_time: f64,
     started_at: i64,
     updated_at: i64,
 }
@@ -3910,6 +3924,7 @@ fn read_user_sessions(
                             CAST(time_listened AS REAL),
                             CAST(current_time AS REAL),
                             CAST(duration AS REAL),
+                            CAST(start_time AS REAL),
                             CAST(started_at AS INTEGER),
                             CAST(updated_at AS INTEGER)
                        FROM abs_playback_sessions
@@ -3925,8 +3940,9 @@ fn read_user_sessions(
                         time_listened: row.get(2)?,
                         current_time: row.get(3)?,
                         duration: row.get(4)?,
-                        started_at: row.get(5)?,
-                        updated_at: row.get(6)?,
+                        start_time: row.get(5)?,
+                        started_at: row.get(6)?,
+                        updated_at: row.get(7)?,
                     })
                 })
                 .ok()?;
@@ -3998,6 +4014,7 @@ fn progress_sessions(
                     time_listened: listened,
                     current_time,
                     duration,
+                    start_time: 0.0,
                     started_at: updated_at,
                     updated_at,
                 });
@@ -4028,12 +4045,14 @@ async fn my_listening_stats(
     let mut items = serde_json::Map::new();
     for session in &sessions {
         total_time += session.time_listened;
-        if let Some(date) = chrono::Local.timestamp_opt(session.started_at, 0).single() {
-            let day = date.format("%Y-%m-%d").to_string();
-            *days.entry(day).or_insert(0.0) += session.time_listened;
-            *day_of_week
-                .entry(date.format("%A").to_string())
-                .or_insert(0.0) += session.time_listened;
+        if session.time_listened > 0.0 {
+            if let Some(date) = chrono::Local.timestamp_opt(session.started_at, 0).single() {
+                let day = date.format("%Y-%m-%d").to_string();
+                *days.entry(day).or_insert(0.0) += session.time_listened;
+                *day_of_week
+                    .entry(date.format("%A").to_string())
+                    .or_insert(0.0) += session.time_listened;
+            }
         }
         let Some(item) = catalog.find_item(&session.item_id) else {
             continue;
@@ -4043,15 +4062,15 @@ async fn my_listening_stats(
             json!({
                 "id": session.item_id,
                 "timeListening": 0.0,
-                "mediaMetadata": metadata,
-                "lastUpdate": session.updated_at * 1000
+                "mediaMetadata": metadata
             })
         });
         let current = entry["timeListening"].as_f64().unwrap_or_default();
         entry["timeListening"] = json!(current + session.time_listened);
-        if session.updated_at * 1000 > entry["lastUpdate"].as_i64().unwrap_or_default() {
-            entry["lastUpdate"] = json!(session.updated_at * 1000);
-        }
+    }
+    for entry in items.values_mut() {
+        let time = entry["timeListening"].as_f64().unwrap_or_default().round() as i64;
+        entry["timeListening"] = json!(time);
     }
     let recent_sessions = sessions
         .iter()
@@ -4072,17 +4091,26 @@ async fn my_listening_stats(
             Some(json!({
                 "id": session.id,
                 "userId": identity.id,
+                "libraryId": item.library_id,
                 "libraryItemId": item.id,
-                "mediaItemId": item.id,
-                "mediaItemType": "book",
+                "bookId": item.id,
+                "episodeId": null,
+                "mediaType": "book",
                 "mediaMetadata": metadata,
+                "chapters": [],
                 "displayTitle": item.title,
                 "displayAuthor": item.author,
+                "coverPath": format!("/api/items/{}/cover", item.id),
                 "duration": session.duration,
-                "currentTime": session.current_time,
-                "timeListening": session.time_listened,
+                "playMethod": 0,
+                "mediaPlayer": "html5",
+                "deviceInfo": null,
+                "serverVersion": SERVER_VERSION,
                 "date": date,
                 "dayOfWeek": day_of_week,
+                "timeListening": session.time_listened.round() as i64,
+                "startTime": session.start_time,
+                "currentTime": session.current_time,
                 "startedAt": session.started_at * 1000,
                 "updatedAt": session.updated_at * 1000
             }))
@@ -4250,23 +4278,23 @@ async fn my_year_stats(
     let mut finished = Vec::new();
     if let Ok(db) = state.db.lock() {
         if let Ok(mut statement) = db.prepare(
-            "SELECT media_key FROM watch_progress
+            "SELECT media_key, COALESCE(finished_at, updated_at) FROM watch_progress
               WHERE user_id = ?1 AND watched = 1
                 AND COALESCE(finished_at, updated_at) >= ?2
                 AND COALESCE(finished_at, updated_at) < ?3
               ORDER BY COALESCE(finished_at, updated_at) DESC",
         ) {
             if let Ok(rows) = statement.query_map(params![identity.id, start, end], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             }) {
                 finished = rows.filter_map(Result::ok).collect();
             }
         }
     }
-    let mut longest: Option<(String, String, i64)> = None;
+    let mut longest: Option<(String, String, i64, i64)> = None;
     let mut finished_covers = Vec::new();
     let mut num_finished = 0;
-    for item_id in &finished {
+    for (item_id, finished_at) in &finished {
         let Some(item) = catalog.find_item(item_id) else {
             continue;
         };
@@ -4277,9 +4305,14 @@ async fn my_year_stats(
         let duration = item.duration.round() as i64;
         if longest
             .as_ref()
-            .is_none_or(|(_, _, current)| duration > *current)
+            .is_none_or(|(_, _, current, _)| duration > *current)
         {
-            longest = Some((item.id.clone(), item.title.clone(), duration));
+            longest = Some((
+                item.id.clone(),
+                item.title.clone(),
+                duration,
+                finished_at.saturating_mul(1000),
+            ));
         }
     }
     let covers = covers
@@ -4287,12 +4320,15 @@ async fn my_year_stats(
         .filter(|item_id| !finished_covers.contains(item_id))
         .collect::<Vec<_>>();
     let longest = longest
-        .map(|(id, title, duration)| {
+        .map(|(id, title, duration, finished_at)| {
             json!({
                 "id": id,
                 "title": title,
                 "duration": duration,
-                "finishedAt": Value::Null
+                "finishedAt": chrono::Utc
+                    .timestamp_millis_opt(finished_at)
+                    .single()
+                    .map(|date| date.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
             })
         })
         .unwrap_or(Value::Null);

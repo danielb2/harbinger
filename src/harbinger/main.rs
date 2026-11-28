@@ -421,7 +421,13 @@ const BILINGUAL_INCOMPLETE_NOTICE: &str =
 const BILINGUAL_GENERATING_NOTICE: &str = "Generating bilingual subtitles, please reload";
 
 pub(crate) fn bilingual_translation_job_key(media: &Media, first: &str, second: &str) -> String {
-    format!("prepared:{}:{}:{}", media.id, first, second)
+    format!(
+        "prepared:{}:{}:{}:{}",
+        media.id,
+        media.path.display(),
+        first,
+        second
+    )
 }
 
 fn start_translation_job(
@@ -2584,6 +2590,7 @@ fn open_database(
              duration REAL NOT NULL DEFAULT 0,
              current_time REAL NOT NULL DEFAULT 0,
              time_listened REAL NOT NULL DEFAULT 0,
+             start_time REAL NOT NULL DEFAULT 0,
              started_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              closed_at INTEGER
@@ -2615,6 +2622,10 @@ fn open_database(
     );
     let _ = connection.execute(
         "ALTER TABLE watch_progress ADD COLUMN finished_at INTEGER",
+        [],
+    );
+    let _ = connection.execute(
+        "ALTER TABLE abs_playback_sessions ADD COLUMN start_time REAL NOT NULL DEFAULT 0",
         [],
     );
     let _ = connection.execute(
@@ -2967,6 +2978,8 @@ pub(crate) struct WebTranslationProgressRequest {
 struct SubtitleSourceMarker {
     fingerprint: String,
     source_key: Option<String>,
+    #[serde(default)]
+    total_cues: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -3046,6 +3059,15 @@ fn subtitle_translation_fingerprint(
         .collect())
 }
 
+pub(crate) async fn subtitle_marker_total_cues(artifact_path: &std::path::Path) -> Option<usize> {
+    let contents = tokio::fs::read_to_string(subtitle_source_marker_path(artifact_path))
+        .await
+        .ok()?;
+    serde_json::from_str::<SubtitleSourceMarker>(&contents)
+        .ok()
+        .and_then(|marker| marker.total_cues)
+}
+
 async fn subtitle_source_marker_matches(
     artifact_path: &std::path::Path,
     fingerprint: &str,
@@ -3077,12 +3099,22 @@ async fn write_subtitle_source_marker(
     artifact_path: &std::path::Path,
     fingerprint: &str,
     source_key: Option<&str>,
+    total_cues: Option<usize>,
 ) -> Result<(), String> {
     let marker_path = subtitle_source_marker_path(artifact_path);
+    let total_cues = match total_cues {
+        Some(total_cues) => Some(total_cues),
+        None => tokio::fs::read_to_string(&marker_path)
+            .await
+            .ok()
+            .and_then(|contents| serde_json::from_str::<SubtitleSourceMarker>(&contents).ok())
+            .and_then(|marker| marker.total_cues),
+    };
     let temporary_path = PathBuf::from(format!("{}.tmp", marker_path.to_string_lossy()));
     let contents = serde_json::to_vec(&SubtitleSourceMarker {
         fingerprint: fingerprint.to_owned(),
         source_key: source_key.map(str::to_owned),
+        total_cues,
     })
     .map_err(|_| "Could not encode subtitle source metadata".to_owned())?;
     tokio::fs::write(&temporary_path, contents)
@@ -3099,8 +3131,11 @@ async fn prepare_translation_checkpoint(
     fingerprint: &str,
     source_key: Option<&str>,
 ) -> Result<(), String> {
+    let total_cues = subtitles::parse_subtitles(translation_input)
+        .ok()
+        .map(|cues| cues.len());
     if subtitle_source_marker_matches(checkpoint_path, fingerprint, source_key).await {
-        write_subtitle_source_marker(checkpoint_path, fingerprint, source_key).await?;
+        write_subtitle_source_marker(checkpoint_path, fingerprint, source_key, total_cues).await?;
         return Ok(());
     }
     let has_checkpoint = tokio::fs::metadata(checkpoint_path).await.is_ok();
@@ -3130,7 +3165,7 @@ async fn prepare_translation_checkpoint(
             .map_err(|_| "Could not reset the subtitle checkpoint for this source".to_owned())?;
         info!("subtitle checkpoint belongs to a different source; restarting from the first cue");
     }
-    write_subtitle_source_marker(checkpoint_path, fingerprint, source_key).await
+    write_subtitle_source_marker(checkpoint_path, fingerprint, source_key, total_cues).await
 }
 
 #[cfg(test)]
@@ -3288,7 +3323,7 @@ async fn translate_subtitle_cached_with_progress(
     let _cache_guard = cache_lock.lock().await;
     if subtitle_source_marker_matches(&sidecar_path, &fingerprint, source_key).await {
         if let Ok(contents) = tokio::fs::read_to_string(&sidecar_path).await {
-            write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
+            write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key, None).await?;
             cleanup_translation_checkpoint(&sidecar_part_path).await;
             let vtt = subtitle_to_vtt(&contents, &output_extension);
             send_vtt_progress(progress.as_ref(), &vtt)?;
@@ -3306,7 +3341,7 @@ async fn translate_subtitle_cached_with_progress(
             &output_extension,
         )
         .await?;
-        write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
+        write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key, None).await?;
         send_vtt_progress(progress.as_ref(), &cached)?;
         return Ok(cached);
     }
@@ -3378,7 +3413,7 @@ async fn translate_subtitle_cached_with_progress(
     }
     finalize_bilingual_translation(&sidecar_path, &sidecar_part_path, &vtt, &output_extension)
         .await?;
-    write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key).await?;
+    write_subtitle_source_marker(&sidecar_path, &fingerprint, source_key, None).await?;
     Ok(vtt)
 }
 
@@ -7284,6 +7319,7 @@ pub(crate) struct SubtitleTrack {
     pub(crate) language: Option<String>,
     pub(crate) bilingual: bool,
     pub(crate) pending_bilingual: bool,
+    pub(crate) generating: bool,
 }
 
 fn store_media_info(state: &AppState, media: &Media, info: serde_json::Value) {
@@ -8242,6 +8278,7 @@ async fn subtitle_tracks(
             language: Some(external_subtitle_language(&media.path, &path).0.to_owned()),
             bilingual: external_subtitle_pair(&media.path, &path).is_some(),
             pending_bilingual: false,
+            generating: false,
         });
     }
     if let Some((first, second)) = languages.as_ref() {
@@ -8267,6 +8304,7 @@ async fn subtitle_tracks(
                     language: Some(first.clone()),
                     bilingual: true,
                     pending_bilingual: false,
+                    generating: false,
                 });
             } else if checkpoint && selected_checkpoint {
                 tracks.push(SubtitleTrack {
@@ -8280,6 +8318,7 @@ async fn subtitle_tracks(
                     language: Some(first.clone()),
                     bilingual: true,
                     pending_bilingual: false,
+                    generating: true,
                 });
             } else {
                 tracks.push(SubtitleTrack {
@@ -8293,6 +8332,7 @@ async fn subtitle_tracks(
                     language: None,
                     bilingual: false,
                     pending_bilingual: true,
+                    generating: false,
                 });
             }
         }
@@ -8320,6 +8360,7 @@ async fn subtitle_tracks(
                     language: Some(plex_track_language(track).0.to_owned()),
                     bilingual: false,
                     pending_bilingual: false,
+                    generating: false,
                 });
             }
         }

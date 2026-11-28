@@ -150,6 +150,7 @@ fn fixture() -> Fixture {
              duration REAL NOT NULL DEFAULT 0,
              current_time REAL NOT NULL DEFAULT 0,
              time_listened REAL NOT NULL DEFAULT 0,
+             start_time REAL NOT NULL DEFAULT 0,
              started_at INTEGER NOT NULL,
              updated_at INTEGER NOT NULL,
              closed_at INTEGER
@@ -1149,6 +1150,7 @@ async fn series_endpoints_group_by_name_and_report_real_counts() {
     assert_eq!(status, StatusCode::OK);
     let series: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(series["total"], 2);
+    assert_eq!(series["filterBy"], "all");
     let sword = series["results"]
         .as_array()
         .unwrap()
@@ -1463,6 +1465,17 @@ async fn year_stats_report_sessions_and_finished_books() {
     let listening: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(listening["totalTime"], 25);
     assert_eq!(listening["recentSessions"].as_array().unwrap().len(), 1);
+    let recent = &listening["recentSessions"][0];
+    assert_eq!(recent["mediaType"], "book");
+    assert!(recent["libraryId"].as_str().is_some());
+    assert!(recent["bookId"].as_str().is_some());
+    assert!(recent["duration"].is_number());
+    assert!(recent["startedAt"].is_number());
+    assert!(recent["updatedAt"].is_number());
+    assert_eq!(recent["timeListening"], 25);
+    assert!(listening["recentSessions"][0]["dayOfWeek"]
+        .as_str()
+        .is_some());
     assert!(listening["days"].is_object());
     assert!(listening["dayOfWeek"].is_object());
     assert!(listening["dayOfWeek"]

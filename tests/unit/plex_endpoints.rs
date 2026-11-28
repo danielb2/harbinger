@@ -5893,7 +5893,7 @@ async fn changing_translation_source_resets_the_partial_without_mixing_cues() {
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
     )
     .unwrap();
-    super::write_subtitle_source_marker(&checkpoint, &fingerprint_a, Some("stream:1"))
+    super::write_subtitle_source_marker(&checkpoint, &fingerprint_a, Some("stream:1"), None)
         .await
         .unwrap();
 
@@ -6017,7 +6017,7 @@ async fn plex_translated_stream_returns_the_staged_part_without_waiting_for_comp
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
     )
     .unwrap();
-    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"))
+    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"), Some(1))
         .await
         .unwrap();
     let final_path = super::bilingual_subtitle_path(&media, "en", "vi", "vtt");
@@ -6244,7 +6244,7 @@ async fn web_translation_progress_reports_staged_cues_and_completed_srt() {
         "WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHello\nXin chào\n\n",
     )
     .unwrap();
-    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"))
+    super::write_subtitle_source_marker(&checkpoint, "test-source", Some("stream:7"), Some(1))
         .await
         .unwrap();
     let request = || {
@@ -6277,7 +6277,7 @@ async fn web_translation_progress_reports_staged_cues_and_completed_srt() {
         "1\n00:00:01,000 --> 00:00:02,000\nHello\nXin chào\n",
     )
     .unwrap();
-    super::write_subtitle_source_marker(&final_path, "test-source", Some("stream:7"))
+    super::write_subtitle_source_marker(&final_path, "test-source", Some("stream:7"), Some(1))
         .await
         .unwrap();
     let response = fixture.app.clone().oneshot(request()).await.unwrap();
