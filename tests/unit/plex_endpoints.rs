@@ -3970,6 +3970,176 @@ async fn plex_continue_watching_hub_tracks_progress_and_remove_action() {
 }
 
 #[tokio::test]
+async fn library_home_visibility_flags_hide_plex_continue_watching_and_recently_added() {
+    let fixture = fixture();
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.libraries[0].show_continue_watching = false;
+    }
+    let timeline = send(
+        &fixture.app,
+        Method::GET,
+        "/:/timeline?ratingKey=1-1&time=4000&duration=10000",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(timeline.status(), StatusCode::OK);
+
+    let home = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let home = String::from_utf8(
+        to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let continue_cards = home
+        .split("class=\"continue-grid\">")
+        .nth(1)
+        .unwrap()
+        .split("</div>")
+        .next()
+        .unwrap();
+    assert!(!continue_cards.contains("data-media-path=\"Demo.mkv\""));
+
+    let hub = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/continueWatching",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(hub.status(), StatusCode::OK);
+    let hub: serde_json::Value =
+        serde_json::from_slice(&to_bytes(hub.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(hub["MediaContainer"]["Hub"][0]["totalSize"], 0);
+    assert_eq!(
+        hub["MediaContainer"]["Hub"][0]["Metadata"],
+        serde_json::json!([])
+    );
+
+    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
+    assert_eq!(section_hubs.status(), StatusCode::OK);
+    let section_hubs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_hubs.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!section_hubs["MediaContainer"]["Hub"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|hub| hub["title"] == "Continue Watching"));
+
+    let section_items = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/continueWatching/items",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(section_items.status(), StatusCode::OK);
+    let section_items: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_items.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(section_items["MediaContainer"]["size"], 0);
+    assert_eq!(section_items["MediaContainer"]["totalSize"], 0);
+    assert_eq!(
+        section_items["MediaContainer"]["Metadata"],
+        serde_json::json!([])
+    );
+
+    {
+        let mut config = fixture.config.lock().unwrap();
+        config.libraries[0].show_continue_watching = true;
+        config.libraries[0].show_recently_added = false;
+    }
+
+    let home = send(&fixture.app, Method::GET, "/", Body::empty()).await;
+    let home = String::from_utf8(
+        to_bytes(home.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    let recent_cards = home
+        .split("class=\"recent-grid\">")
+        .nth(1)
+        .unwrap()
+        .split("</div>")
+        .next()
+        .unwrap();
+    assert!(!recent_cards.contains("data-media-path=\"Demo.mkv\""));
+
+    let home_hubs = send(&fixture.app, Method::GET, "/hubs", Body::empty()).await;
+    assert_eq!(home_hubs.status(), StatusCode::OK);
+    let home_hubs: serde_json::Value =
+        serde_json::from_slice(&to_bytes(home_hubs.into_body(), usize::MAX).await.unwrap()).unwrap();
+    let hubs = home_hubs["MediaContainer"]["Hub"].as_array().unwrap();
+    assert!(!hubs
+        .iter()
+        .any(|hub| hub["key"] == "/hubs/items?identifier=movie.recentlyadded.1"));
+    assert!(hubs
+        .iter()
+        .any(|hub| hub["key"] == "/hubs/items?identifier=movie.recommended.1"));
+
+    let section_hubs = send(&fixture.app, Method::GET, "/hubs/sections/1", Body::empty()).await;
+    let section_hubs: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_hubs.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let section_shelves = section_hubs["MediaContainer"]["Hub"].as_array().unwrap();
+    assert!(!section_shelves
+        .iter()
+        .any(|hub| hub["key"] == "/hubs/items?identifier=movie.recentlyadded.1"));
+    assert!(section_shelves
+        .iter()
+        .any(|hub| hub["title"] == "Recommended in Movies"));
+
+    let section_recent = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/sections/1/recentlyAdded",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(section_recent.status(), StatusCode::OK);
+    let section_recent: serde_json::Value = serde_json::from_slice(
+        &to_bytes(section_recent.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        section_recent["MediaContainer"]["Hub"],
+        serde_json::json!([])
+    );
+
+    let hub_items = send(
+        &fixture.app,
+        Method::GET,
+        "/hubs/items?identifier=movie.recentlyadded.1",
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(hub_items.status(), StatusCode::OK);
+    let hub_items: serde_json::Value =
+        serde_json::from_slice(&to_bytes(hub_items.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(hub_items["MediaContainer"]["size"], 0);
+    assert_eq!(
+        hub_items["MediaContainer"]["Metadata"],
+        serde_json::json!([])
+    );
+}
+
+#[tokio::test]
 async fn watch_card_actions_change_and_hide_continue_progress() {
     let fixture = fixture();
     let saved = fixture

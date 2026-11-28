@@ -3737,6 +3737,9 @@ pub(crate) async fn plex_continue_watching_hub(
             continue;
         }
         let found = libraries.iter().enumerate().find_map(|(index, library)| {
+            if !library.show_continue_watching {
+                return None;
+            }
             if only_section.is_some_and(|section| section != index + 1) {
                 return None;
             }
@@ -4086,6 +4089,9 @@ pub(crate) async fn plex_hubs_response(
         };
         let categories = plex_hub_categories(rated_count > 0, only_hub);
         for category in categories {
+            if category == "recentlyAdded" && !library.show_recently_added {
+                continue;
+            }
             if category == "recommended" {
                 hubs.push(
                     plex_recommendation_hub(
@@ -4118,7 +4124,10 @@ pub(crate) async fn plex_hubs_response(
         }
     }
 
-    if let Some(section) = only_section.filter(|_| only_hub.is_none()) {
+    if let Some(section) = only_section
+        .filter(|_| only_hub.is_none())
+        .filter(|section| libraries[*section - 1].show_continue_watching)
+    {
         let mut query = BTreeMap::new();
         query.insert("section".to_owned(), section.to_string());
         let response = plex_continue_watching_hub(State(state.clone()), Query(query)).await;

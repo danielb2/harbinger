@@ -19,6 +19,11 @@
 - unwatched_badge: tv-series covers show the number of unwatched episodes in the top-right corner in white font on an 80% opaque background, layered on the cover; when there are no unwatched episodes show a checkmark instead of a 0.
   - Verify: a series with unwatched episodes renders the count badge, and a fully watched series renders `✓`; both are positioned over the cover with the specified background.
 
+## home visibility
+
+- library_home_visibility: a library's "Show on Home" settings in Harbinger's web UI are server-wide policy, not web-only preferences. When `show_recently_added` is off, the library must not contribute items to recently added home surfaces in any client. When `show_continue_watching` is off, the library must not contribute items to continue watching or next-up surfaces in any client. Apply the flags in Plex and in every future client from the same library configuration; do not keep separate client-specific visibility lists.
+  - Verify: turn off recently added for a library and confirm the web home and Plex `/hubs`, `/hubs/sections/{id}`, `/hubs/sections/{id}/recentlyAdded`, and `/hubs/items?identifier=...recentlyadded...` show no recently added shelf or items for it; turn off continue watching and confirm the web home and Plex `/hubs/continueWatching` and `/hubs/sections/{id}/continueWatching/items` return nothing from it while other libraries still appear.
+
 ## storage
 
 - media_sidecars_portable: with `metadata_storage = "media"`, media-folder sidecars are the portable metadata record for the media beside them, not a disposable cache. Copying a media directory to a fresh Harbinger host must restore the same match, posters, covers, and per-episode skip markers without refetching artwork or repeating expensive work such as intro/credit detection. Detected and user-edited skip markers are metadata per episode and must round-trip through the sidecar. SQLite may be a local index or cache, but it must not be the only durable home for sidecar-owned metadata.
